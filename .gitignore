@@ -39,3 +39,14 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Chrome profiles (contain session data)
+/chrome-profiles/
+/.chrome-bot-profile/
+/.chrome-profile/
+
+# Error screenshots
+/error-screenshots/
+
+# Automation build output
+/dist/

@@ -1,0 +1,3633 @@
+import { Page } from "puppeteer-core";
+import { BasePlatform, AddressDetails } from "./BasePlatform";
+import {
+  sleep,
+  clearAndType,
+  navigateWithRetry,
+  waitWithRetry,
+} from "../core/helpers";
+
+const DELAYS = {
+  short: 100,
+  medium: 200,
+  long: 300,
+};
+
+export class FlipkartPlatform extends BasePlatform {
+  constructor(page: Page, productUrl: string) {
+    super(page, productUrl);
+  }
+
+  async navigateToProduct(): Promise<void> {
+    console.log("Opening product page...");
+    await navigateWithRetry(this.page, this.productUrl, {
+      timeoutMs: 10000,
+      maxRetries: 5,
+    });
+    await sleep(DELAYS.medium);
+  }
+
+  async clickBuyNow(): Promise<void> {
+    console.log("Waiting for Buy Now button ...");
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForFunction(
+          () => {
+            // Check for "Buy Now" text OR yellow gradient button
+            const allEls = document.querySelectorAll("div, span, button");
+            for (const el of allEls) {
+              const text = el.textContent?.trim().toLowerCase();
+              if (text === "buy now" || text === "buy now!") return true;
+            }
+            // Also check for yellow gradient (Buy Now button background)
+            const gradients = document.querySelectorAll('div[style*="linear-gradient"]');
+            for (const g of gradients) {
+              const style = g.getAttribute("style") || "";
+              if (style.includes("#ffe51f") || style.includes("#ffcd03") || style.includes("rgb(255, 229, 31)")) {
+                return true;
+              }
+            }
+            return false;
+          },
+          { timeout: 10000 }
+        );
+      },
+      { label: "Buy Now button", timeoutMs: 10000, maxRetries: 5 }
+    );
+
+    // Find the Buy Now button using multiple strategies
+    const buyBox = await this.page.evaluate(() => {
+      // polyfill esbuild's __name helper which doesn't exist in browser context
+      if (typeof (globalThis as any).__name === "undefined") (globalThis as any).__name = (fn: any) => fn;
+
+      const logs: string[] = [];
+
+      // --- Strategy 1: Find yellow gradient div (the Buy Now button background) ---
+      // Structure: parent > div(position:absolute, border-radius:12px) > div(yellow gradient)
+      const gradients = document.querySelectorAll('div[style*="linear-gradient"]');
+      for (const g of gradients) {
+        const style = g.getAttribute("style") || "";
+        if (!(style.includes("#ffe51f") || style.includes("#ffcd03") || style.includes("rgb(255, 229, 31)"))) continue;
+
+        logs.push(`Found yellow gradient: style="${style.slice(0, 80)}..."`);
+
+        // Go up: gradient div → position:absolute wrapper → pressable parent
+        let target: HTMLElement = g as HTMLElement;
+        if (g.parentElement) {
+          const ps = g.parentElement.getAttribute("style") || "";
+          if (ps.includes("position") && ps.includes("absolute")) {
+            target = g.parentElement.parentElement || g.parentElement;
+          } else {
+            target = g.parentElement;
+          }
+        }
+
+        // Walk up to find the best pressable container
+        let best: HTMLElement = target;
+        let el: HTMLElement | null = target;
+        while (el && el !== document.body) {
+          const s = el.getAttribute("style") || "";
+          if (el.getAttribute("role") === "button" || s.includes("cursor: pointer") || s.includes("cursor:pointer") || el.tagName === "BUTTON") {
+            best = el;
+          }
+          if (el.getBoundingClientRect().width > 400) break;
+          el = el.parentElement;
+        }
+
+        best.scrollIntoView({ block: "center" });
+        const rect = best.getBoundingClientRect();
+        logs.push(`Yellow gradient pressable at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
+
+        // Confirm it's the Buy Now button
+        const parentText = best.textContent?.trim().toLowerCase() || "";
+        if (parentText.includes("buy now")) {
+          logs.push("Confirmed: contains 'buy now' text");
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "yellow-gradient", logs };
+        }
+        if (rect.width < 300 && rect.height > 30 && rect.height < 70) {
+          logs.push("Likely Buy Now based on size");
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "yellow-gradient-size", logs };
+        }
+      }
+
+      // --- Strategy 2: Find "Buy Now" text and walk up ---
+      const allEls = document.querySelectorAll("div, span, button");
+      for (const label of allEls) {
+        const text = label.textContent?.trim().toLowerCase();
+        if (text !== "buy now" && text !== "buy now!") continue;
+        if (label.children.length > 3) continue;
+
+        logs.push(`Found "Buy Now" text in <${label.tagName.toLowerCase()}> class="${label.className}"`);
+
+        let best: HTMLElement = label as HTMLElement;
+        let el: HTMLElement | null = label as HTMLElement;
+        while (el && el !== document.body) {
+          const s = el.getAttribute("style") || "";
+          if (el.getAttribute("role") === "button" || s.includes("cursor: pointer") || s.includes("cursor:pointer") || el.tagName === "BUTTON") {
+            best = el;
+          }
+          if (el.getBoundingClientRect().width > 400) break;
+          el = el.parentElement;
+        }
+
+        best.scrollIntoView({ block: "center" });
+        const rect = best.getBoundingClientRect();
+        logs.push(`Text-based pressable at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
+        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "text", logs };
+      }
+
+      logs.push("No Buy Now button found");
+      return null;
+    });
+
+    if (buyBox) {
+      for (const line of buyBox.logs) console.log(line);
+    }
+    if (!buyBox) throw new Error("Buy Now button not found");
+    console.log(`=== Buy Now (variant: ${buyBox.variant}) ===`);
+
+    await sleep(300);
+
+    // Tap and wait for navigation — "context destroyed" means the click worked
+    try {
+      // Start listening for navigation BEFORE tapping
+      const navPromise = this.page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => null);
+
+      // Method 1: touchscreen.tap (works for React Native Web Pressable)
+      await this.page.touchscreen.tap(buyBox.x, buyBox.y);
+      console.log(`Tapped Buy Now at (${buyBox.x.toFixed(0)}, ${buyBox.y.toFixed(0)})`);
+
+      // Wait for navigation to complete
+      const navResult = await navPromise;
+      if (navResult) {
+        console.log(`Buy Now navigated to: ${this.page.url()}`);
+        return;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("context") || msg.includes("destroyed") || msg.includes("detached")) {
+        // Navigation happened — context destroyed is a success signal
+        console.log("Buy Now triggered navigation (context destroyed)");
+        // Wait for new page to settle
+        await this.page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
+        console.log(`After Buy Now, URL: ${this.page.url()}`);
+        return;
+      }
+      console.log(`Buy Now tap error: ${msg}`);
+    }
+
+    // Check if navigation already happened
+    await sleep(DELAYS.medium);
+    try {
+      const currentUrl = await this.page.url();
+      if (!currentUrl.includes("/p/") || currentUrl.includes("checkout") || currentUrl.includes("viewcart") || currentUrl.includes("order")) {
+        console.log(`Buy Now already navigated to: ${currentUrl}`);
+        return;
+      }
+    } catch {
+      // Context destroyed — navigation in progress, wait for it
+      await this.page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
+      console.log(`After Buy Now, URL: ${this.page.url()}`);
+      return;
+    }
+
+    // Method 2: mouse click fallback
+    console.log("Tap may not have worked, trying mouse click...");
+    try {
+      const navPromise = this.page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => null);
+      await this.page.mouse.click(buyBox.x, buyBox.y);
+      const navResult = await navPromise;
+      if (navResult) {
+        console.log(`Mouse click navigated to: ${this.page.url()}`);
+        return;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("context") || msg.includes("destroyed") || msg.includes("detached")) {
+        await this.page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
+        console.log(`Mouse click navigated to: ${this.page.url()}`);
+        return;
+      }
+    }
+
+    // Method 3: React fiber handler
+    console.log("Mouse click also didn't navigate, trying React fiber handler...");
+    try {
+      const fiberResult = await this.page.evaluate(() => {
+        if (typeof (globalThis as any).__name === "undefined") (globalThis as any).__name = (fn: any) => fn;
+
+        // Try yellow gradient element first
+        const gradients = document.querySelectorAll('div[style*="linear-gradient"]');
+        for (const g of gradients) {
+          const style = g.getAttribute("style") || "";
+          if (style.includes("#ffe51f") || style.includes("#ffcd03") || style.includes("rgb(255, 229, 31)")) {
+            let el: HTMLElement | null = g as HTMLElement;
+            while (el && el !== document.body) {
+              const fiberKey = Object.keys(el).find(k => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
+              if (fiberKey) {
+                let fiber = (el as any)[fiberKey];
+                let depth = 0;
+                while (fiber && depth < 30) {
+                  const props = fiber.memoizedProps || fiber.pendingProps;
+                  if (props) {
+                    const h = props.onPress || props.onClick || props.onPressIn;
+                    if (typeof h === "function") {
+                      try { h({ nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {} }); return "gradient handler invoked"; } catch {}
+                    }
+                  }
+                  fiber = fiber.return;
+                  depth++;
+                }
+              }
+              el = el.parentElement;
+            }
+          }
+        }
+
+        // Try "Buy Now" text elements
+        const allEls = document.querySelectorAll("div, span, button");
+        for (const label of allEls) {
+          const text = label.textContent?.trim().toLowerCase();
+          if (text !== "buy now" && text !== "buy now!") continue;
+          if (label.children.length > 3) continue;
+          let el: HTMLElement | null = label as HTMLElement;
+          while (el && el !== document.body) {
+            const fiberKey = Object.keys(el).find(k => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
+            if (fiberKey) {
+              let fiber = (el as any)[fiberKey];
+              let depth = 0;
+              while (fiber && depth < 30) {
+                const props = fiber.memoizedProps || fiber.pendingProps;
+                if (props) {
+                  const h = props.onPress || props.onClick || props.onPressIn;
+                  if (typeof h === "function") {
+                    try { h({ nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {} }); return "text handler invoked"; } catch {}
+                  }
+                }
+                fiber = fiber.return;
+                depth++;
+              }
+            }
+            el = el.parentElement;
+          }
+        }
+        return "no handler found";
+      });
+      console.log(`React fiber fallback: ${fiberResult}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("context") || msg.includes("destroyed") || msg.includes("detached")) {
+        console.log("Fiber handler triggered navigation");
+        await this.page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
+      }
+    }
+
+    console.log(`After Buy Now, URL: ${this.page.url()}`);
+  }
+
+  async setQuantity(qty: number): Promise<void> {
+    if (qty <= 1) {
+      console.log("Quantity is 1, skipping quantity selection");
+      return;
+    }
+
+    // Step 1: Open quantity dropdown (click "Qty: X")
+    console.log("Waiting for Quantity dropdown ...");
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForFunction(
+          () =>
+            [...document.querySelectorAll("div")].some((el) =>
+              el.textContent?.trim().startsWith("Qty:")
+            ),
+          { timeout: 10000 }
+        );
+      },
+      { label: "Quantity dropdown", timeoutMs: 10000, maxRetries: 5 }
+    );
+    await this.page.evaluate(() => {
+      const els = document.querySelectorAll("div.css-146c3p1");
+      for (const el of els) {
+        if (el.textContent?.trim().startsWith("Qty:")) {
+          (el.closest('div[style*="cursor"]') as HTMLElement)?.click();
+          return;
+        }
+      }
+    });
+    console.log("Clicked Quantity dropdown");
+    await sleep(DELAYS.medium);
+
+    // Step 2: Click "more"
+    console.log('Waiting for "more" option ...');
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForFunction(
+          () =>
+            [...document.querySelectorAll("div.css-146c3p1")].some(
+              (el) => el.textContent?.trim() === "more"
+            ),
+          { timeout: 10000 }
+        );
+      },
+      { label: '"more" option', timeoutMs: 10000, maxRetries: 5 }
+    );
+    await this.page.evaluate(() => {
+      const els = document.querySelectorAll("div.css-146c3p1");
+      for (const el of els) {
+        if (el.textContent?.trim() === "more") {
+          (el.closest("div.r-1glkqn6") as HTMLElement)?.click();
+          return;
+        }
+      }
+    });
+    console.log('Clicked "more"');
+    await sleep(DELAYS.short);
+
+    // Step 3: Enter quantity
+    await clearAndType(
+      this.page,
+      'input[placeholder="Quantity"]',
+      qty.toString(),
+      "Quantity input"
+    );
+    await sleep(DELAYS.short);
+
+    // Step 4: Click "APPLY"
+    console.log('Waiting for "APPLY" button ...');
+    await this.page.evaluate(() => {
+      const els = document.querySelectorAll("div.css-146c3p1");
+      for (const el of els) {
+        if (el.textContent?.trim() === "APPLY") {
+          (el.closest("div.r-5kz9s3") as HTMLElement)?.click();
+          return;
+        }
+      }
+    });
+    console.log('Clicked "APPLY"');
+    await sleep(DELAYS.medium);
+  }
+
+  async proceedToCheckout(): Promise<void> {
+    const currentUrl = this.page.url();
+
+    // If already on checkout page, just wait for it to settle — never reload
+    if (currentUrl.includes("/viewcheckout")) {
+      console.log(`Already on checkout page (${currentUrl}) — waiting for content to render...`);
+      // Wait for React to render the payment section (poll until body has enough text)
+      for (let i = 0; i < 20; i++) {
+        const bodyLen = await this.page.evaluate(() => document.body.innerText.length);
+        if (bodyLen > 100) break;
+        await sleep(500);
+      }
+      await sleep(300);
+      console.log(`Checkout page ready: ${this.page.url()}`);
+      return;
+    }
+
+    // Not on checkout page — navigate directly
+    const checkoutUrl = "https://www.flipkart.com/viewcheckout";
+    console.log(`On ${currentUrl} — navigating to checkout...`);
+    await this.page.goto(checkoutUrl, { waitUntil: "networkidle2", timeout: 20000 }).catch(() => {});
+
+    // Wait for page to settle
+    for (let i = 0; i < 20; i++) {
+      const bodyLen = await this.page.evaluate(() => document.body.innerText.length);
+      if (bodyLen > 100) break;
+      await sleep(500);
+    }
+    await sleep(300);
+    console.log(`Checkout page loaded: ${this.page.url()}`);
+  }
+
+  async isPaymentPage(): Promise<boolean> {
+    try {
+      const hasPaymentElements = await this.page.evaluate(() => {
+        const text = document.body.innerText;
+        return (
+          text.includes("PAYMENT OPTIONS") ||
+          text.includes("Credit / Debit / ATM Card") ||
+          text.includes("Net Banking") ||
+          text.includes("Gift Card")
+        );
+      });
+      return hasPaymentElements;
+    } catch {
+      return false;
+    }
+  }
+
+  async addToCart(): Promise<void> {
+    console.log("Waiting for Add to Cart button...");
+
+    // Wait for either: SVG cart icon OR text-based "Add to Cart" button
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForFunction(
+          () => {
+            // Check for SVG cart icon
+            const allPaths = document.querySelectorAll("path");
+            for (const p of allPaths) {
+              if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) return true;
+            }
+            // Check for text-based "add to cart" button
+            const labels = document.querySelectorAll("div.css-146c3p1");
+            for (const label of labels) {
+              const text = label.textContent?.trim().toLowerCase();
+              if (text === "add to cart" || text === "add to bag") return true;
+            }
+            // Check for white gradient button (div with white linear-gradient inside css-g5y9jx with border-radius: 12px)
+            const gradientDivs = document.querySelectorAll('div.css-g5y9jx[style*="border-radius: 12px"]');
+            if (gradientDivs.length > 0) return true;
+            return false;
+          },
+          { timeout: 10000 }
+        );
+      },
+      { label: "Add to Cart button", timeoutMs: 10000, maxRetries: 5 }
+    );
+
+    // Step 1: Find the button coordinates — try all known patterns
+    const btnCoords = await this.page.evaluate(() => {
+      const logs: string[] = [];
+
+      // --- Pattern 1: Text-based "Add to Cart" / "Add to Bag" ---
+      const labels = document.querySelectorAll("div.css-146c3p1");
+      for (const label of labels) {
+        const text = label.textContent?.trim().toLowerCase();
+        if (text === "add to cart" || text === "add to bag") {
+          logs.push(`Found text button: "${label.textContent?.trim()}"`);
+          // Walk up to the outermost pressable container (usually has role or cursor style)
+          let best: HTMLElement = label as HTMLElement;
+          let el: HTMLElement | null = label as HTMLElement;
+          while (el && el !== document.body) {
+            const style = el.getAttribute("style") || "";
+            if (style.includes("cursor") || el.getAttribute("role") === "button") {
+              best = el;
+            }
+            // Stop at the bottom bar container (typically very wide)
+            if (el.getBoundingClientRect().width > 300) break;
+            el = el.parentElement;
+          }
+          best.scrollIntoView({ block: "center" });
+          const rect = best.getBoundingClientRect();
+          logs.push(`Text button at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "text", logs };
+        }
+      }
+
+      // --- Pattern 2: White gradient button (border-radius: 12px) ---
+      const gradientContainers = document.querySelectorAll('div.css-g5y9jx[style*="border-radius: 12px"]');
+      for (const gc of gradientContainers) {
+        // Check it has a white gradient child
+        const gradChild = gc.querySelector('div[style*="linear-gradient"]');
+        if (gradChild) {
+          logs.push("Found white gradient button (border-radius: 12px)");
+          // The pressable container is a parent of this overlay
+          let pressable: HTMLElement = gc.parentElement || gc as HTMLElement;
+          // Walk up to find the container with cursor/role
+          let el: HTMLElement | null = gc as HTMLElement;
+          while (el && el !== document.body) {
+            const style = el.getAttribute("style") || "";
+            if (style.includes("cursor") || el.getAttribute("role") === "button") {
+              pressable = el;
+            }
+            if (el.getBoundingClientRect().width > 300) break;
+            el = el.parentElement;
+          }
+          pressable.scrollIntoView({ block: "center" });
+          const rect = pressable.getBoundingClientRect();
+          logs.push(`Gradient button at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "gradient", logs };
+        }
+      }
+
+      // --- Pattern 3: SVG cart icon ---
+      const allPaths = document.querySelectorAll("path");
+      for (const p of allPaths) {
+        if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) {
+          logs.push("Found SVG cart icon");
+          // Walk up to 44x44 container or nearest css-g5y9jx
+          let best: HTMLElement = p as unknown as HTMLElement;
+          let el: HTMLElement | null = p as unknown as HTMLElement;
+          while (el && el !== document.body) {
+            const style = el.getAttribute("style") || "";
+            if (style.includes("width: 44px") || style.includes("width:44px") || el.classList.contains("css-g5y9jx")) {
+              best = el;
+            }
+            if (style.includes("cursor") || el.getAttribute("role") === "button") {
+              best = el;
+              break;
+            }
+            el = el.parentElement;
+          }
+          best.scrollIntoView({ block: "center" });
+          const rect = best.getBoundingClientRect();
+          logs.push(`SVG button at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "svg", logs };
+        }
+      }
+
+      logs.push("No Add to Cart button found");
+      return { x: 0, y: 0, variant: "none", logs };
+    });
+
+    // Log
+    console.log(`=== Add to Cart (variant: ${btnCoords.variant}) ===`);
+    for (const line of btnCoords.logs) console.log(line);
+
+    if (btnCoords.variant === "none") {
+      try {
+        await this.page.screenshot({ path: "error-screenshots/add-to-cart-debug.png" });
+        console.log("Debug screenshot saved");
+      } catch {}
+      throw new Error("Add to Cart button not found");
+    }
+
+    // Step 2: Use touchscreen.tap — most reliable for React Native Web Pressable
+    await sleep(300);
+    await this.page.touchscreen.tap(btnCoords.x, btnCoords.y);
+    console.log(`Tapped Add to Cart at (${btnCoords.x.toFixed(0)}, ${btnCoords.y.toFixed(0)})`);
+
+    // Step 3: If tap didn't work, try React fiber handler as backup
+    await sleep(800);
+    const cartChanged = await this.page.evaluate(() => {
+      const badge = document.querySelector("span.m2YAMv");
+      return badge?.textContent || "0";
+    });
+    console.log(`Cart badge after tap: ${cartChanged}`);
+
+    if (cartChanged === "0") {
+      console.log("Tap may not have worked, trying React fiber handler...");
+      const fiberResult = await this.page.evaluate(() => {
+        if (typeof (globalThis as any).__name === "undefined") (globalThis as any).__name = (fn: any) => fn;
+
+        // Inline fiber handler search for a given start element
+        // Returns a string result or null
+        let handlerResult: string | null = null;
+
+        // Try text button
+        const labels = document.querySelectorAll("div.css-146c3p1, div, span");
+        for (const label of labels) {
+          const text = label.textContent?.trim().toLowerCase();
+          if (text === "add to cart" || text === "add to bag") {
+            let el: HTMLElement | null = label as HTMLElement;
+            while (el && el !== document.body) {
+              const fiberKey = Object.keys(el).find(k => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
+              if (fiberKey) {
+                let fiber = (el as any)[fiberKey];
+                let depth = 0;
+                while (fiber && depth < 30) {
+                  const props = fiber.memoizedProps || fiber.pendingProps;
+                  if (props) {
+                    const h = props.onPress || props.onClick || props.onPressIn;
+                    if (typeof h === "function") {
+                      try { h({ nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {} }); handlerResult = "text handler invoked"; } catch {}
+                    }
+                  }
+                  if (handlerResult) break;
+                  fiber = fiber.return;
+                  depth++;
+                }
+              }
+              if (handlerResult) break;
+              el = el.parentElement;
+            }
+            if (handlerResult) return handlerResult;
+          }
+        }
+
+        // Try gradient button
+        const gradientContainers = document.querySelectorAll('div[style*="border-radius"]');
+        for (const gc of gradientContainers) {
+          if (gc.querySelector('div[style*="linear-gradient"]')) {
+            let el: HTMLElement | null = gc as HTMLElement;
+            while (el && el !== document.body) {
+              const fiberKey = Object.keys(el).find(k => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
+              if (fiberKey) {
+                let fiber = (el as any)[fiberKey];
+                let depth = 0;
+                while (fiber && depth < 30) {
+                  const props = fiber.memoizedProps || fiber.pendingProps;
+                  if (props) {
+                    const h = props.onPress || props.onClick || props.onPressIn;
+                    if (typeof h === "function") {
+                      try { h({ nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {} }); return "gradient handler invoked"; } catch {}
+                    }
+                  }
+                  fiber = fiber.return;
+                  depth++;
+                }
+              }
+              el = el.parentElement;
+            }
+          }
+        }
+
+        // Try SVG
+        const allPaths = document.querySelectorAll("path");
+        for (const p of allPaths) {
+          if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) {
+            let el: HTMLElement | null = p as unknown as HTMLElement;
+            while (el && el !== document.body) {
+              const fiberKey = Object.keys(el).find(k => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
+              if (fiberKey) {
+                let fiber = (el as any)[fiberKey];
+                let depth = 0;
+                while (fiber && depth < 30) {
+                  const props = fiber.memoizedProps || fiber.pendingProps;
+                  if (props) {
+                    const h = props.onPress || props.onClick || props.onPressIn;
+                    if (typeof h === "function") {
+                      try { h({ nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {} }); return "svg handler invoked"; } catch {}
+                    }
+                  }
+                  fiber = fiber.return;
+                  depth++;
+                }
+              }
+              el = el.parentElement;
+            }
+          }
+        }
+        return "no handler found";
+      });
+      console.log(`React fiber fallback: ${fiberResult}`);
+    }
+
+    await sleep(DELAYS.medium);
+  }
+
+  async goToCart(): Promise<void> {
+    // Click the cart icon in the header: <a class="SXucWY" href="/viewcart...">
+    console.log("Navigating to cart...");
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForSelector('a[href*="/viewcart"]', {
+          visible: true,
+          timeout: 10000,
+        });
+      },
+      { label: "Cart link", timeoutMs: 10000, maxRetries: 5 }
+    );
+    await this.page.evaluate(() => {
+      const cartLink = document.querySelector('a[href*="/viewcart"]') as HTMLElement;
+      if (cartLink) {
+        cartLink.scrollIntoView({ block: "center" });
+        cartLink.click();
+      }
+    });
+    console.log("Clicked Cart");
+    await sleep(DELAYS.long);
+  }
+
+  async setCartItemQuantity(itemIndex: number, qty: number): Promise<void> {
+    // On Flipkart cart page, each item has a quantity section with +/- buttons
+    // and a "Qty: X" display. We need to find the Nth item and adjust its quantity.
+    console.log(`Setting quantity for cart item ${itemIndex + 1} to ${qty}...`);
+
+    // Wait for the cart page to load with items
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForFunction(
+          () => {
+            // Look for quantity displays in the cart (e.g., "Qty:" text)
+            const qtyLabels = [...document.querySelectorAll("div")].filter((el) =>
+              el.textContent?.trim().startsWith("Qty:")
+            );
+            return qtyLabels.length > 0;
+          },
+          { timeout: 10000 }
+        );
+      },
+      { label: "Cart quantity controls", timeoutMs: 10000, maxRetries: 5 }
+    );
+
+    // Find all quantity controls in the cart and click the one at itemIndex
+    // Step 1: Click "Qty: X" dropdown for the target item
+    const clickedDropdown = await this.page.evaluate((idx: number) => {
+      const qtyLabels = [...document.querySelectorAll("div.css-146c3p1")].filter(
+        (el) => el.textContent?.trim().startsWith("Qty:")
+      );
+      if (idx < qtyLabels.length) {
+        const el = qtyLabels[idx];
+        const clickTarget = el.closest('div[style*="cursor"]') || el.parentElement;
+        if (clickTarget) {
+          (clickTarget as HTMLElement).scrollIntoView({ block: "center" });
+          (clickTarget as HTMLElement).click();
+          return true;
+        }
+      }
+      return false;
+    }, itemIndex);
+
+    if (!clickedDropdown) {
+      console.log(`Warning: Qty dropdown for item ${itemIndex + 1} not found, skipping`);
+      return;
+    }
+    console.log(`Clicked Qty dropdown for item ${itemIndex + 1}`);
+    await sleep(DELAYS.medium);
+
+    // Step 2: Click "more" to get the text input
+    const clickedMore = await this.page.evaluate(() => {
+      const els = document.querySelectorAll("div.css-146c3p1");
+      for (const el of els) {
+        if (el.textContent?.trim() === "more") {
+          const clickTarget = el.closest("div.r-1glkqn6") || el.parentElement;
+          if (clickTarget) {
+            (clickTarget as HTMLElement).click();
+            return true;
+          }
+        }
+      }
+      return false;
+    });
+
+    if (clickedMore) {
+      console.log('Clicked "more"');
+      await sleep(DELAYS.short);
+
+      // Step 3: Enter quantity in the input
+      await clearAndType(
+        this.page,
+        'input[placeholder="Quantity"]',
+        qty.toString(),
+        "Cart Quantity input"
+      );
+      await sleep(DELAYS.short);
+
+      // Step 4: Click "APPLY"
+      await this.page.evaluate(() => {
+        const els = document.querySelectorAll("div.css-146c3p1");
+        for (const el of els) {
+          if (el.textContent?.trim() === "APPLY") {
+            const clickTarget = el.closest("div.r-5kz9s3") || el.parentElement;
+            if (clickTarget) {
+              (clickTarget as HTMLElement).click();
+              return;
+            }
+          }
+        }
+      });
+      console.log(`Set quantity for item ${itemIndex + 1} to ${qty}`);
+      await sleep(DELAYS.medium);
+    } else {
+      // Fallback: if "more" isn't available, use +/- buttons
+      console.log(`"more" option not found, using +/- buttons for item ${itemIndex + 1}`);
+      // Click + button (qty-1) times to increase from 1 to desired qty
+      for (let i = 1; i < qty; i++) {
+        const plusClicked = await this.page.evaluate((idx: number) => {
+          // Find + buttons (SVG with "+" path or button with "+" text)
+          const svgs = document.querySelectorAll("svg");
+          const plusBtns: Element[] = [];
+          for (const svg of svgs) {
+            const paths = svg.querySelectorAll("path");
+            for (const p of paths) {
+              const d = p.getAttribute("d") || "";
+              // "+" icon typically has horizontal and vertical lines
+              if (d.includes("H") && d.includes("V") && !d.includes("M17 18.375")) {
+                plusBtns.push(svg);
+                break;
+              }
+            }
+          }
+          // Each cart item has a +/- pair, get the + for item at idx
+          // + buttons are typically the second in each pair
+          if (plusBtns.length > idx) {
+            const target = plusBtns[idx].parentElement || plusBtns[idx];
+            (target as HTMLElement).click();
+            return true;
+          }
+          return false;
+        }, itemIndex);
+        if (plusClicked) {
+          await sleep(300); // Wait for quantity update
+        }
+      }
+      console.log(`Used +/- buttons to set item ${itemIndex + 1} to qty ${qty}`);
+    }
+  }
+
+  async placeOrder(): Promise<void> {
+    // Click "Place order" button: div.css-146c3p1 with text "Place order" inside a yellow bg container
+    console.log("Waiting for Place Order button...");
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForFunction(
+          () => {
+            const labels = document.querySelectorAll("div.css-146c3p1");
+            for (const label of labels) {
+              const text = label.textContent?.trim().toLowerCase();
+              if (text === "place order") return true;
+            }
+            return false;
+          },
+          { timeout: 10000 }
+        );
+      },
+      { label: "Place Order button", timeoutMs: 10000, maxRetries: 5, isPaymentPage: this.isPaymentPage }
+    );
+
+    const placeBox = await this.page.evaluate(() => {
+      const labels = document.querySelectorAll("div.css-146c3p1");
+      for (const label of labels) {
+        const text = label.textContent?.trim().toLowerCase();
+        if (text && text.includes("place order")) {
+          // Walk up to the yellow container (div.css-g5y9jx with background-color)
+          let el: HTMLElement | null = label as HTMLElement;
+          while (el) {
+            const style = el.getAttribute("style") || "";
+            if (el.classList.contains("css-g5y9jx") && style.includes("background-color")) {
+              el.scrollIntoView({ block: "center" });
+              const rect = el.getBoundingClientRect();
+              return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+            }
+            el = el.parentElement;
+          }
+          // Fallback: use the text label
+          (label as HTMLElement).scrollIntoView({ block: "center" });
+          const rect = label.getBoundingClientRect();
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+        }
+      }
+      return null;
+    });
+
+    if (!placeBox) throw new Error("Place Order button not found");
+    await sleep(300);
+    await this.page.touchscreen.tap(placeBox.x, placeBox.y);
+    console.log(`Tapped Place Order at (${placeBox.x.toFixed(0)}, ${placeBox.y.toFixed(0)})`);
+    await sleep(DELAYS.long);
+  }
+
+  async isOrderConfirmationVisible(): Promise<boolean> {
+    try {
+      const result = await this.page.evaluate(() => {
+        const url = window.location.href.toLowerCase();
+        const text = document.body.innerText.toLowerCase();
+
+        // URL-based detection (most reliable)
+        if (
+          url.includes("orderresponse") ||
+          url.includes("order-confirmed") ||
+          url.includes("orderconfirmed") ||
+          url.includes("/orderdetail") ||
+          url.includes("order_id=") ||
+          url.includes("reference_id=od")
+        ) {
+          return { confirmed: true, method: "url" };
+        }
+
+        // Text-based detection — Flipkart shows specific confirmation text
+        if (
+          text.includes("order confirmed") ||
+          text.includes("order placed successfully") ||
+          text.includes("your order has been placed") ||
+          text.includes("order is confirmed") ||
+          text.includes("order successful")
+        ) {
+          return { confirmed: true, method: "text" };
+        }
+
+        // Check for confirmation elements (green tick, order ID display)
+        const orderIdEls = document.querySelectorAll("div.css-146c3p1");
+        for (const el of orderIdEls) {
+          const t = el.textContent?.trim() || "";
+          if (/^OD\d{10,}/.test(t) || t.startsWith("Order ID")) {
+            return { confirmed: true, method: "orderid" };
+          }
+        }
+
+        return { confirmed: false, method: "none" };
+      });
+
+      if (result.confirmed) {
+        console.log(`Order confirmed (detected via: ${result.method})`);
+      }
+      return result.confirmed;
+    } catch {
+      return false;
+    }
+  }
+
+  async loginWithEmail(email: string): Promise<void> {
+    console.log(`Logging in with email: ${email.substring(0, 3)}***`);
+
+    // Check if already logged in — if so, log out first
+    if (await this.isLoggedIn()) {
+      console.log("Already logged in. Logging out first...");
+      await this.logout();
+    }
+
+    // Navigate to Flipkart login page
+    await navigateWithRetry(this.page, "https://www.flipkart.com/account/login?ret=/", {
+      timeoutMs: 15000,
+      maxRetries: 3,
+    });
+    await sleep(DELAYS.long);
+
+    // Wait for email input field
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForFunction(
+          () => {
+            // Look for text input in the login form
+            const inputs = document.querySelectorAll('input[type="text"], input[type="email"]');
+            return inputs.length > 0;
+          },
+          { timeout: 10000 }
+        );
+      },
+      { label: "Login email input", timeoutMs: 10000, maxRetries: 5 }
+    );
+
+    // Find the email input by its label text, focus it, and type using keyboard events
+    // dispatched from within the browser context so React properly registers the input
+    console.log("Typing into login email input ...");
+    const typed = await this.page.evaluate((emailToType: string) => {
+      // Find the label/span containing "Enter Email/Mobile number"
+      const allSpans = document.querySelectorAll('label span, span');
+      for (const el of allSpans) {
+        if (el.textContent?.trim() === "Enter Email/Mobile number") {
+          // Walk up to find the input inside the container
+          let input: HTMLInputElement | null = null;
+          const parent = el.closest('div');
+          if (parent) {
+            input = parent.querySelector('input[type="text"]') as HTMLInputElement | null;
+          }
+          // Fallback: walk up the DOM tree looking for the input
+          if (!input) {
+            let curr: HTMLElement | null = el.closest('div');
+            while (curr && curr !== document.body) {
+              input = curr.querySelector('input[type="text"]') as HTMLInputElement | null;
+              if (input) break;
+              curr = curr.parentElement;
+            }
+          }
+
+          if (input) {
+            // Focus the input so keyboard events go to the right element
+            input.focus();
+
+            // Clear existing value
+            input.value = "";
+
+            // Type character by character using keyboard events React can respond to
+            for (const char of emailToType) {
+              const keyEvent = new KeyboardEvent("keydown", {
+                key: char,
+                bubbles: true,
+                cancelable: true,
+              });
+              input.dispatchEvent(keyEvent);
+
+              // Update the value
+              const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,
+                "value"
+              )?.set;
+              nativeInputValueSetter?.call(input, input.value + char);
+
+              input.dispatchEvent(new Event("input", { bubbles: true }));
+              input.dispatchEvent(new Event("change", { bubbles: true }));
+
+              const keyUpEvent = new KeyboardEvent("keyup", {
+                key: char,
+                bubbles: true,
+                cancelable: true,
+              });
+              input.dispatchEvent(keyUpEvent);
+            }
+
+            input.dispatchEvent(new Event("blur", { bubbles: true }));
+            return true;
+          }
+        }
+      }
+      return false;
+    }, email);
+
+    if (!typed) {
+      throw new Error("Could not find email input on login page");
+    }
+    await sleep(DELAYS.medium);
+
+    // Click "Request OTP" button directly by class
+    console.log("Clicking Request OTP...");
+    const otpRequested = await this.page.evaluate(() => {
+      // Target the button by its class names
+      const btn = document.querySelector('button.dSM5Ub.Kv3ekh.KcXDCU') as HTMLButtonElement | null;
+      if (btn) {
+        btn.click();
+        return true;
+      }
+      return false;
+    });
+
+    if (!otpRequested) {
+      throw new Error("Could not find Request OTP button");
+    }
+
+    console.log("OTP requested — waiting for human to enter OTP...");
+  }
+
+  async waitForLoginCompletion(timeoutMs = 300000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    const pollInterval = 2000;
+
+    while (Date.now() < deadline) {
+      try {
+        const loggedIn = await this.page.evaluate(() => {
+          const url = window.location.href.toLowerCase();
+          // If we're no longer on the login page, login succeeded
+          if (!url.includes("/account/login")) {
+            return true;
+          }
+          // Check for logged-in indicators on the page
+          const text = document.body.innerText.toLowerCase();
+          if (text.includes("my account") || text.includes("my orders")) {
+            return true;
+          }
+          return false;
+        });
+
+        if (loggedIn) {
+          console.log("Login completed successfully");
+          return true;
+        }
+      } catch {
+        // Page might be navigating — that's a good sign
+        await sleep(pollInterval);
+        try {
+          const url = this.page.url();
+          if (!url.includes("/account/login")) {
+            console.log("Login completed (detected via URL change)");
+            return true;
+          }
+        } catch {
+          // Still navigating
+        }
+      }
+
+      await sleep(pollInterval);
+    }
+
+    console.log("Login timed out");
+    return false;
+  }
+
+  async logout(): Promise<void> {
+    console.log("Logging out...");
+    await this.logoutViaUI();
+    await this.clearSessionData();
+    // Navigate to confirm logged-out state
+    try {
+      await this.page.goto("https://www.flipkart.com", {
+        waitUntil: "domcontentloaded",
+        timeout: 15000,
+      });
+      await sleep(DELAYS.long);
+    } catch {
+      console.log("Post-logout navigation failed, continuing...");
+    }
+    console.log("Logout complete");
+  }
+
+  private async isLoggedIn(): Promise<boolean> {
+    try {
+      return await this.page.evaluate(() => {
+        const url = window.location.href.toLowerCase();
+        if (url.includes("/account/login")) return false;
+        const text = document.body.innerText.toLowerCase();
+        return (
+          text.includes("my account") ||
+          text.includes("my orders") ||
+          text.includes("logout") ||
+          text.includes("sign out")
+        );
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  private async logoutViaUI(): Promise<void> {
+    console.log("Performing UI-based logout...");
+
+    // Step 1: Navigate to homepage to ensure header is loaded
+    try {
+      await this.page.goto("https://www.flipkart.com", {
+        waitUntil: "domcontentloaded",
+        timeout: 15000,
+      });
+      await sleep(DELAYS.medium);
+    } catch { /* ignore */ }
+
+    // Step 2: Click the account/avatar button in the header
+    const menuOpened = await this.page.evaluate(() => {
+      const allEls = document.querySelectorAll('a, div[role="button"], span');
+      for (const el of allEls) {
+        const text = el.textContent?.trim().toLowerCase();
+        if (text === "my account" || text === "login") {
+          (el as HTMLElement).click();
+          return true;
+        }
+      }
+      // Try clicking the avatar/account div if text not found
+      const avatar =
+        document.querySelector('div[class*="_3ko"]') ||
+        document.querySelector('div[class*="_2no"]');
+      if (avatar) { (avatar as HTMLElement).click(); return true; }
+      return false;
+    });
+
+    if (!menuOpened) {
+      console.log("Account menu not found, using cookie clear fallback");
+      return;
+    }
+
+    await sleep(DELAYS.medium);
+
+    // Step 3: Click "Logout" / "Sign Out" in the dropdown
+    const loggedOut = await this.page.evaluate(() => {
+      const allLinks = document.querySelectorAll('a, button, div[role="button"]');
+      for (const el of allLinks) {
+        const t = el.textContent?.trim().toLowerCase() || "";
+        if (t === "logout" || t === "sign out" || t === "signout") {
+          (el as HTMLElement).click();
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (loggedOut) {
+      console.log("UI-based logout succeeded");
+      await sleep(DELAYS.long);
+    } else {
+      console.log("Sign out button not found in dropdown, falling back to cookie clear");
+    }
+  }
+
+  private async clearSessionData(): Promise<void> {
+    try {
+      const client = await this.page.createCDPSession();
+      await client.send("Network.clearBrowserCookies");
+      await client.detach();
+      console.log("Cleared all cookies via CDP");
+    } catch { /* ignore */ }
+    try {
+      await this.page.evaluate(() => {
+        try { localStorage.clear(); } catch {}
+        try { sessionStorage.clear(); } catch {}
+      });
+      console.log("Cleared localStorage and sessionStorage");
+    } catch { /* ignore */ }
+  }
+
+  async resetForNextIteration(): Promise<void> {
+    console.log("Resetting browser state for next iteration...");
+
+    // Step 1: Close any extra tabs/pages that may have opened during payment
+    try {
+      const browser = this.page.browser();
+      const pages = await browser.pages();
+      for (const p of pages) {
+        if (p !== this.page) {
+          await p.close().catch(() => {});
+        }
+      }
+    } catch {
+      console.log("Tab cleanup skipped");
+    }
+
+    // Step 2: Dismiss any popups on current page (don't navigate yet — save time)
+    await this.page.evaluate(() => {
+      const closeButtons = document.querySelectorAll('button._2KpZ6l._2doB4z, span._30XB9F');
+      closeButtons.forEach((btn) => (btn as HTMLElement).click());
+    }).catch(() => {});
+
+    console.log("Browser state reset complete");
+  }
+
+  /**
+   * Verify and fix quantity, delivery address, and GST checkbox on the
+   * order summary page (intermediate page after clicking Buy Now, before
+   * the full checkout page). After all checks pass, clicks Continue to
+   * proceed to the checkout page.
+   *
+   * This is the primary entry point for the order summary flow.
+   */
+  async verifyAddressOnOrderSummary(
+    address: AddressDetails,
+    expectedQty: number
+  ): Promise<void> {
+    const pageUrl = this.page.url();
+    console.log(`Verifying order summary page: ${pageUrl}`);
+
+    // Step 1: Verify quantity on order summary
+    await this.verifyQuantityOnOrderSummary(expectedQty);
+
+    // Step 2: Verify delivery address
+    await this.verifyDeliveryAddressOnSummary(address);
+
+    // Step 3: Verify GST invoice checkbox
+    await this.verifyGstCheckboxOnSummary();
+
+    // Step 4: Click Continue to proceed to checkout page
+    await this.clickContinueToCheckout();
+
+    console.log("Order summary verification complete");
+  }
+
+  /**
+   * Verify and fix GST invoice details on the checkout page.
+   * Called AFTER verifyAddressOnOrderSummary() once on /viewcheckout.
+   */
+  async verifyAddressOnCheckout(
+    address?: AddressDetails
+  ): Promise<void> {
+    if (!address) {
+      console.log("No GST address provided — skipping address verification");
+      return;
+    }
+
+    const pageUrl = this.page.url();
+    console.log(`Verifying address on checkout: ${address.gstNumber} (${address.companyName})`);
+    console.log(`Current page URL: ${pageUrl}`);
+
+    if (!pageUrl.includes("flipkart.com")) {
+      console.log("ERROR: Not on Flipkart! Cannot verify address.");
+      throw new Error("Not on Flipkart checkout page");
+    }
+
+    // ----------------------------------------------------------------
+    // Step 1: Verify and fix delivery address (should be no-op if set on summary)
+    // ----------------------------------------------------------------
+    await this.verifyDeliveryAddress(address);
+
+    // ----------------------------------------------------------------
+    // Step 2: Verify and fix GST invoice details
+    // ----------------------------------------------------------------
+    await this.verifyGstInvoice(address);
+
+    // ----------------------------------------------------------------
+    // Step 3: Ensure GST invoice checkbox is ticked
+    // ----------------------------------------------------------------
+    await this.ensureGstCheckboxTicked();
+
+    console.log("Address verification complete");
+  }
+
+  // ================================================================
+  // ORDER SUMMARY PAGE METHODS
+  // These run on the intermediate order summary page after Buy Now
+  // ================================================================
+
+  private async verifyQuantityOnOrderSummary(expectedQty: number): Promise<void> {
+    console.log(`Verifying quantity on order summary: expected=${expectedQty}`);
+
+    // Try to find the quantity displayed on the order summary page
+    let displayedQty = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const qtyText = await this.page.evaluate(() => {
+        // Look for quantity near "Qty" text or a number near product info
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          // Flipkart often shows "Qty: N" or just the number next to product
+          if (/^[\d]+$/.test(txt) && d.offsetParent !== null) {
+            // Check if this div is near a qty-related parent
+            let el: HTMLElement | null = d.parentElement;
+            let found = false;
+            while (el && el !== document.body) {
+              const parentTxt = (el.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
+              if (parentTxt.includes("qty")) {
+                found = true;
+                break;
+              }
+              el = el.parentElement;
+            }
+            if (found) return txt;
+          }
+          // Also try: look for a div where the text starts with "Qty"
+          if (txt.toLowerCase().startsWith("qty")) {
+            const match = txt.match(/qty[:\s]*(\d+)/i);
+            if (match) return match[1];
+          }
+        }
+        // Fallback: look for any number input or select with quantity
+        const selects = document.querySelectorAll("select");
+        for (const s of selects) {
+          const parentTxt = ((s.closest("div")?.innerText) || "").toLowerCase();
+          if (parentTxt.includes("qty")) {
+            return (s as HTMLSelectElement).value;
+          }
+        }
+        // Fallback: look for a visible quantity input
+        const inputs = document.querySelectorAll("input");
+        for (const inp of inputs) {
+          const placeholder = (inp.getAttribute("placeholder") || "").toLowerCase();
+          const name = (inp.getAttribute("name") || "").toLowerCase();
+          if ((placeholder.includes("quantity") || name.includes("quantity")) && inp.value) {
+            return inp.value;
+          }
+        }
+        return null;
+      });
+
+      if (qtyText) {
+        displayedQty = parseInt(qtyText, 10);
+        if (!isNaN(displayedQty)) break;
+      }
+      await sleep(300);
+    }
+
+    if (displayedQty > 0) {
+      console.log(`Current quantity on summary: ${displayedQty}`);
+    } else {
+      console.log("Could not detect quantity on order summary page — assuming correct");
+      return;
+    }
+
+    if (displayedQty === expectedQty) {
+      console.log("Quantity matches — no change needed");
+      return;
+    }
+
+    console.log(`Quantity mismatch: ${displayedQty} vs ${expectedQty} — correcting...`);
+
+    // Click the Qty selector to open the quantity dropdown/dialog
+    // Pattern from setQuantity(): find div with class css-146c3p1 near "Qty"
+    let qtyClicked = false;
+    for (let attempt = 0; attempt < 3 && !qtyClicked; attempt++) {
+      const result = await this.page.evaluate(() => {
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (txt.toLowerCase().startsWith("qty")) {
+            // Walk up to find clickable parent
+            let el: HTMLElement | null = d;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              if (style.includes("cursor: pointer") || el.getAttribute("role") === "button") {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return "clicked";
+              }
+              el = el.parentElement;
+            }
+            // Fallback: click the div itself
+            (d as HTMLElement).click();
+            return "clicked_fallback";
+          }
+        }
+        // Alternative: look for div with css-146c3p1 class that is near Qty text
+        for (const d of allDivs) {
+          const cls = d.className || "";
+          if (cls.includes("css-146c3p1")) {
+            let el: HTMLElement | null = d;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              if (style.includes("cursor: pointer")) {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return "clicked_css_class";
+              }
+              el = el.parentElement;
+            }
+          }
+        }
+        return null;
+      });
+
+      if (result) {
+        qtyClicked = true;
+        console.log(`Qty selector clicked (${result})`);
+        await sleep(300);
+      } else {
+        console.log(`Qty selector not found (attempt ${attempt + 1}/3)`);
+        await sleep(300);
+      }
+    }
+
+    if (!qtyClicked) {
+      console.log("WARNING: Could not open quantity selector — proceeding anyway");
+      return;
+    }
+
+    // Wait for the quantity dialog/dropdown to appear
+    let dialogReady = false;
+    for (let i = 0; i < 5 && !dialogReady; i++) {
+      dialogReady = await this.page.evaluate(() => {
+        return (
+          !!document.querySelector('input[placeholder*="Quantity" i]') ||
+          !!document.querySelector('input[placeholder*="Qty" i]') ||
+          !!document.querySelector(".css-146c3p1") ||
+          document.body.innerText.includes("APPLY")
+        );
+      });
+      if (!dialogReady) await sleep(300);
+    }
+
+    if (!dialogReady) {
+      console.log("WARNING: Quantity dialog did not appear — proceeding anyway");
+      return;
+    }
+
+    // Type the desired quantity into the input
+    await this.page.evaluate((qty: number) => {
+      // Try to find the quantity input
+      const selectors = [
+        'input[placeholder*="Quantity" i]',
+        'input[placeholder*="Qty" i]',
+        'input[name*="quantity" i]',
+      ];
+      for (const sel of selectors) {
+        const inp = document.querySelector(sel) as HTMLInputElement | null;
+        if (inp) {
+          inp.focus();
+          // Clear and type
+          inp.value = "";
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+          if (setter) setter.call(inp, String(qty));
+          else inp.value = String(qty);
+          inp.dispatchEvent(new Event("input", { bubbles: true }));
+          inp.dispatchEvent(new Event("change", { bubbles: true }));
+          return "typed";
+        }
+      }
+      return null;
+    }, expectedQty);
+    await sleep(500);
+
+    // Click APPLY button
+    let applied = false;
+    for (let attempt = 0; attempt < 3 && !applied; attempt++) {
+      const result = await this.page.evaluate(() => {
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toUpperCase();
+          if (txt === "APPLY") {
+            let el: HTMLElement | null = d;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              if (style.includes("cursor: pointer") || el.getAttribute("role") === "button") {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return "clicked";
+              }
+              el = el.parentElement;
+            }
+            (d as HTMLElement).click();
+            return "clicked_fallback";
+          }
+        }
+        // Also try button
+        const buttons = document.querySelectorAll("button");
+        for (const btn of buttons) {
+          const txt = (btn.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
+          if (txt === "APPLY") {
+            (btn as HTMLElement).click();
+            return "clicked_button";
+          }
+        }
+        return null;
+      });
+
+      if (result) {
+        applied = true;
+        console.log(`Quantity APPLY clicked (${result})`);
+        await sleep(500);
+      } else {
+        console.log(`APPLY button not found (attempt ${attempt + 1}/3)`);
+        await sleep(300);
+      }
+    }
+
+    if (!applied) {
+      console.log("WARNING: Could not click APPLY — quantity may not be updated");
+    } else {
+      console.log(`Quantity updated to ${expectedQty} on order summary`);
+    }
+  }
+
+  private async verifyDeliveryAddressOnSummary(address: AddressDetails): Promise<void> {
+    console.log("Verifying delivery address on order summary...");
+    console.log(`Looking for: city="${address.city}", pincode="${address.pincode}"`);
+
+    // Wait for the order summary page to fully load the address section
+    try {
+      await this.page.waitForFunction(
+        () => {
+          const body = document.body.innerText || "";
+          return body.includes("Deliver to") || body.includes("Delivery Address");
+        },
+        { timeout: 15000 }
+      );
+      console.log("Address section loaded on order summary");
+    } catch {
+      console.log("WARNING: Address section not found on order summary page");
+    }
+    await sleep(300);
+
+    // Read current address text
+    const currentText = await this.page.evaluate(() => {
+      const allDivs = Array.from(document.querySelectorAll("div"));
+      for (const d of allDivs) {
+        const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+        if (txt.startsWith("Deliver to:")) {
+          return d.innerText || "";
+        }
+      }
+      // Fallback: look for any div containing address-relevant text
+      for (const d of allDivs) {
+        const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+        if (txt.includes("Deliver to")) {
+          return d.innerText || "";
+        }
+      }
+      return "";
+    });
+
+    console.log(`Current address text: "${(currentText || "").slice(0, 150)}"`);
+
+    const matchScore = this.scoreAddressMatch(currentText, address);
+    const hasPincode = (currentText || "").includes(address.pincode.trim());
+    const hasCity = (currentText || "").toLowerCase().includes(address.city.trim().toLowerCase());
+    console.log(`Address match score: ${matchScore}/6, pincode=${hasPincode}, city=${hasCity}`);
+
+    if (matchScore >= 3 || (hasPincode && hasCity)) {
+      console.log("Delivery address matches on order summary — no change needed");
+      return;
+    }
+
+    // Address mismatch — click "Change" near the address section
+    console.log("Delivery address mismatch on order summary — clicking Change...");
+    await this.clickAddressChangeButton();
+    await sleep(500);
+
+    // Wait for address list/modal to appear
+    let addressListLoaded = false;
+    for (let i = 0; i < 8 && !addressListLoaded; i++) {
+      await sleep(300);
+      addressListLoaded = await this.page.evaluate(() => {
+        const body = document.body.innerText || "";
+        return (
+          body.includes("Deliver to") ||
+          body.includes("Select Delivery") ||
+          body.includes("Saved Address") ||
+          body.includes("Delivery Address") ||
+          body.includes("ADD A NEW ADDRESS")
+        );
+      });
+      if (addressListLoaded) {
+        console.log(`Address list loaded (${(i + 1) * 1000}ms)`);
+        break;
+      }
+    }
+
+    if (!addressListLoaded) {
+      console.log("WARNING: Address list did not appear after Change click");
+    }
+
+    await sleep(300);
+
+    // Try to select the address from the existing list
+    const found = await this.selectAddressFromList(address);
+    if (found) {
+      console.log("Selected address from existing list on order summary");
+      // Wait for modal to close
+      let modalClosed = false;
+      for (let i = 0; i < 8 && !modalClosed; i++) {
+        await sleep(300);
+        try {
+          const stillOpen = await this.page.evaluate(() => {
+            const body = document.body.innerText || "";
+            return (
+              body.includes("Select Delivery Address") ||
+              body.includes("Edit Address") ||
+              body.includes("ADD A NEW ADDRESS")
+            );
+          });
+          if (!stillOpen) {
+            modalClosed = true;
+            console.log(`Address modal closed after ~${(i + 1) * 1000}ms`);
+          }
+        } catch (err) {
+          const msg = (err as Error).message;
+          if (msg.includes("detached") || msg.includes("Frame")) {
+            modalClosed = true;
+            console.log("Frame detached — modal likely closed");
+          }
+        }
+      }
+      await sleep(300);
+      return;
+    }
+
+    // Address not in list — add new address in a new tab
+    console.log("Address not in list on order summary — adding new address in new tab...");
+
+    const browser = this.page.browser();
+    const newTab = await browser.newPage();
+    await newTab.goto("https://www.flipkart.com/account/addresses", {
+      waitUntil: "networkidle2",
+      timeout: 20000,
+    });
+    console.log("Opened addresses page in new tab");
+    await sleep(500);
+
+    // Click ADD A NEW ADDRESS
+    await this.clickAddNewAddressButton(newTab);
+    await sleep(500);
+
+    // Wait for form
+    try {
+      await newTab.waitForFunction(
+        () => !!document.querySelector('input[name="name"]'),
+        { timeout: 10000 }
+      );
+    } catch {
+      console.log("WARNING: Address form fields did not appear in new tab");
+    }
+    await sleep(300);
+
+    // Fill form using existing helper
+    await this.fillAddressForm(newTab, address);
+
+    // Click Save
+    await this.clickSaveButton(newTab);
+
+    // Wait for save
+    let saved = false;
+    for (let i = 0; i < 8 && !saved; i++) {
+      await sleep(300);
+      try {
+        const nameInput = await newTab.$('input[name="name"]');
+        if (!nameInput) {
+          saved = true;
+          console.log(`Address saved (${(i + 1) * 1000}ms)`);
+        }
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (msg.includes("detached") || msg.includes("Frame")) {
+          saved = true;
+          console.log("Frame detached — save likely succeeded");
+        }
+      }
+    }
+
+    // Close new tab and return to order summary
+    await newTab.close();
+    console.log("Closed new tab, returning to order summary");
+
+    // Refresh order summary page
+    await this.page.goto(this.page.url(), { waitUntil: "networkidle2", timeout: 20000 });
+    await sleep(500);
+    console.log("Refreshed order summary page");
+
+    // Click Change again and select the newly added address
+    console.log("Clicking Change to select newly added address...");
+    await this.clickAddressChangeButton();
+    await sleep(500);
+
+    const selected = await this.selectAddressFromList(address);
+    if (selected) {
+      console.log("Selected newly added address on order summary");
+    } else {
+      console.log("WARNING: Could not auto-select newly added address");
+    }
+
+    // Wait for modal to close
+    let modalClosed = false;
+    for (let i = 0; i < 8 && !modalClosed; i++) {
+      await sleep(300);
+      try {
+        const stillOpen = await this.page.evaluate(() => {
+          const body = document.body.innerText || "";
+          return body.includes("Select Delivery Address") || body.includes("Edit Address") || body.includes("ADD A NEW ADDRESS");
+        });
+        if (!stillOpen) {
+          modalClosed = true;
+          console.log(`Modal closed after ~${(i + 1) * 1000}ms`);
+        }
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (msg.includes("detached") || msg.includes("Frame")) {
+          modalClosed = true;
+        }
+      }
+    }
+    await sleep(300);
+  }
+
+  private async verifyGstCheckboxOnSummary(): Promise<void> {
+    console.log("Verifying GST checkbox on order summary...");
+
+    // Wait for GST section to be visible
+    for (let i = 0; i < 5; i++) {
+      const visible = await this.page.evaluate(() => {
+        const body = document.body.innerText || "";
+        return body.includes("Use GST Invoice") || body.includes("GST Invoice") || body.includes("GST invoice");
+      });
+      if (visible) break;
+      await sleep(300);
+    }
+
+    // Check if already ticked
+    const isChecked = await this.page.evaluate(() => {
+      // Check for checked images
+      const checkedImgs = document.querySelectorAll('img[src*="checked"]');
+      if (checkedImgs.length > 0) return true;
+      // Check aria-checked
+      const checkboxes = document.querySelectorAll('[role="checkbox"]');
+      for (const cb of checkboxes) {
+        if (cb.getAttribute("aria-checked") === "true") return true;
+      }
+      // Check near "Use GST Invoice" text
+      const allDivs = Array.from(document.querySelectorAll("div"));
+      for (const d of allDivs) {
+        const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+        if (txt.includes("Use GST Invoice")) {
+          let el: HTMLElement | null = d.parentElement;
+          while (el && el !== document.body) {
+            const imgs = el.querySelectorAll('img[src*="checked"]');
+            if (imgs.length > 0) return true;
+            el = el.parentElement;
+          }
+        }
+      }
+      return false;
+    });
+
+    if (isChecked) {
+      console.log("GST checkbox already ticked on order summary");
+      return;
+    }
+
+    console.log("GST checkbox not ticked on order summary — clicking it");
+
+    let clicked = false;
+    for (let attempt = 0; attempt < 3 && !clicked; attempt++) {
+      const result = await this.page.evaluate(() => {
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (txt.includes("Use GST Invoice")) {
+            // Walk up to find clickable parent
+            let el: HTMLElement | null = d.parentElement;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              const role = el.getAttribute("role") || "";
+              if (
+                style.includes("cursor: pointer") ||
+                role === "checkbox" ||
+                el.tagName === "INPUT" ||
+                el.tagName === "IMG"
+              ) {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return true;
+              }
+              el = el.parentElement;
+            }
+            // Fallback: find nearest cursor:pointer ancestor
+            let parentEl: HTMLElement | null = d;
+            while (parentEl && parentEl !== document.body) {
+              const pStyle = parentEl.getAttribute("style") || "";
+              if (pStyle.includes("cursor: pointer")) {
+                parentEl.scrollIntoView({ block: "center" });
+                parentEl.click();
+                return true;
+              }
+              parentEl = parentEl.parentElement;
+            }
+            // Last resort: click the div itself
+            (d as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      });
+
+      if (result) {
+        clicked = true;
+        console.log("GST checkbox clicked on order summary");
+      } else {
+        console.log(`GST checkbox click failed (attempt ${attempt + 1}/3)`);
+        await sleep(300);
+      }
+    }
+
+    await sleep(300);
+
+    // Verify the checkbox is now ticked
+    const nowChecked = await this.page.evaluate(() => {
+      const checkedImgs = document.querySelectorAll('img[src*="checked"]');
+      if (checkedImgs.length > 0) return true;
+      const checkboxes = document.querySelectorAll('[role="checkbox"]');
+      for (const cb of checkboxes) {
+        if (cb.getAttribute("aria-checked") === "true") return true;
+      }
+      return false;
+    });
+
+    if (nowChecked) {
+      console.log("GST checkbox ticked successfully on order summary");
+    } else {
+      console.log("WARNING: GST checkbox may not have ticked — proceeding anyway");
+    }
+  }
+
+  private async clickContinueToCheckout(): Promise<void> {
+    console.log("Clicking Continue to proceed to checkout...");
+
+    // Wait for the Continue button to appear
+    let buttonFound = false;
+    for (let attempt = 0; attempt < 3 && !buttonFound; attempt++) {
+      try {
+        await this.page.waitForFunction(
+          () => {
+            const allDivs = Array.from(document.querySelectorAll("div"));
+            for (const d of allDivs) {
+              const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
+              // Flipkart Continue button often has "continue" text with green styling
+              if (txt === "continue" || txt === "continue ") {
+                return true;
+              }
+            }
+            // Also check buttons
+            const buttons = Array.from(document.querySelectorAll("button"));
+            for (const b of buttons) {
+              const txt = (b.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+              if (txt === "continue" || txt === "continue ") return true;
+            }
+            return false;
+          },
+          { timeout: 15000 }
+        );
+        buttonFound = true;
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (msg.includes("detached") || msg.includes("Frame")) {
+          console.log("Frame detached while waiting for Continue (attempt " + (attempt + 1) + "/3)");
+          await sleep(500);
+        } else {
+          console.log("WARNING: Continue button not found: " + msg);
+          return;
+        }
+      }
+    }
+
+    if (!buttonFound) {
+      console.log("WARNING: Continue button never appeared");
+      return;
+    }
+
+    // Click the Continue button
+    let result: string | null = null;
+    for (let attempt = 0; attempt < 3 && !result; attempt++) {
+      result = await this.page.evaluate(() => {
+        // Try buttons first (most reliable)
+        const buttons = Array.from(document.querySelectorAll("button"));
+        for (const b of buttons) {
+          const txt = (b.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+          if (txt === "continue" || txt === "continue ") {
+            (b as HTMLElement).click();
+            return "clicked_button";
+          }
+        }
+        // Try divs
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
+          if (txt === "continue" || txt === "continue ") {
+            // Walk up to find clickable parent
+            let el: HTMLElement | null = d;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              if (style.includes("cursor: pointer") || el.getAttribute("role") === "button") {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return "clicked_div";
+              }
+              el = el.parentElement;
+            }
+            // Fallback: click div itself
+            (d as HTMLElement).click();
+            return "clicked_div_fallback";
+          }
+        }
+        return null;
+      });
+
+      if (result) {
+        console.log(`Continue clicked (${result})`);
+        break;
+      } else {
+        console.log(`Continue not found (attempt ${attempt + 1}/3)`);
+        await sleep(300);
+      }
+    }
+
+    if (!result) {
+      console.log("WARNING: Could not click Continue button");
+      return;
+    }
+
+    // Wait for navigation away from order summary to payment page.
+    // After clicking Continue, the URL changes FROM /viewcheckout TO the payment page.
+    // We wait for the URL to NOT contain /viewcheckout, then wait for it to stabilize.
+    console.log("Waiting for Continue navigation...");
+    const startUrl = this.page.url();
+    let paymentPageReached = false;
+
+    for (let i = 0; i < 30; i++) { // 30 * 200ms = 6s max
+      await sleep(200);
+      try {
+        const url = this.page.url();
+        // Payment page URL patterns: does NOT contain /viewcheckout
+        if (url !== startUrl && !url.includes("/viewcheckout")) {
+          console.log(`Navigated away from order summary: ${url}`);
+          // Now wait for the page to fully load (networkidle2 equivalent via polling)
+          for (let j = 0; j < 30; j++) { // 30 * 200ms = 6s max
+            await sleep(200);
+            try {
+              const bodyLen = await this.page.evaluate(() => document.body.innerText.length);
+              const currentUrl = this.page.url();
+              // Check we're still on the same page (not redirected back)
+              if (currentUrl === url && bodyLen > 100) {
+                paymentPageReached = true;
+                console.log(`Payment page loaded: ${url}, body length: ${bodyLen}`);
+                break;
+              }
+            } catch {
+              // Page still loading, continue
+            }
+          }
+          break;
+        }
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (msg.includes("detached") || msg.includes("Frame") || msg.includes("Session closed")) {
+          console.log("Frame detached during Continue navigation — waiting...");
+        }
+      }
+    }
+
+    if (!paymentPageReached) {
+      const finalUrl = this.page.url();
+      console.log(`WARNING: Payment page may not have loaded. URL: ${finalUrl}`);
+    } else {
+      console.log("Continue navigation complete — on payment page");
+    }
+  }
+
+  private async verifyDeliveryAddress(address: AddressDetails): Promise<void> {
+    console.log("Checking delivery address...");
+    console.log(`Looking for: city="${address.city}", pincode="${address.pincode}", locality="${address.locality}"`);
+
+    // Wait for the checkout page to load
+    try {
+      await this.page.waitForFunction(
+        () => {
+          const divs = document.querySelectorAll("div");
+          for (const d of divs) {
+            const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+            if (txt.startsWith("Deliver to:")) return true;
+          }
+          return false;
+        },
+        { timeout: 15000 }
+      );
+      console.log("Checkout page loaded, checking address...");
+    } catch {
+      console.log("WARNING: Checkout page did not load within 15s");
+    }
+
+    // Get the current address text to check if it matches
+    const currentText = await this.page.evaluate(() => {
+      const divs = document.querySelectorAll("div");
+      for (const d of divs) {
+        const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+        if (txt.startsWith("Deliver to:")) return d.innerText || "";
+      }
+      return "";
+    });
+    console.log(`Current address: "${currentText.slice(0, 150)}"`);
+
+    const hasPincode = currentText.includes(address.pincode.trim());
+    const hasCity = currentText.toLowerCase().includes(address.city.trim().toLowerCase());
+    const matchScore = this.scoreAddressMatch(currentText, address);
+
+    console.log(`Pincode match: ${hasPincode}, City match: ${hasCity}, Score: ${matchScore}/6`);
+
+    if (hasPincode && hasCity) {
+      console.log("Delivery address matches — no change needed");
+      return;
+    }
+
+    // ----------------------------------------------------------------
+    // Step 1: Click "Change" button to open address list
+    // There are TWO "Change" buttons on checkout: one for address, one for GST.
+    // We need to find the one inside/near the "Deliver to:" section specifically.
+    // ----------------------------------------------------------------
+    console.log("Delivery address mismatch — clicking Change to open address list...");
+    await this.clickAddressChangeButton();
+
+    // Wait for the address list/modal to appear
+    let addressListLoaded = false;
+    for (let i = 0; i < 8; i++) {
+      await sleep(300);
+      const listVisible = await this.page.evaluate(() => {
+        const body = document.body.innerText || "";
+        return (
+          body.includes("Deliver to") ||
+          body.includes("Select Delivery") ||
+          body.includes("Edit Address") ||
+          body.includes("Saved Address") ||
+          body.includes("Delivery Address") ||
+          body.includes("ADD A NEW ADDRESS")
+        );
+      });
+      if (listVisible) {
+        console.log(`Address list loaded (${(i + 1) * 1000}ms)`);
+        addressListLoaded = true;
+        break;
+      }
+    }
+
+    if (!addressListLoaded) {
+      console.log("WARNING: Address list did not appear, taking screenshot");
+      // Dump page content to understand what happened
+      const dump = await this.page.evaluate(() => {
+        const body = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+        return body.slice(0, 800);
+      });
+      console.log(`[verifyDeliveryAddress] Page text after Change click: "${dump}"`);
+    }
+
+    // Give the address list a moment to fully render
+    await sleep(300);
+
+    // ----------------------------------------------------------------
+    // Step 2: Try to select the address from the list
+    // ----------------------------------------------------------------
+    // Step 2: Try to select the address from the list
+    // ----------------------------------------------------------------
+    const found = await this.selectAddressFromList(address);
+    if (found) {
+      console.log("Selected address from existing list");
+      // Wait for address modal to close (indicates return to checkout)
+      console.log("Waiting for address modal to close...");
+      let modalClosed = false;
+      for (let i = 0; i < 8 && !modalClosed; i++) {
+        await sleep(300);
+        try {
+          const isModalOpen = await this.page.evaluate(() => {
+            const body = document.body.innerText || "";
+            return (
+              body.includes("Select Delivery Address") ||
+              body.includes("Edit Address") ||
+              body.includes("ADD A NEW ADDRESS")
+            );
+          });
+          if (!isModalOpen) {
+            console.log(`Address modal closed after ~${(i + 1) * 1000}ms`);
+            modalClosed = true;
+          } else {
+            console.log(`Address modal still open (${(i + 1) * 1000}ms)...`);
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes("detached") || msg.includes("Frame")) {
+            console.log(`[verifyDeliveryAddress] Frame detached — modal likely closed`);
+            modalClosed = true;
+          } else {
+            console.log(`[verifyDeliveryAddress] Error checking modal state: ${msg}`);
+          }
+        }
+      }
+
+      if (modalClosed) {
+        console.log("Address selected successfully — proceeding with checkout");
+        await sleep(300);
+        return;
+      }
+
+      // Modal is still open — the click may not have actually selected the address
+      console.log("WARNING: Modal still open after click — selection may have failed");
+      console.log("Refreshing page to check state...");
+      try {
+        await this.page.reload({ waitUntil: "networkidle2", timeout: 15000 });
+      } catch {}
+      await sleep(500);
+
+      // Check if the address is now correctly set on the checkout page
+      const stillWrong = await this.page.evaluate((addr: AddressDetails) => {
+        const body = document.body.innerText || "";
+        return !body.includes(addr.pincode.trim());
+      }, address);
+
+      if (stillWrong) {
+        console.log("Address not correctly set — will add new address");
+      } else {
+        console.log("Address appears correct after refresh — proceeding");
+        return;
+      }
+    }
+
+    console.log("Address not found in list — will add new address");
+
+    // ----------------------------------------------------------------
+    // Step 3: Add new address
+    // ----------------------------------------------------------------
+    // Open new tab to add address
+    const browser = this.page.browser();
+    const newTab = await browser.newPage();
+    console.log("Opening /account/addresses in new tab...");
+    await newTab.goto("https://www.flipkart.com/account/addresses", {
+      waitUntil: "networkidle2",
+      timeout: 20000,
+    });
+
+    // Wait for the page to fully load — handle detached frame errors
+    try {
+      await newTab.waitForFunction(
+        () => document.body.innerText.length > 100,
+        { timeout: 15000 }
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("detached") || msg.includes("Frame")) {
+        console.log("[AddAddress] Frame detached during page load, retrying...");
+        await sleep(500);
+      }
+    }
+    await sleep(500);
+
+    // Click ADD A NEW ADDRESS
+    console.log("Clicking ADD A NEW ADDRESS...");
+    await this.clickAddNewAddressButton(newTab);
+    await sleep(500);
+
+    // Wait for the form to appear
+    try {
+      await newTab.waitForFunction(
+        () => {
+          const nameInput = document.querySelector('input[name="name"]');
+          return nameInput !== null;
+        },
+        { timeout: 10000 }
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("detached") || msg.includes("Frame")) {
+        console.log("[AddAddress] Frame detached waiting for form, retrying...");
+        await sleep(500);
+      }
+    }
+    await sleep(300);
+
+    // Fill form
+    console.log("Filling address form...");
+    await this.fillAddressForm(newTab, address);
+
+    // Click Save
+    console.log("Clicking Save...");
+    await this.clickSaveButton(newTab);
+
+    // Wait for save to process — watch for navigation or confirmation
+    let saved = false;
+    for (let i = 0; i < 8 && !saved; i++) {
+      await sleep(300);
+      try {
+        const pageState = await newTab.evaluate(() => {
+          const body = document.body.innerText || "";
+          return {
+            text: body.replace(/\s+/g, " ").trim().slice(0, 200),
+            url: window.location.href,
+          };
+        });
+        // Check if we're no longer on the add-address form
+        const nameInput = await newTab.$('input[name="name"]');
+        if (!nameInput) {
+          console.log(`[AddAddress] Form closed after ${(i + 1) * 1000}ms — save appears successful`);
+          saved = true;
+        } else {
+          console.log(`[AddAddress] Still on form (${(i + 1) * 1000}ms): ${pageState.text.slice(0, 100)}`);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("detached") || msg.includes("Frame")) {
+          console.log(`[AddAddress] Frame detached while waiting for save (attempt ${i + 1}/8)`);
+          saved = true; // Assume save happened
+        }
+      }
+    }
+
+    if (!saved) {
+      console.log("[AddAddress] WARNING: Could not confirm save, proceeding anyway");
+    }
+
+    await newTab.close();
+    console.log("Closed new tab, returning to checkout");
+
+    // Go back to checkout
+    await this.page.goto("https://www.flipkart.com/viewcheckout", {
+      waitUntil: "networkidle2",
+      timeout: 20000,
+    });
+    await sleep(500);
+
+    // Click Change again and select the newly added address
+    console.log("Clicking Change on checkout to select newly added address...");
+    await this.clickAddressChangeButton();
+    await sleep(500);
+
+    const selected = await this.selectAddressFromList(address);
+    if (selected) {
+      console.log("Selected newly added address");
+      await sleep(500);
+    } else {
+      console.log("WARNING: Could not auto-select newly added address");
+    }
+  }
+
+  private async verifyGstInvoice(address: AddressDetails): Promise<void> {
+    console.log("Checking GST invoice details...");
+
+    // Wait for the GST section to be visible on the checkout page
+    // Look for the "GST Invoice" or "Tax Invoice" section with "Change" button
+    let gstSectionVisible = false;
+    for (let attempt = 0; attempt < 5 && !gstSectionVisible; attempt++) {
+      gstSectionVisible = await this.page.evaluate(() => {
+        const body = document.body.innerText || "";
+        return (
+          body.includes("GST Invoice") ||
+          body.includes("Tax Invoice") ||
+          body.includes("Use GST Invoice") ||
+          body.includes("GST invoice") ||
+          /\d{2}[A-Z]{3}[A-Z0-9]{10}/.test(body) // GST number pattern 15 chars
+        );
+      });
+      if (!gstSectionVisible) {
+        console.log(`GST section not visible yet (attempt ${attempt + 1}/5), waiting...`);
+        await sleep(500);
+      }
+    }
+
+    if (!gstSectionVisible) {
+      console.log("No GST section found on this page — skipping GST verification");
+      return;
+    }
+    console.log("GST section found on page, checking current details...");
+
+    // Extract all text from the page to search for GST number
+    const pageText = await this.page.evaluate(() => document.body.innerText || "");
+
+    const gstNumberClean = address.gstNumber.trim().replace(/\s/g, "");
+    const companyNameClean = address.companyName.trim().toLowerCase();
+
+    // Primary check: GST number appears anywhere on the page
+    const hasGstNumber = gstNumberClean.length >= 15 && pageText.includes(gstNumberClean);
+
+    // Secondary check: company name appears in GST context
+    const hasCompanyName = companyNameClean.length >= 3 && pageText.includes(companyNameClean);
+
+    console.log(`GST number "${gstNumberClean}" on page: ${hasGstNumber}`);
+    console.log(`Company name "${companyNameClean}" on page: ${hasCompanyName}`);
+
+    // If GST number is found, consider it a match (company name may be abbreviated on checkout)
+    if (hasGstNumber) {
+      console.log("GST invoice details match — no change needed");
+      return;
+    }
+
+    console.log("GST invoice mismatch or missing — updating GST details");
+
+    // Find the GST-specific "Change" button — look for it inside the GST invoice section
+    // Strategy: find a "Change" button that is near GST-related text
+    let gstChangeClicked = false;
+    for (let attempt = 0; attempt < 3 && !gstChangeClicked; attempt++) {
+      const result = await this.page.evaluate(() => {
+        // Find the GST invoice section first
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        let gstSectionDiv: HTMLElement | null = null;
+
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (
+            txt.includes("GST Invoice") ||
+            txt.includes("Tax Invoice") ||
+            txt.includes("Use GST Invoice") ||
+            txt.includes("GST invoice")
+          ) {
+            // Make sure this is a substantial div (not a tiny element)
+            if ((d.innerText || "").length > 20) {
+              gstSectionDiv = d;
+              break;
+            }
+          }
+        }
+
+        if (!gstSectionDiv) return "no_section";
+
+        // Now find the "Change" button inside or near the GST section
+        const changeButtons = Array.from(
+          gstSectionDiv.querySelectorAll("div, span")
+        ) as HTMLElement[];
+        for (const btn of changeButtons) {
+          const txt = (btn.innerText || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .toLowerCase();
+          if (txt === "change") {
+            // Walk up to find clickable parent
+            let el: HTMLElement | null = btn;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              if (
+                style.includes("cursor: pointer") ||
+                el.getAttribute("role") === "button" ||
+                el.tagName === "BUTTON"
+              ) {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return "clicked";
+              }
+              el = el.parentElement;
+            }
+            // Fallback: click btn itself
+            btn.scrollIntoView({ block: "center" });
+            btn.click();
+            return "clicked";
+          }
+        }
+        return "no_button";
+      });
+
+      if (result === "clicked") {
+        gstChangeClicked = true;
+        console.log("GST 'Change' button clicked");
+        break;
+      } else if (result === "no_section") {
+        console.log(`GST section not found in DOM (attempt ${attempt + 1}/3)`);
+      } else {
+        console.log(`GST 'Change' button not found in section (attempt ${attempt + 1}/3)`);
+      }
+      await sleep(300);
+    }
+
+    if (!gstChangeClicked) {
+      // Fallback: try the general text button approach
+      console.log("Trying general 'Change' button approach...");
+      await this.clickTextButton("Change");
+      await sleep(500);
+    }
+
+    // Wait for GST form or "Add new GST Details" to appear
+    let gstFormReady = false;
+    for (let i = 0; i < 5 && !gstFormReady; i++) {
+      gstFormReady = await this.page.evaluate(() => {
+        const body = document.body.innerText || "";
+        return (
+          body.includes("Add new GST Details") ||
+          document.querySelector('input[maxlength="15"]') !== null ||
+          document.querySelector('input[maxlength="60"]') !== null
+        );
+      });
+      if (!gstFormReady) {
+        await sleep(300);
+      }
+    }
+
+    // Check if "Add new GST Details" button is visible and click it
+    const hasAddNewGst = await this.page.evaluate(() => {
+      return document.body.innerText.includes("Add new GST Details");
+    });
+
+    if (hasAddNewGst) {
+      console.log("Clicking 'Add new GST Details'...");
+      await this.clickTextButton("Add new GST Details");
+      await sleep(500);
+    } else {
+      console.log("'Add new GST Details' not found — form may already be open");
+    }
+
+    // Wait for form inputs to appear
+    for (let i = 0; i < 5; i++) {
+      const hasInputs = await this.page.evaluate(() => {
+        return (
+          document.querySelector('input[maxlength="15"]') !== null ||
+          document.querySelector('input[maxlength="60"]') !== null
+        );
+      });
+      if (hasInputs) break;
+      await sleep(300);
+    }
+
+    // Fill GST number and company name
+    await this.fillGstForm(address.gstNumber, address.companyName);
+
+    // Click Confirm and Save
+    await this.clickConfirmAndSave();
+    await sleep(500);
+  }
+
+  private async ensureGstCheckboxTicked(): Promise<void> {
+    console.log("Checking GST invoice checkbox...");
+
+    // Wait for GST section to be visible first
+    for (let i = 0; i < 5; i++) {
+      const visible = await this.page.evaluate(() => {
+        const body = document.body.innerText || "";
+        return body.includes("Use GST Invoice") || body.includes("GST Invoice");
+      });
+      if (visible) break;
+      await sleep(300);
+    }
+
+    // Check if GST checkbox is already ticked
+    const isChecked = await this.page.evaluate(() => {
+      // Flipkart uses img tags for checkbox states
+      const checkedImgs = document.querySelectorAll('img[src*="checked"]');
+      // Also check for any checkbox-like element that is checked
+      const checkboxes = document.querySelectorAll('[role="checkbox"]');
+      for (const cb of checkboxes) {
+        if (cb.getAttribute("aria-checked") === "true") return true;
+      }
+      // Check if any img near "Use GST Invoice" is checked
+      const allDivs = Array.from(document.querySelectorAll("div"));
+      for (const d of allDivs) {
+        if ((d.innerText || "").replace(/\s+/g, " ").trim().includes("Use GST Invoice")) {
+          // Look for checked img inside this div's container
+          let el: HTMLElement | null = d.parentElement;
+          while (el && el !== document.body) {
+            const imgs = el.querySelectorAll('img[src*="checked"]');
+            if (imgs.length > 0) return true;
+            el = el.parentElement;
+          }
+        }
+      }
+      return checkedImgs.length > 0;
+    });
+
+    if (isChecked) {
+      console.log("GST invoice checkbox is already ticked");
+      return;
+    }
+
+    console.log("GST invoice checkbox not ticked — clicking it");
+
+    let clicked = false;
+    for (let attempt = 0; attempt < 3 && !clicked; attempt++) {
+      const result = await this.page.evaluate(() => {
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (txt.includes("Use GST Invoice")) {
+            // Find the checkbox-like element within the GST section
+            // Look for clickable elements near this text
+            let el: HTMLElement | null = d.parentElement;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              const role = el.getAttribute("role") || "";
+              if (
+                style.includes("cursor: pointer") ||
+                role === "checkbox" ||
+                el.tagName === "INPUT" ||
+                el.tagName === "IMG"
+              ) {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return true;
+              }
+              el = el.parentElement;
+            }
+            // Fallback: click the nearest cursor:pointer parent of d
+            let parentEl: HTMLElement | null = d;
+            while (parentEl && parentEl !== document.body) {
+              const pStyle = parentEl.getAttribute("style") || "";
+              if (pStyle.includes("cursor: pointer")) {
+                parentEl.scrollIntoView({ block: "center" });
+                parentEl.click();
+                return true;
+              }
+              parentEl = parentEl.parentElement;
+            }
+            // Last resort: click the div itself
+            (d as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      });
+
+      if (result) {
+        clicked = true;
+        console.log("GST checkbox clicked");
+      } else {
+        console.log(`GST checkbox click failed (attempt ${attempt + 1}/3)`);
+        await sleep(300);
+      }
+    }
+
+    await sleep(300);
+    const stillUnchecked = await this.page.evaluate(() => {
+      const checkedImgs = document.querySelectorAll('img[src*="checked"]');
+      return checkedImgs.length === 0;
+    });
+
+    if (stillUnchecked) {
+      console.log("Warning: GST invoice checkbox may not have ticked — proceeding anyway");
+    } else {
+      console.log("GST invoice checkbox ticked successfully");
+    }
+  }
+
+  private async clickTextButton(text: string, page?: import("puppeteer-core").Page): Promise<void> {
+    const targetPage = page || this.page;
+    const normalized = text.replace(/\s+/g, " ").trim();
+
+    await waitWithRetry(
+      targetPage,
+      async () => {
+        await targetPage.waitForFunction(
+          (lbl: string) => {
+            const allDivs = document.querySelectorAll("div");
+            for (const d of allDivs) {
+              const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
+              if (txt.includes(lbl.toLowerCase())) return true;
+            }
+            return false;
+          },
+          { timeout: 5000 },
+          normalized
+        );
+      },
+      { label: `Button: ${text}`, timeoutMs: 8000, maxRetries: 5 }
+    );
+
+    await targetPage.evaluate(
+      (lbl: string) => {
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        const matches = allDivs.filter((d) => {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
+          return txt.includes(lbl.toLowerCase());
+        });
+
+        for (const d of matches) {
+          let el: HTMLElement | null = d;
+          while (el && el !== document.body) {
+            const style = el.getAttribute("style") || "";
+            if (style.includes("cursor: pointer") || el.getAttribute("role") === "button") {
+              el.scrollIntoView({ block: "center" });
+              el.click();
+              return;
+            }
+            el = el.parentElement as HTMLElement | null;
+          }
+          // Fallback: use parent if it has cursor
+          const parent = d.parentElement;
+          if (parent && (parent.getAttribute("style") || "").includes("cursor")) {
+            parent.scrollIntoView({ block: "center" });
+            parent.click();
+            return;
+          }
+          d.scrollIntoView({ block: "center" });
+          (d as HTMLElement).click();
+          return;
+        }
+      },
+      normalized
+    );
+    console.log(`Clicked: ${text}`);
+  }
+
+  /**
+   * Click the "Change" button specifically for the delivery address section.
+   * On the checkout page, there are multiple "Change" buttons (address + GST).
+   * This method finds the one inside or adjacent to the "Deliver to:" section.
+   */
+  private async clickAddressChangeButton(): Promise<void> {
+    // Wait for the address "Change" button to appear — handle detached frame errors
+    let buttonFound = false;
+    for (let attempt = 0; attempt < 3 && !buttonFound; attempt++) {
+      try {
+        await this.page.waitForFunction(
+          () => {
+            const divs = Array.from(document.querySelectorAll("div"));
+            for (const d of divs) {
+              const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+              if (txt === "Change " || txt === "Change") return true;
+            }
+            return false;
+          },
+          { timeout: 15000 }
+        );
+        buttonFound = true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("detached") || msg.includes("Frame")) {
+          console.log(`[clickAddressChangeButton] Frame detached (attempt ${attempt + 1}/3), retrying...`);
+          await sleep(500);
+        } else {
+          console.log(`WARNING: Address 'Change' button never appeared: ${msg}`);
+          return;
+        }
+      }
+    }
+
+    if (!buttonFound) {
+      console.log("WARNING: Address 'Change' button never appeared");
+      return;
+    }
+
+    // Find all "Change" buttons and pick the one near the "Deliver to:" section
+    let result: string;
+    try {
+      result = await this.page.evaluate(() => {
+      const allDivs = Array.from(document.querySelectorAll("div")) as HTMLElement[];
+
+      // Find the "Deliver to:" section container first
+      let deliverToSection: HTMLElement | null = null;
+      for (const d of allDivs) {
+        const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+        if (txt.startsWith("Deliver to:")) {
+          deliverToSection = d;
+          break;
+        }
+      }
+
+      if (!deliverToSection) {
+        // Fallback: click the first "Change" div we find
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (txt === "Change " || txt === "Change") {
+            // Walk up to find clickable parent
+            let el: HTMLElement | null = d;
+            let bestEl: HTMLElement | null = null;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              const cls = el.className || "";
+              if (cls.includes("css-g5y9jx") && style.includes("cursor")) {
+                bestEl = el;
+              }
+              if (style.includes("cursor: pointer")) {
+                bestEl = el;
+              }
+              el = el.parentElement as HTMLElement | null;
+            }
+            if (bestEl) {
+              bestEl.scrollIntoView({ block: "center" });
+              bestEl.click();
+              return "clicked_first_change";
+            }
+            (d as HTMLElement).click();
+            return "clicked_first_change_fallback";
+          }
+        }
+        return "no_change_button_found";
+      }
+
+      // Find "Change" buttons inside or near the "Deliver to:" section
+      // Walk through siblings of deliverToSection
+      const parent = deliverToSection.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.querySelectorAll(":scope > *")) as HTMLElement[];
+        for (const sibling of siblings) {
+          const siblingText = (sibling.innerText || "").replace(/\s+/g, " ").trim();
+          if (siblingText === "Change " || siblingText === "Change") {
+            sibling.scrollIntoView({ block: "center" });
+            sibling.click();
+            return "clicked_deliver_section_sibling";
+          }
+        }
+      }
+
+      // Search within the deliverToSection and nearby DOM for "Change"
+      const innerDivs = Array.from(
+        deliverToSection.querySelectorAll("div, span, button")
+      ) as HTMLElement[];
+      for (const d of innerDivs) {
+        const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+        if (txt === "Change " || txt === "Change") {
+          let el: HTMLElement | null = d;
+          while (el && el !== document.body) {
+            const style = el.getAttribute("style") || "";
+            if (style.includes("cursor: pointer")) {
+              el.scrollIntoView({ block: "center" });
+              el.click();
+              return "clicked_inside_deliver_section";
+            }
+            el = el.parentElement;
+          }
+          (d as HTMLElement).click();
+          return "clicked_inside_deliver_fallback";
+        }
+      }
+
+      // Check if "Change" is in the parent's siblings' children
+      if (parent && parent.parentElement) {
+        const gpChildren = Array.from(
+          parent.parentElement.querySelectorAll(":scope > *")
+        ) as HTMLElement[];
+        for (const child of gpChildren) {
+          if (child === parent) continue;
+          const childText = (child.innerText || "").replace(/\s+/g, " ").trim();
+          if (childText === "Change " || childText === "Change") {
+            child.scrollIntoView({ block: "center" });
+            child.click();
+            return "clicked_gp_sibling";
+          }
+          // Look in grandchildren
+          const gc = Array.from(
+            child.querySelectorAll("div, span, button")
+          ) as HTMLElement[];
+          for (const gcEl of gc) {
+            const gcText = (gcEl.innerText || "").replace(/\s+/g, " ").trim();
+            if (gcText === "Change " || gcText === "Change") {
+              let el: HTMLElement | null = gcEl;
+              while (el && el !== document.body) {
+                if ((el.getAttribute("style") || "").includes("cursor: pointer")) {
+                  el.scrollIntoView({ block: "center" });
+                  el.click();
+                  return "clicked_gc";
+                }
+                el = el.parentElement;
+              }
+            }
+          }
+        }
+      }
+
+      // Last resort: scan ALL divs and prefer the one closest to "Deliver to:"
+      let bestDist = Infinity;
+      let bestEl: HTMLElement | null = null;
+      const dtRect = deliverToSection.getBoundingClientRect();
+      for (const d of allDivs) {
+        const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+        if (txt === "Change " || txt === "Change") {
+          const r = d.getBoundingClientRect();
+          const dist = Math.abs(r.top - dtRect.top) + Math.abs(r.left - dtRect.left);
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestEl = d;
+          }
+        }
+      }
+      if (bestEl) {
+        bestEl.scrollIntoView({ block: "center" });
+        bestEl.click();
+        return `clicked_nearest_change_dist=${bestDist.toFixed(0)}`;
+      }
+
+      return "no_change_button_found";
+    });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("detached") || msg.includes("Frame")) {
+        console.log("[clickAddressChangeButton] Frame detached during evaluation — page likely navigated, proceeding...");
+      } else {
+        console.log(`[clickAddressChangeButton] Evaluate error: ${msg}`);
+      }
+      return;
+    }
+
+    console.log(`[clickAddressChangeButton] Result: ${result}`);
+  }
+
+  /** Click a button by text — finds divs matching the text, then clicks the outermost clickable parent */
+  private async clickDivButton(label: string): Promise<void> {
+    // Normalize the label: collapse all whitespace to single spaces, trim
+    const normalizedLabel = label.replace(/\s+/g, " ").trim().toLowerCase();
+
+    // Wait for the button to appear using waitForFunction with regex matching
+    try {
+      await this.page.waitForFunction(
+        (lbl: string) => {
+          const allDivs = document.querySelectorAll("div");
+          for (const d of allDivs) {
+            const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
+            if (txt.includes(lbl.toLowerCase())) return true;
+          }
+          return false;
+        },
+        { timeout: 15000 },
+        label.replace(/\s+/g, " ").trim()
+      );
+      console.log(`Button found: ${label}`);
+    } catch {
+      // Debug: show what's on the page
+      const pageText = await this.page.evaluate(() => {
+        const divs = Array.from(document.querySelectorAll("div"));
+        const results: { text: string; style: string }[] = [];
+        for (const d of divs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (txt.length > 2 && txt.length < 100) {
+            results.push({ text: txt, style: (d.getAttribute("style") || "").slice(0, 100) });
+          }
+        }
+        return results.slice(0, 30);
+      });
+      console.log(`WARNING: Could not find button "${label}". Page divs:`);
+      pageText.forEach((d) => console.log(`  "${d.text}" | style="${d.style}"`));
+      return;
+    }
+
+    // Find and click using page.evaluate
+    const clicked = await this.page.evaluate(
+      (lbl: string) => {
+        // Find ALL divs containing the label text (case-insensitive, whitespace-normalized)
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        const matchingDivs = allDivs.filter((d) => {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          return txt.toLowerCase().includes(lbl.toLowerCase());
+        });
+
+        console.log(`Found ${matchingDivs.length} div(s) with text containing "${lbl}"`);
+
+        for (const d of matchingDivs) {
+          // Walk UP to find the best clickable parent (css-g5y9jx with cursor)
+          let bestEl: HTMLElement | null = null;
+          let el: HTMLElement | null = d;
+          let depth = 0;
+          while (el && el !== document.body && depth < 10) {
+            const cls = el.className || "";
+            const style = el.getAttribute("style") || "";
+            if (cls.includes("css-g5y9jx") && style.includes("cursor")) {
+              bestEl = el;
+            }
+            // Also capture any element with cursor: pointer
+            if (style.includes("cursor: pointer")) {
+              bestEl = el;
+            }
+            el = el.parentElement as HTMLElement | null;
+            depth++;
+          }
+
+          if (bestEl) {
+            bestEl.scrollIntoView({ block: "center" });
+            bestEl.click();
+            return true;
+          }
+
+          // Fallback: click the text div itself
+          (d as HTMLElement).click();
+          return true;
+        }
+        return false;
+      },
+      label.replace(/\s+/g, " ").trim()
+    );
+
+    if (clicked) {
+      console.log(`Clicked: ${label}`);
+    } else {
+      console.log(`WARNING: Could not click: ${label}`);
+    }
+  }
+
+  /** Click the "ADD A NEW ADDRESS" button on the addresses page */
+  private async clickAddNewAddressButton(page: import("puppeteer-core").Page): Promise<void> {
+    const label = "ADD A NEW ADDRESS";
+
+    // Wait for the button to appear
+    try {
+      await page.waitForFunction(
+        (lbl: string) => {
+          // Method 1: Find by class cv8zZS
+          const byClass = document.querySelectorAll(".cv8zZS") as NodeListOf<HTMLElement>;
+          for (const b of byClass) {
+            const txt = (b.innerText || "").toUpperCase();
+            if (txt.includes(lbl)) return true;
+          }
+          // Method 2: Find any div containing the text
+          const allDivs = document.querySelectorAll("div") as NodeListOf<HTMLElement>;
+          for (const d of allDivs) {
+            const txt = (d.innerText || "").toUpperCase();
+            if (txt.includes(lbl)) return true;
+          }
+          return false;
+        },
+        { timeout: 10000 },
+        label
+      );
+      console.log(`Button found: ${label}`);
+    } catch {
+      console.log(`WARNING: Could not find button "${label}"`);
+      return;
+    }
+
+    // Find and click: target div.cv8zZS that contains the text
+    const clicked = await page.evaluate(
+      (lbl: string) => {
+        // Strategy 1: Find div.cv8zZS that has the text
+        const byClass = document.querySelectorAll(".cv8zZS") as NodeListOf<HTMLElement>;
+        for (const d of byClass) {
+          const txt = (d.innerText || "").toUpperCase();
+          if (txt.includes(lbl)) {
+            d.scrollIntoView({ block: "center" });
+            d.click();
+            return true;
+          }
+        }
+        // Strategy 2: Find any div with the text, then walk up to cv8zZS
+        const allDivs = Array.from(document.querySelectorAll("div")) as HTMLElement[];
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").toUpperCase();
+          if (txt.includes(lbl)) {
+            let el: HTMLElement | null = d;
+            while (el && el !== document.body) {
+              if (el.className && el.className.includes("cv8zZS")) {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return true;
+              }
+              el = el.parentElement as HTMLElement | null;
+            }
+            // Fallback: click the div
+            d.scrollIntoView({ block: "center" });
+            (d as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      },
+      label
+    );
+
+    if (clicked) {
+      console.log("Clicked: ADD A NEW ADDRESS");
+    } else {
+      console.log("WARNING: Could not click ADD A NEW ADDRESS");
+    }
+  }
+
+  /** Click the Save button on the address form */
+  private async clickSaveButton(page: import("puppeteer-core").Page): Promise<void> {
+    // Wait for the button to appear — handle detached frame errors from async navigation
+    let buttonFound = false;
+    for (let attempt = 0; attempt < 5 && !buttonFound; attempt++) {
+      try {
+        await page.waitForFunction(
+          () => {
+            const btns = document.querySelectorAll("button.dSM5Ub");
+            return btns.length > 0;
+          },
+          { timeout: 10000 }
+        );
+        buttonFound = true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("detached") || msg.includes("Frame")) {
+          console.log(`[clickSaveButton] Frame detached during wait (attempt ${attempt + 1}/5), retrying...`);
+          await sleep(300);
+        } else {
+          console.log(`WARNING: Could not find Save button: ${msg}`);
+          return;
+        }
+      }
+    }
+
+    if (!buttonFound) {
+      console.log("WARNING: Save button never appeared");
+      return;
+    }
+    console.log("Save button found");
+
+    // Use Puppeteer's native click() instead of page.evaluate(btn.click())
+    // native click() waits for element to be actionable and fires proper events
+    try {
+      await page.click("button.dSM5Ub", { delay: 50 });
+      console.log("Clicked: Save (native click)");
+      return;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("detached") || msg.includes("Frame")) {
+        console.log(`[clickSaveButton] Frame detached — page navigated, save may have succeeded`);
+        return;
+      }
+      console.log(`[clickSaveButton] Native click failed: ${msg}, trying fallback...`);
+    }
+
+    // Fallback: evaluate-based click
+    let clicked = false;
+    try {
+      clicked = await page.evaluate(() => {
+        const btn = document.querySelector("button.dSM5Ub") as HTMLButtonElement | null;
+        if (!btn) return false;
+
+        // Try mouse click at button center (most reliable for React buttons)
+        const rect = btn.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          const x = rect.left + rect.width / 2;
+          const y = rect.top + rect.height / 2;
+          btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y, button: 0 }));
+          btn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y, button: 0 }));
+          btn.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y, button: 0 }));
+          return true;
+        }
+
+        btn.scrollIntoView({ block: "center" });
+        btn.click();
+        return true;
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("detached") || msg.includes("Frame")) {
+        console.log(`[clickSaveButton] Frame detached during fallback — page navigated, save likely succeeded`);
+        return;
+      }
+      console.log(`[clickSaveButton] Fallback evaluate error: ${msg}`);
+    }
+
+    if (clicked) console.log("Clicked: Save (fallback mouse event)");
+    else console.log("WARNING: Could not click Save");
+  }
+
+  /** Click the "Confirm and Save" button in the GST form — div.css-g5y9jx with grey background */
+  private async clickConfirmAndSave(): Promise<void> {
+    const label = "Confirm and Save";
+
+    // Wait for the button to appear
+    try {
+      await this.page.waitForFunction(
+        (lbl: string) => {
+          const allDivs = document.querySelectorAll("div");
+          for (const d of allDivs) {
+            const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+            if (txt === lbl || txt.includes(lbl)) return true;
+          }
+          return false;
+        },
+        { timeout: 10000 },
+        label
+      );
+      console.log("Confirm and Save button found");
+    } catch {
+      console.log("WARNING: Could not find Confirm and Save button");
+      return;
+    }
+
+    // Click: find the div containing the text, then walk up to the clickable parent
+    const clicked = await this.page.evaluate(
+      (lbl: string) => {
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        const matches = allDivs.filter((d) => {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          return txt.includes(lbl);
+        });
+
+        for (const d of matches) {
+          // Walk up to find the best clickable element
+          let el: HTMLElement | null = d;
+          let bestEl: HTMLElement | null = null;
+          while (el && el !== document.body) {
+            const style = el.getAttribute("style") || "";
+            const cls = el.className || "";
+            // Prefer the grey-background div (css-g5y9jx)
+            if (cls.includes("css-g5y9jx") && style.includes("cursor")) {
+              bestEl = el;
+            }
+            if (style.includes("cursor: pointer")) {
+              bestEl = el;
+            }
+            el = el.parentElement as HTMLElement | null;
+          }
+          if (bestEl) {
+            bestEl.scrollIntoView({ block: "center" });
+            bestEl.click();
+            return true;
+          }
+          // Fallback: click the text div itself
+          (d as HTMLElement).click();
+          return true;
+        }
+        return false;
+      },
+      label
+    );
+
+    if (clicked) console.log("Clicked: Confirm and Save");
+    else console.log("WARNING: Could not click Confirm and Save");
+  }
+
+  /**
+   * Scans the saved-addresses modal for a card matching the target address
+   * by company name + city + locality. Falls back to false if no match found.
+   * Saved address cards show: company name (bold) + "locality, city" text.
+   */
+  private async selectAddressFromList(address: AddressDetails): Promise<boolean> {
+    const targetName = (address.companyName || address.name || "").trim().toLowerCase();
+    const targetCity = address.city.trim().toLowerCase();
+    const targetLocality = (address.locality || "").trim().toLowerCase();
+    console.log(`[SelectAddress] Looking for saved address: name="${targetName}", city="${targetCity}", locality="${targetLocality}"`);
+
+    // Wait for the address modal to appear
+    let modalFound = false;
+    for (let attempt = 0; attempt < 8 && !modalFound; attempt++) {
+      try {
+        modalFound = await this.page.evaluate(() => {
+          const body = document.body.innerText || "";
+          return (
+            body.includes("Deliver to") ||
+            body.includes("Select Delivery Address") ||
+            body.includes("Saved Address") ||
+            body.includes("Delivery Address") ||
+            body.includes("ADD A NEW ADDRESS")
+          );
+        });
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (msg.includes("detached") || msg.includes("Frame")) {
+          console.log(`[SelectAddress] Frame detached (attempt ${attempt + 1}/8), waiting...`);
+          await sleep(500);
+          continue;
+        }
+        throw err;
+      }
+      if (!modalFound) await sleep(300);
+    }
+
+    if (!modalFound) {
+      console.log("[SelectAddress] Address modal never appeared");
+      return false;
+    }
+    console.log("[SelectAddress] Address modal detected");
+    await sleep(500);
+
+    // Find all address card candidates — Flipkart uses cDeXU9 for clickable address cards
+    // Each card contains company name div + locality/city text div
+    let result: {
+      x: number;
+      y: number;
+      cardText: string;
+      score: number;
+    } | null = null;
+
+    for (let attempt = 0; attempt < 3 && !result; attempt++) {
+      try {
+        result = await this.page.evaluate(
+          (addr: AddressDetails) => {
+            const targetName = (addr.companyName || addr.name || "").trim().toLowerCase();
+            const targetCity = addr.city.trim().toLowerCase();
+            const targetLocality = (addr.locality || "").trim().toLowerCase();
+
+            const cards: {
+              el: HTMLElement;
+              name: string;
+              text: string;
+              rect: DOMRect;
+            }[] = [];
+
+            // Strategy 1: Find by cDeXU9 class (the address card class from the DOM)
+            const cdexu9 = document.querySelectorAll(".cDeXU9");
+            for (const el of cdexu9) {
+              // cDeXU9 cards have cursor:pointer and contain address text
+              const text = (el as HTMLElement).innerText || "";
+              const style = (el as HTMLElement).getAttribute("style") || "";
+              if (
+                style.includes("cursor") &&
+                text.trim().length > 5 &&
+                !text.toLowerCase().includes("add a new address")
+              ) {
+                const r = (el as HTMLElement).getBoundingClientRect();
+                cards.push({ el: el as HTMLElement, name: "", text, rect: r });
+              }
+            }
+
+            // Strategy 2: Find all divs with cursor:pointer that look like address cards
+            if (cards.length === 0) {
+              const allDivs = document.querySelectorAll("div[style*='cursor']");
+              for (const el of allDivs) {
+                const style = (el as HTMLElement).getAttribute("style") || "";
+                const text = (el as HTMLElement).innerText || "";
+                if (
+                  style.includes("pointer") &&
+                  text.trim().length > 10 &&
+                  !text.toLowerCase().includes("add a new address") &&
+                  (text.toLowerCase().includes("deliver") ||
+                    text.toLowerCase().includes(targetCity) ||
+                    text.toLowerCase().includes("address"))
+                ) {
+                  const r = (el as HTMLElement).getBoundingClientRect();
+                  cards.push({ el: el as HTMLElement, name: "", text, rect: r });
+                }
+              }
+            }
+
+            // Strategy 3: Find any visible divs containing address-like text
+            if (cards.length === 0) {
+              const allEls = document.querySelectorAll("div");
+              for (const el of allEls) {
+                const text = (el as HTMLElement).innerText || "";
+                const style = (el as HTMLElement).getAttribute("style") || "";
+                if (
+                  (style.includes("cursor") || style.includes("pointer")) &&
+                  text.trim().length > 20 &&
+                  !text.toLowerCase().includes("add a new address") &&
+                  (text.toLowerCase().includes(targetCity) || text.toLowerCase().includes(targetName))
+                ) {
+                  const r = (el as HTMLElement).getBoundingClientRect();
+                  cards.push({ el: el as HTMLElement, name: "", text, rect: r });
+                }
+              }
+            }
+
+            console.log(`[SelectAddress] Found ${cards.length} address card candidates`);
+
+            if (cards.length === 0) {
+              // Last resort: scan all visible clickable divs with city or name text
+              const allDivs = Array.from(document.querySelectorAll("div")) as HTMLElement[];
+              for (const d of allDivs) {
+                const style = d.getAttribute("style") || "";
+                const text = d.innerText || "";
+                const cls = d.className || "";
+                if (
+                  (style.includes("cursor") || cls.includes("css-g5y9jx")) &&
+                  text.trim().length > 15 &&
+                  !text.toLowerCase().includes("add a new address") &&
+                  text.toLowerCase().includes(targetCity)
+                ) {
+                  const r = d.getBoundingClientRect();
+                  if (r.width > 50 && r.height > 30) {
+                    cards.push({ el: d, name: "", text, rect: r });
+                  }
+                }
+              }
+            }
+
+            // Score each card
+            let bestScore = -1;
+            let bestCard: { el: HTMLElement; name: string; text: string; rect: DOMRect } | null = null;
+
+            for (const card of cards) {
+              const cardText = card.text.toLowerCase();
+              const cardName = card.name.toLowerCase();
+              let score = 0;
+
+              // Name match (highest weight — company names are unique per address)
+              if (targetName && (cardText.includes(targetName) || cardName.includes(targetName))) {
+                score += 4;
+              }
+
+              // City match
+              if (targetCity && cardText.includes(targetCity)) {
+                score += 2;
+              }
+
+              // Locality keyword match
+              if (targetLocality) {
+                const localityParts = targetLocality.split(/\s+/).filter((p) => p.length > 3);
+                for (const part of localityParts) {
+                  if (cardText.includes(part)) {
+                    score += 1;
+                    break;
+                  }
+                }
+              }
+
+              console.log(
+                `[SelectAddress] Card score=${score} name="${targetName}" city="${targetCity}" | text="${card.text.replace(
+                  /\s+/g,
+                  " "
+                ).trim().slice(0, 100)}"`
+              );
+
+              if (score > bestScore) {
+                bestScore = score;
+                bestCard = card;
+              }
+            }
+
+            if (!bestCard || bestScore < 1) {
+              console.log(`[SelectAddress] No matching address card found (bestScore=${bestScore})`);
+              // Log all card texts for debugging
+              for (const card of cards) {
+                console.log(`[SelectAddress]   candidate: "${card.text.replace(/\s+/g, " ").trim().slice(0, 120)}"`);
+              }
+              return null;
+            }
+
+            console.log(`[SelectAddress] Best match: score=${bestScore} text="${bestCard.text.replace(/\s+/g, " ").trim().slice(0, 100)}"`);
+
+            // Walk up to find the most appropriate clickable ancestor
+            let clickableEl: HTMLElement | null = bestCard.el;
+            let el: HTMLElement | null = bestCard.el;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              const cls = el.className || "";
+              if ((style.includes("cursor") || cls.includes("cDeXU9") || cls.includes("css-g5y9jx")) && style.includes("cursor")) {
+                clickableEl = el;
+                break;
+              }
+              el = el.parentElement;
+            }
+
+            const rect = clickableEl!.getBoundingClientRect();
+            return {
+              x: rect.left + rect.width / 2,
+              y: rect.top + rect.height / 2,
+              cardText: bestCard.text.replace(/\s+/g, " ").trim().slice(0, 120),
+              score: bestScore,
+            };
+          },
+          address
+        );
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (msg.includes("detached") || msg.includes("Frame")) {
+          console.log(`[SelectAddress] Frame detached (attempt ${attempt + 1}/3), retrying...`);
+          await sleep(500);
+          continue;
+        }
+        console.log(`[SelectAddress] Evaluate error: ${msg}`);
+        return false;
+      }
+    }
+
+    if (!result) {
+      console.log("[SelectAddress] Could not locate any address card — returning false");
+      return false;
+    }
+
+    console.log(`[SelectAddress] Best match (score=${result.score}): "${result.cardText}"`);
+    console.log(`[SelectAddress] Clicking at (${result.x.toFixed(0)}, ${result.y.toFixed(0)})`);
+
+    try {
+      await this.page.mouse.move(result.x, result.y);
+      await sleep(100);
+      await this.page.mouse.click(result.x, result.y);
+      console.log("[SelectAddress] Mouse click succeeded");
+      return true;
+    } catch (err) {
+      console.log(`[SelectAddress] Mouse click failed: ${(err as Error).message}`);
+      try {
+        await this.page.evaluate(
+          (coords: { x: number; y: number }) => {
+            const el = document.elementFromPoint(coords.x, coords.y);
+            if (el) el.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: coords.x, clientY: coords.y }));
+          },
+          { x: result.x, y: result.y }
+        );
+        console.log("[SelectAddress] Clicked via elementFromPoint");
+        return true;
+      } catch (e) {
+        console.log(`[SelectAddress] All click methods failed: ${(e as Error).message}`);
+        return false;
+      }
+    }
+  }
+
+
+  private async fillAddressForm(
+    page: import("puppeteer-core").Page,
+    address: AddressDetails
+  ): Promise<void> {
+    const pincodeToUse = address.checkoutPincode || address.pincode;
+
+    // Fill using name attributes — Flipkart uses standard HTML name attributes on inputs
+    await this.fillByName(page, "name", address.name, "Name");
+    await this.fillByName(page, "phone", address.mobile, "Mobile");
+    await this.fillByName(page, "pincode", pincodeToUse, "Pincode");
+    await this.fillByName(page, "addressLine2", address.locality, "Locality");
+    await this.fillTextareaByName(page, "addressLine1", address.addressLine1, "Address");
+    await this.fillByName(page, "city", address.city, "City");
+
+    // Select state from dropdown
+    let stateSet = false;
+    for (let attempt = 0; attempt < 5 && !stateSet; attempt++) {
+      const result = await page.evaluate((stateVal: string) => {
+        const select = document.querySelector('select[name="state"]') as HTMLSelectElement | null;
+        if (!select) return "not_found";
+        const options = Array.from(select.querySelectorAll("option"));
+        const found = options.find((opt) => opt.value === stateVal);
+        if (found) {
+          select.value = stateVal;
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+          return "found";
+        }
+        return "not_found";
+      }, address.state);
+      if (result === "found") {
+        console.log(`Selected state: ${address.state}`);
+        stateSet = true;
+        await sleep(300);
+      } else {
+        console.log(`State "${address.state}" not found in dropdown (attempt ${attempt + 1}/5)`);
+        await sleep(300);
+      }
+    }
+
+    // Click Home or Work radio
+    const radioId = address.addressType === "Home" ? "HOME" : "WORK";
+    let typeSet = false;
+    for (let attempt = 0; attempt < 5 && !typeSet; attempt++) {
+      const result = await page.evaluate((id: string) => {
+        const radio = document.getElementById(id) as HTMLInputElement | null;
+        if (radio && radio.name === "locationTypeTag") {
+          radio.click();
+          return "found";
+        }
+        return "not_found";
+      }, radioId);
+      if (result === "found") {
+        console.log(`Selected address type: ${address.addressType}`);
+        typeSet = true;
+        await sleep(300);
+      } else {
+        await sleep(500);
+      }
+    }
+  }
+
+  /** Type into an input by its name attribute */
+  private async fillByName(
+    page: import("puppeteer-core").Page,
+    name: string,
+    value: string,
+    label: string
+  ): Promise<void> {
+    let found = false;
+    for (let attempt = 0; attempt < 5 && !found; attempt++) {
+      const result = await page.evaluate(
+        (n: string, val: string) => {
+          const input = document.querySelector(`input[name="${n}"]`) as HTMLInputElement | null;
+          if (!input) return "not_found";
+          input.focus();
+          // Clear existing value
+          input.value = "";
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+          if (setter) setter.call(input, val);
+          else input.value = val;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          return "found";
+        },
+        name,
+        value
+      );
+      if (result === "found") {
+        console.log(`Filled ${label}`);
+        found = true;
+        await sleep(300);
+      } else {
+        console.log(`${label} (name="${name}") not found (attempt ${attempt + 1}/5)`);
+        await sleep(300);
+      }
+    }
+  }
+
+  /** Type into a textarea by its name attribute */
+  private async fillTextareaByName(
+    page: import("puppeteer-core").Page,
+    name: string,
+    value: string,
+    label: string
+  ): Promise<void> {
+    let found = false;
+    for (let attempt = 0; attempt < 5 && !found; attempt++) {
+      const result = await page.evaluate(
+        (n: string, val: string) => {
+          const textarea = document.querySelector(`textarea[name="${n}"]`) as HTMLTextAreaElement | null;
+          if (!textarea) return "not_found";
+          textarea.focus();
+          textarea.value = "";
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+          if (setter) setter.call(textarea, val);
+          else textarea.value = val;
+          textarea.dispatchEvent(new Event("input", { bubbles: true }));
+          textarea.dispatchEvent(new Event("change", { bubbles: true }));
+          return "found";
+        },
+        name,
+        value
+      );
+      if (result === "found") {
+        console.log(`Filled ${label}`);
+        found = true;
+        await sleep(300);
+      } else {
+        console.log(`${label} (textarea[name="${name}"]) not found (attempt ${attempt + 1}/5)`);
+        await sleep(300);
+      }
+    }
+  }
+
+  private async fillGstForm(gstNumber: string, companyName: string): Promise<void> {
+    console.log("Filling GST form...");
+
+    let filled = false;
+    for (let attempt = 0; attempt < 5 && !filled; attempt++) {
+      const result = await this.page.evaluate((gst: string, company: string) => {
+        // Find GST number input: maxlength=15
+        const gstEl = document.querySelector('input[maxlength="15"]') as HTMLInputElement | null;
+        // Find company name input: maxlength=60
+        const companyEl = document.querySelector('input[maxlength="60"]') as HTMLInputElement | null;
+
+        const filledGst = gstEl !== null;
+        const filledCompany = companyEl !== null;
+
+        if (gstEl) {
+          gstEl.focus();
+          gstEl.value = "";
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+          if (setter) setter.call(gstEl, gst);
+          else gstEl.value = gst;
+          gstEl.dispatchEvent(new Event("input", { bubbles: true }));
+          gstEl.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        if (companyEl) {
+          companyEl.focus();
+          companyEl.value = "";
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+          if (setter) setter.call(companyEl, company);
+          else companyEl.value = company;
+          companyEl.dispatchEvent(new Event("input", { bubbles: true }));
+          companyEl.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+
+        return { filledGst, filledCompany };
+      }, gstNumber, companyName);
+
+      if (result.filledGst) {
+        console.log(`Entered GST number: ${gstNumber.slice(0, 2)}***${gstNumber.slice(-2)}`);
+      } else {
+        console.log(`WARNING: GST input [maxlength="15"] not found (attempt ${attempt + 1}/5)`);
+      }
+      if (result.filledCompany) {
+        console.log(`Entered company name: ${companyName}`);
+      } else {
+        console.log(`WARNING: Company input [maxlength="60"] not found (attempt ${attempt + 1}/5)`);
+      }
+
+      if (result.filledGst && result.filledCompany) {
+        filled = true;
+      } else {
+        await sleep(300);
+      }
+    }
+
+    await sleep(500);
+  }
+
+  /**
+   * Determine if the delivery address on the page matches the saved address.
+   * Uses pincode + city as the primary anchor (most reliable on Flipkart).
+   * Falls back to the overall text content search for partial matches.
+   */
+  private scoreAddressMatch(text: string, address: AddressDetails): number {
+    if (!text) return 0;
+
+    const lowerText = text.toLowerCase();
+    const pincode = address.pincode.trim();
+    const city = address.city.trim().toLowerCase();
+    const locality = address.locality.trim().toLowerCase();
+    const name = address.name.trim().toLowerCase();
+    const addrLine = address.addressLine1.trim().toLowerCase();
+
+    let score = 0;
+
+    // Pincode is the most reliable — if it matches, that's strong confirmation
+    if (pincode.length === 6 && lowerText.includes(pincode)) {
+      score += 2;
+    }
+
+    // City name match
+    if (city.length >= 3 && lowerText.includes(city)) {
+      score += 1;
+    }
+
+    // Locality — use first 2 significant words
+    const localityKey = locality.split(/\s+/).filter((w) => w.length > 2).slice(0, 2).join(" ");
+    if (localityKey.length > 0 && lowerText.includes(localityKey)) {
+      score += 1;
+    }
+
+    // Name — flipkart may show just first name or full name
+    if (name.length >= 3) {
+      const nameParts = name.split(/\s+/);
+      const nameMatch = nameParts.some((part) => part.length > 2 && lowerText.includes(part));
+      if (nameMatch) score += 1;
+    }
+
+    // Address line — first 2 significant words
+    const addrKey = addrLine.split(/\s+/).filter((w) => w.length > 3).slice(0, 2).join(" ");
+    if (addrKey.length > 0 && lowerText.includes(addrKey)) {
+      score += 1;
+    }
+
+    return score;
+  }
+}
+
