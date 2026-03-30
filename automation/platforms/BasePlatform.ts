@@ -1,5 +1,27 @@
 import { Page } from "puppeteer-core";
 
+/** InstaDDR account credentials */
+export interface InstaDdrAccount {
+  instaDdrId: string;
+  instaDdrPassword: string;
+  email: string;
+}
+
+/** Minimal interface for InstaDdrService */
+export interface InstaDdrServiceLike {
+  login(id: string, password: string): Promise<void>;
+  logout(): Promise<void>;
+  fetchOtp(credentials: { instaDdrId: string; instaDdrPassword: string; email: string }): Promise<string>;
+  /** Navigate to InstaDDR login page and wait for user to log in manually. */
+  waitForManualLogin(id: string, password: string): Promise<void>;
+}
+
+/** Options passed to loginWithEmail for InstaDDR OTP automation */
+export interface InstaDdrLoginOptions {
+  instaDdrService?: InstaDdrServiceLike;
+  instaDdrAccount?: InstaDdrAccount;
+}
+
 /** Delivery address details with GST invoice information */
 export interface AddressDetails {
   name: string;
@@ -63,7 +85,7 @@ export abstract class BasePlatform {
   }
 
   /** Login with email (account rotation). OTP entered by human. */
-  async loginWithEmail(_email: string): Promise<void> {
+  async loginWithEmail(_email: string, _options?: InstaDdrLoginOptions): Promise<void> {
     throw new Error("loginWithEmail not implemented for this platform");
   }
 

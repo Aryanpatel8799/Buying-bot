@@ -11,6 +11,7 @@ import { z } from "zod";
 
 const giftCardSchema = z.object({
   chromeProfileId: z.string(),
+  platform: z.enum(["flipkart", "amazon"]).default("flipkart"),
   giftCards: z
     .array(
       z.object({
@@ -20,8 +21,7 @@ const giftCardSchema = z.object({
           .transform((v) => v.replace(/[\s-]/g, "")),
         pin: z
           .string()
-          .min(1, "PIN is required")
-          .regex(/^\d+$/, "PIN must be numeric"),
+          .default(""),
       })
     )
     .min(1, "At least one gift card is required"),
@@ -84,6 +84,7 @@ export async function POST(req: NextRequest) {
         skipped: skipped.length,
         total: data.giftCards.length,
         logs: skipped.map((c) => `[INFO] Skipped ${c} — already added successfully`),
+        cardStatuses: [],
         message: "All gift cards have already been added to your account",
       });
     }
@@ -93,9 +94,10 @@ export async function POST(req: NextRequest) {
       toAdd.map((gc) => ({
         userId,
         cardNumber: gc.cardNumber,
-        encryptedPin: encrypt(gc.pin),
+        encryptedPin: encrypt(gc.pin || ""),
         status: "pending",
         chromeProfileId: data.chromeProfileId,
+        platform: data.platform,
       }))
     );
 
@@ -103,6 +105,7 @@ export async function POST(req: NextRequest) {
 
     const config = {
       chromeProfileDir,
+      platform: data.platform,
       giftCards: toAdd,
       historyIds: historyEntries.map((h) => h._id.toString()),
     };
@@ -123,6 +126,14 @@ export async function POST(req: NextRequest) {
     let completed = 0;
     let failed = 0;
     const progressResults: { index: number; status: "success" | "failed"; error?: string }[] = [];
+    const cardStatuses: { cardNumber: string; status: "added" | "not added" }[] = [];
+
+    // Add skipped card statuses
+    for (const gc of data.giftCards) {
+      if (alreadyAdded.has(gc.cardNumber)) {
+        cardStatuses.push({ cardNumber: gc.cardNumber, status: "added" });
+      }
+    }
 
     child.stdout?.on("data", (chunk: Buffer) => {
       const lines = chunk.toString().split("\n").filter(Boolean);
@@ -136,6 +147,11 @@ export async function POST(req: NextRequest) {
               index: msg.iteration - 1,
               status: msg.status === "success" ? "success" : "failed",
               error: msg.error,
+            });
+          } else if (msg.type === "card_status") {
+            cardStatuses.push({
+              cardNumber: msg.cardNumber,
+              status: msg.status,
             });
           } else if (msg.type === "done") {
             completed = msg.completed;
@@ -157,14 +173,16 @@ export async function POST(req: NextRequest) {
       failed: number;
       logs: string[];
     }>((resolve) => {
+      // Timeout: 5 min base + 3s per card (for large batches)
+      const timeoutMs = Math.max(300000, toAdd.length * 3000 + 60000);
       const timeout = setTimeout(() => {
         child.kill("SIGKILL");
         resolve({
           completed,
           failed,
-          logs: [...logs, "[ERROR] Process timed out (5 min)"],
+          logs: [...logs, `[ERROR] Process timed out (${Math.round(timeoutMs / 1000)}s)`],
         });
-      }, 300000);
+      }, timeoutMs);
 
       child.on("exit", () => {
         clearTimeout(timeout);
@@ -202,6 +220,7 @@ export async function POST(req: NextRequest) {
       skipped: skipped.length,
       total: data.giftCards.length,
       logs: result.logs,
+      cardStatuses,
     });
   } catch (error) {
     if (error instanceof z.ZodError) {

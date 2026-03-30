@@ -13,6 +13,7 @@ interface Profile {
 interface GiftCardEntry {
   cardNumber: string;
   pin: string;
+  status?: "added" | "not added" | "";
 }
 
 interface HistoryEntry {
@@ -22,6 +23,11 @@ interface HistoryEntry {
   status: "success" | "failed" | "pending";
   errorMessage?: string;
   addedAt: string;
+}
+
+interface CardStatus {
+  cardNumber: string;
+  status: "added" | "not added";
 }
 
 export default function GiftCardsPage() {
@@ -36,6 +42,9 @@ export default function GiftCardsPage() {
   const [logs, setLogs] = useState<string[]>([]);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [historyLoading, setHistoryLoading] = useState(true);
+
+  // Platform selector
+  const [platform, setPlatform] = useState<"flipkart" | "amazon">("flipkart");
 
   // Manual entry
   const [cardNumber, setCardNumber] = useState("");
@@ -83,15 +92,18 @@ export default function GiftCardsPage() {
     const cleanNum = cn.replace(/[\s-]/g, "");
     if (!cleanNum) {
       errors.cardNumber = "Card number is required";
-    } else if (cleanNum.length < 10) {
+    } else if (cleanNum.length < 4) {
       errors.cardNumber = "Card number is too short";
     }
-    if (!p) {
-      errors.pin = "PIN is required";
-    } else if (!/^\d+$/.test(p)) {
-      errors.pin = "PIN must be numeric";
-    } else if (p.length < 4) {
-      errors.pin = "PIN must be at least 4 digits";
+    // PIN is required for Flipkart but optional for Amazon
+    if (platform === "flipkart") {
+      if (!p) {
+        errors.pin = "PIN is required for Flipkart";
+      } else if (!/^\d+$/.test(p)) {
+        errors.pin = "PIN must be numeric";
+      } else if (p.length < 4) {
+        errors.pin = "PIN must be at least 4 digits";
+      }
     }
     return errors;
   }
@@ -103,13 +115,12 @@ export default function GiftCardsPage() {
 
     const cleanNum = cardNumber.replace(/[\s-]/g, "");
 
-    // Check if already in queue
     if (giftCards.some((gc) => gc.cardNumber === cleanNum)) {
       setError("This card is already in the queue");
       return;
     }
 
-    setGiftCards([...giftCards, { cardNumber: cleanNum, pin: pin.trim() }]);
+    setGiftCards([...giftCards, { cardNumber: cleanNum, pin: pin.trim(), status: "" }]);
     setCardNumber("");
     setPin("");
     setError("");
@@ -126,22 +137,47 @@ export default function GiftCardsPage() {
     const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
 
     for (let i = 0; i < lines.length; i++) {
-      const parts = lines[i].split(",").map((p) => p.trim());
-      if (parts.length < 2 || !parts[0] || !parts[1]) {
-        errors.push(`Row ${i + 1}: Invalid format (need cardNumber,pin)`);
+      const line = lines[i];
+      // Skip header row
+      if (i === 0 && (line.toLowerCase().includes("cardnumber") || line.toLowerCase().includes("card_number") || line.toLowerCase().includes("code"))) {
         continue;
       }
+
+      const parts = line.split(",").map((p) => p.trim());
+      if (!parts[0]) {
+        errors.push(`Row ${i + 1}: Empty card number`);
+        continue;
+      }
+
       const cn = parts[0].replace(/[\s-]/g, "");
-      const p = parts[1];
-      if (cn.length < 10) {
+      const p = parts[1] || "";
+      const existingStatus = (parts[2] || "").toLowerCase().trim();
+
+      // Skip rows already marked as "added"
+      if (existingStatus === "added") {
+        continue;
+      }
+
+      if (cn.length < 4) {
         errors.push(`Row ${i + 1}: Card number too short`);
         continue;
       }
-      if (!/^\d+$/.test(p)) {
+
+      // PIN validation: required for Flipkart, optional for Amazon
+      if (platform === "flipkart" && !p) {
+        errors.push(`Row ${i + 1}: PIN is required for Flipkart`);
+        continue;
+      }
+      if (p && !/^\d*$/.test(p)) {
         errors.push(`Row ${i + 1}: PIN must be numeric`);
         continue;
       }
-      entries.push({ cardNumber: cn, pin: p });
+
+      entries.push({
+        cardNumber: cn,
+        pin: p,
+        status: existingStatus === "not added" ? "not added" : "",
+      });
     }
     return { entries, errors };
   }
@@ -156,11 +192,11 @@ export default function GiftCardsPage() {
       const { entries, errors } = parseCSV(text);
       setCsvErrors(errors);
       if (entries.length > 0) {
-        // Dedupe against existing queue
         const existing = new Set(giftCards.map((gc) => gc.cardNumber));
         const newEntries = entries.filter((e) => !existing.has(e.cardNumber));
         setGiftCards((prev) => [...prev, ...newEntries]);
-        setSuccess(`Loaded ${newEntries.length} new gift cards from file${entries.length - newEntries.length > 0 ? ` (${entries.length - newEntries.length} duplicates skipped)` : ""}`);
+        const skippedCount = entries.length - newEntries.length;
+        setSuccess(`Loaded ${newEntries.length} gift cards from file${skippedCount > 0 ? ` (${skippedCount} duplicates skipped)` : ""}`);
       }
     };
     reader.readAsText(file);
@@ -201,7 +237,14 @@ export default function GiftCardsPage() {
       const res = await fetch("/api/giftcards/add", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chromeProfileId, giftCards }),
+        body: JSON.stringify({
+          chromeProfileId,
+          platform,
+          giftCards: giftCards.map((gc) => ({
+            cardNumber: gc.cardNumber,
+            pin: gc.pin,
+          })),
+        }),
       });
 
       const data = await res.json();
@@ -213,12 +256,26 @@ export default function GiftCardsPage() {
       }
 
       setLogs(data.logs || []);
+
+      // Update per-card statuses in the queue
+      if (data.cardStatuses && data.cardStatuses.length > 0) {
+        const statusMap = new Map<string, "added" | "not added">();
+        for (const cs of data.cardStatuses as CardStatus[]) {
+          statusMap.set(cs.cardNumber, cs.status);
+        }
+        setGiftCards((prev) =>
+          prev.map((gc) => ({
+            ...gc,
+            status: statusMap.get(gc.cardNumber) || gc.status || "",
+          }))
+        );
+      }
+
       const parts = [];
       if (data.completed > 0) parts.push(`${data.completed} added`);
       if (data.failed > 0) parts.push(`${data.failed} failed`);
       if (data.skipped > 0) parts.push(`${data.skipped} skipped (already added)`);
       setSuccess(`Done! ${parts.join(", ")} out of ${data.total} total.`);
-      setGiftCards([]);
       fetchHistory();
     } catch {
       setError("Something went wrong");
@@ -227,11 +284,59 @@ export default function GiftCardsPage() {
     }
   }
 
+  function downloadCSV() {
+    // Generate CSV from current queue with status column
+    const hasQueue = giftCards.length > 0 && giftCards.some((gc) => gc.status);
+    const source = hasQueue ? giftCards : [];
+
+    // Also include history if no queue results
+    const rows: string[] = ["cardNumber,pin,status"];
+
+    if (hasQueue) {
+      for (const gc of giftCards) {
+        rows.push(`${gc.cardNumber},${gc.pin},${gc.status || ""}`);
+      }
+    } else {
+      // Download from history
+      for (const h of history) {
+        const status = h.status === "success" ? "added" : h.status === "failed" ? "not added" : "";
+        rows.push(`${h.cardNumber},,${status}`);
+      }
+    }
+
+    const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `giftcards-${platform}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function downloadHistoryCSV() {
+    const rows: string[] = ["cardNumber,status,error,date"];
+    for (const h of history) {
+      const status = h.status === "success" ? "added" : h.status === "failed" ? "not added" : "";
+      const error = (h.errorMessage || "").replace(/,/g, ";");
+      const date = new Date(h.addedAt).toLocaleString();
+      rows.push(`${h.cardNumber},${status},${error},${date}`);
+    }
+    const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `giftcard-history-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   const statusBadge = (s: string) => {
     switch (s) {
       case "success":
+      case "added":
         return "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20";
       case "failed":
+      case "not added":
         return "bg-red-500/10 text-red-400 border border-red-500/20";
       default:
         return "bg-yellow-500/10 text-yellow-400 border border-yellow-500/20";
@@ -242,10 +347,34 @@ export default function GiftCardsPage() {
     <div className="max-w-4xl mx-auto">
       {/* Header */}
       <div className="mb-8">
-        <h1 className="text-2xl font-bold mb-1">Flipkart Gift Cards</h1>
+        <h1 className="text-2xl font-bold mb-1">Gift Cards</h1>
         <p className="text-sm text-gray-400">
-          Add gift cards to your Flipkart account automatically
+          Add gift cards to your Flipkart or Amazon account automatically
         </p>
+      </div>
+
+      {/* Platform Selector */}
+      <div className="flex gap-2 mb-6">
+        <button
+          onClick={() => setPlatform("flipkart")}
+          className={`px-5 py-2.5 rounded-xl text-sm font-medium transition-all ${
+            platform === "flipkart"
+              ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+              : "bg-gray-900 text-gray-400 border border-gray-800 hover:text-white hover:border-gray-700"
+          }`}
+        >
+          🛒 Flipkart
+        </button>
+        <button
+          onClick={() => setPlatform("amazon")}
+          className={`px-5 py-2.5 rounded-xl text-sm font-medium transition-all ${
+            platform === "amazon"
+              ? "bg-orange-600 text-white shadow-lg shadow-orange-600/20"
+              : "bg-gray-900 text-gray-400 border border-gray-800 hover:text-white hover:border-gray-700"
+          }`}
+        >
+          📦 Amazon
+        </button>
       </div>
 
       {/* Tabs */}
@@ -310,7 +439,7 @@ export default function GiftCardsPage() {
               ))}
             </select>
             <p className="text-xs text-gray-500 mt-1">
-              Must be logged into Flipkart
+              Must be logged into {platform === "flipkart" ? "Flipkart" : "Amazon"}
             </p>
           </div>
 
@@ -328,7 +457,7 @@ export default function GiftCardsPage() {
                     setCardNumber(e.target.value);
                     setFieldErrors((p) => ({ ...p, cardNumber: undefined }));
                   }}
-                  placeholder="Gift Card Number"
+                  placeholder={platform === "amazon" ? "Gift Card Claim Code" : "Gift Card Number"}
                   className={`w-full px-4 py-2.5 bg-gray-800 border rounded-xl text-white font-mono focus:outline-none focus:ring-2 transition-all ${
                     fieldErrors.cardNumber
                       ? "border-red-500/50 focus:ring-red-500/40"
@@ -339,26 +468,28 @@ export default function GiftCardsPage() {
                   <p className="text-xs text-red-400 mt-1">{fieldErrors.cardNumber}</p>
                 )}
               </div>
-              <div className="w-40">
-                <input
-                  type="text"
-                  value={pin}
-                  onChange={(e) => {
-                    setPin(e.target.value.replace(/\D/g, ""));
-                    setFieldErrors((p) => ({ ...p, pin: undefined }));
-                  }}
-                  placeholder="PIN"
-                  maxLength={8}
-                  className={`w-full px-4 py-2.5 bg-gray-800 border rounded-xl text-white font-mono focus:outline-none focus:ring-2 transition-all ${
-                    fieldErrors.pin
-                      ? "border-red-500/50 focus:ring-red-500/40"
-                      : "border-gray-700 focus:ring-blue-500/40 focus:border-blue-500/40"
-                  }`}
-                />
-                {fieldErrors.pin && (
-                  <p className="text-xs text-red-400 mt-1">{fieldErrors.pin}</p>
-                )}
-              </div>
+              {platform === "flipkart" && (
+                <div className="w-40">
+                  <input
+                    type="text"
+                    value={pin}
+                    onChange={(e) => {
+                      setPin(e.target.value.replace(/\D/g, ""));
+                      setFieldErrors((p) => ({ ...p, pin: undefined }));
+                    }}
+                    placeholder="PIN"
+                    maxLength={8}
+                    className={`w-full px-4 py-2.5 bg-gray-800 border rounded-xl text-white font-mono focus:outline-none focus:ring-2 transition-all ${
+                      fieldErrors.pin
+                        ? "border-red-500/50 focus:ring-red-500/40"
+                        : "border-gray-700 focus:ring-blue-500/40 focus:border-blue-500/40"
+                    }`}
+                  />
+                  {fieldErrors.pin && (
+                    <p className="text-xs text-red-400 mt-1">{fieldErrors.pin}</p>
+                  )}
+                </div>
+              )}
               <button
                 type="button"
                 onClick={addCard}
@@ -375,7 +506,13 @@ export default function GiftCardsPage() {
               Bulk Import (CSV)
             </h3>
             <p className="text-xs text-gray-500 mb-4">
-              Format: <code className="text-gray-400 bg-gray-800 px-1.5 py-0.5 rounded">cardNumber,pin</code> — one per line
+              Format:{" "}
+              <code className="text-gray-400 bg-gray-800 px-1.5 py-0.5 rounded">
+                {platform === "flipkart" ? "cardNumber,pin" : "claimCode"}
+              </code>
+              {" "}— one per line.
+              {" "}Optional 3rd column: <code className="text-gray-400 bg-gray-800 px-1.5 py-0.5 rounded">status</code>
+              {" "}(rows marked &quot;added&quot; are skipped)
             </p>
             <div className="flex gap-3 mb-3 items-center">
               <label className="flex-1 cursor-pointer">
@@ -394,7 +531,10 @@ export default function GiftCardsPage() {
             <textarea
               value={csvText}
               onChange={(e) => setCsvText(e.target.value)}
-              placeholder={"XXXX-XXXX-XXXX-XXXX,123456\nYYYY-YYYY-YYYY-YYYY,654321"}
+              placeholder={platform === "flipkart"
+                ? "XXXX-XXXX-XXXX-XXXX,123456\nYYYY-YYYY-YYYY-YYYY,654321"
+                : "ABCD-EFGH-IJKL\nMNOP-QRST-UVWX"
+              }
               rows={4}
               className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-xl text-white font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all mb-3"
             />
@@ -422,20 +562,35 @@ export default function GiftCardsPage() {
                 <h3 className="text-sm font-semibold text-gray-200">
                   Queue ({giftCards.length} card{giftCards.length !== 1 ? "s" : ""})
                 </h3>
-                <button
-                  onClick={() => setGiftCards([])}
-                  className="text-xs text-red-400 hover:text-red-300 transition-colors"
-                >
-                  Clear All
-                </button>
+                <div className="flex gap-3">
+                  {giftCards.some((gc) => gc.status) && (
+                    <button
+                      onClick={downloadCSV}
+                      className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                    >
+                      ⬇ Download CSV
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setGiftCards([])}
+                    className="text-xs text-red-400 hover:text-red-300 transition-colors"
+                  >
+                    Clear All
+                  </button>
+                </div>
               </div>
               <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-gray-800">
                       <th className="text-left px-4 py-2.5 text-gray-500 font-medium text-xs uppercase tracking-wider">#</th>
-                      <th className="text-left px-4 py-2.5 text-gray-500 font-medium text-xs uppercase tracking-wider">Card Number</th>
-                      <th className="text-left px-4 py-2.5 text-gray-500 font-medium text-xs uppercase tracking-wider">PIN</th>
+                      <th className="text-left px-4 py-2.5 text-gray-500 font-medium text-xs uppercase tracking-wider">
+                        {platform === "amazon" ? "Claim Code" : "Card Number"}
+                      </th>
+                      {platform === "flipkart" && (
+                        <th className="text-left px-4 py-2.5 text-gray-500 font-medium text-xs uppercase tracking-wider">PIN</th>
+                      )}
+                      <th className="text-left px-4 py-2.5 text-gray-500 font-medium text-xs uppercase tracking-wider">Status</th>
                       <th className="px-4 py-2.5"></th>
                     </tr>
                   </thead>
@@ -444,7 +599,18 @@ export default function GiftCardsPage() {
                       <tr key={i} className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors">
                         <td className="px-4 py-2.5 text-gray-500">{i + 1}</td>
                         <td className="px-4 py-2.5 text-white font-mono">{gc.cardNumber}</td>
-                        <td className="px-4 py-2.5 text-white font-mono">{gc.pin}</td>
+                        {platform === "flipkart" && (
+                          <td className="px-4 py-2.5 text-white font-mono">{gc.pin}</td>
+                        )}
+                        <td className="px-4 py-2.5">
+                          {gc.status ? (
+                            <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${statusBadge(gc.status)}`}>
+                              {gc.status}
+                            </span>
+                          ) : (
+                            <span className="text-gray-600 text-xs">—</span>
+                          )}
+                        </td>
                         <td className="px-4 py-2.5 text-right">
                           <button
                             onClick={() => removeCard(i)}
@@ -465,11 +631,15 @@ export default function GiftCardsPage() {
           <button
             onClick={startAdding}
             disabled={loading || giftCards.length === 0 || !chromeProfileId}
-            className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:hover:bg-emerald-600 text-white font-semibold rounded-xl transition-all shadow-lg shadow-emerald-600/10 mb-6"
+            className={`w-full py-3 ${
+              platform === "amazon"
+                ? "bg-orange-600 hover:bg-orange-500 shadow-orange-600/10"
+                : "bg-emerald-600 hover:bg-emerald-500 shadow-emerald-600/10"
+            } disabled:opacity-40 disabled:hover:bg-inherit text-white font-semibold rounded-xl transition-all shadow-lg mb-6`}
           >
             {loading
-              ? `Processing ${giftCards.length} Gift Cards...`
-              : `Add ${giftCards.length || 0} Gift Card${giftCards.length !== 1 ? "s" : ""} to Account`}
+              ? `Processing ${giftCards.length} Gift Cards on ${platform === "amazon" ? "Amazon" : "Flipkart"}...`
+              : `Add ${giftCards.length || 0} Gift Card${giftCards.length !== 1 ? "s" : ""} to ${platform === "amazon" ? "Amazon" : "Flipkart"}`}
           </button>
 
           {/* Logs */}
@@ -487,7 +657,7 @@ export default function GiftCardsPage() {
                         ? "text-red-400"
                         : log.includes("[WARN]")
                         ? "text-yellow-400"
-                        : log.includes("success")
+                        : log.includes("success") || log.includes("added")
                         ? "text-emerald-400"
                         : "text-gray-500"
                     }`}
@@ -510,24 +680,32 @@ export default function GiftCardsPage() {
             </div>
           ) : (
             <>
-              {/* Stats */}
-              <div className="grid grid-cols-3 gap-4 mb-6">
-                <div className="p-4 bg-gray-900 rounded-xl border border-gray-800 text-center">
-                  <p className="text-2xl font-bold text-white">{history.length}</p>
-                  <p className="text-xs text-gray-500 mt-1">Total</p>
+              {/* Stats + Download */}
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex gap-4">
+                  <div className="p-4 bg-gray-900 rounded-xl border border-gray-800 text-center min-w-[100px]">
+                    <p className="text-2xl font-bold text-white">{history.length}</p>
+                    <p className="text-xs text-gray-500 mt-1">Total</p>
+                  </div>
+                  <div className="p-4 bg-gray-900 rounded-xl border border-gray-800 text-center min-w-[100px]">
+                    <p className="text-2xl font-bold text-emerald-400">
+                      {history.filter((h) => h.status === "success").length}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-1">Added</p>
+                  </div>
+                  <div className="p-4 bg-gray-900 rounded-xl border border-gray-800 text-center min-w-[100px]">
+                    <p className="text-2xl font-bold text-red-400">
+                      {history.filter((h) => h.status === "failed").length}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-1">Failed</p>
+                  </div>
                 </div>
-                <div className="p-4 bg-gray-900 rounded-xl border border-gray-800 text-center">
-                  <p className="text-2xl font-bold text-emerald-400">
-                    {history.filter((h) => h.status === "success").length}
-                  </p>
-                  <p className="text-xs text-gray-500 mt-1">Added</p>
-                </div>
-                <div className="p-4 bg-gray-900 rounded-xl border border-gray-800 text-center">
-                  <p className="text-2xl font-bold text-red-400">
-                    {history.filter((h) => h.status === "failed").length}
-                  </p>
-                  <p className="text-xs text-gray-500 mt-1">Failed</p>
-                </div>
+                <button
+                  onClick={downloadHistoryCSV}
+                  className="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl transition-all text-sm font-medium shadow-lg shadow-blue-600/10"
+                >
+                  ⬇ Download CSV
+                </button>
               </div>
 
               <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
@@ -546,7 +724,7 @@ export default function GiftCardsPage() {
                         <td className="px-4 py-3 text-white font-mono">{h.cardNumber}</td>
                         <td className="px-4 py-3">
                           <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${statusBadge(h.status)}`}>
-                            {h.status}
+                            {h.status === "success" ? "added" : h.status === "failed" ? "not added" : h.status}
                           </span>
                         </td>
                         <td className="px-4 py-3 text-xs text-gray-500 max-w-48 truncate">

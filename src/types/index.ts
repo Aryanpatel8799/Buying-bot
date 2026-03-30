@@ -68,6 +68,15 @@ export interface JobConfig {
   accounts?: string[]; // decrypted Flipkart emails for account rotation
   address?: AddressDetails; // delivery address with GST for checkout verification
   maxConcurrentTabs?: number; // max simultaneous browser tabs for RTGS multi-tab mode (default: 1)
+  giftCardInventoryId?: string; // gift card inventory for code rotation
+  instaDdrAccounts?: InstaDdrAccount[]; // InstaDDR accounts for OTP automation
+  instaDdrUrl?: string; // InstaDDR portal URL (defaults to https://m.kuku.lu)
+}
+
+export interface InstaDdrAccount {
+  instaDdrId: string;
+  instaDdrPassword: string;
+  email: string; // the mail receiving Flipkart OTP
 }
 
 // IPC messages from runner child process to parent

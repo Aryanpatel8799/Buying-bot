@@ -37,6 +37,21 @@ interface SavedAddress {
   addressType: string;
 }
 
+interface InventorySummary {
+  _id: string;
+  name: string;
+  platform: "flipkart" | "amazon";
+  totalCodes: number;
+  available: number;
+}
+
+interface InstaDdrGroup {
+  _id: string;
+  label: string;
+  platform: string;
+  totalAccounts: number;
+}
+
 export default function NewJobPage() {
   const { status } = useSession();
   const router = useRouter();
@@ -45,6 +60,10 @@ export default function NewJobPage() {
   const [savedCards, setSavedCards] = useState<SavedCard[]>([]);
   const [savedAccounts, setSavedAccounts] = useState<SavedAccount[]>([]);
   const [savedAddresses, setSavedAddresses] = useState<SavedAddress[]>([]);
+  const [inventories, setInventories] = useState<InventorySummary[]>([]);
+  const [instaDdrGroups, setInstaDdrGroups] = useState<InstaDdrGroup[]>([]);
+  const [giftCardSource, setGiftCardSource] = useState<"single" | "inventory">("single");
+  const [selectedInventoryId, setSelectedInventoryId] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -72,6 +91,10 @@ export default function NewJobPage() {
   const [useAccountRotation, setUseAccountRotation] = useState(false);
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
 
+  // InstaDDR OTP automation
+  const [useInstaDdr, setUseInstaDdr] = useState(false);
+  const [selectedInstaDdrGroupIds, setSelectedInstaDdrGroupIds] = useState<string[]>([]);
+
   // GST Address
   const [useGstAddress, setUseGstAddress] = useState(false);
   const [selectedAddressId, setSelectedAddressId] = useState("");
@@ -84,6 +107,8 @@ export default function NewJobPage() {
       fetchSavedCards();
       fetchSavedAccounts();
       fetchSavedAddresses();
+      fetchInventories();
+      fetchInstaDdrGroups();
     }
   }, [status, router]);
 
@@ -109,6 +134,23 @@ export default function NewJobPage() {
   async function fetchSavedAddresses() {
     const res = await fetch("/api/addresses");
     if (res.ok) setSavedAddresses(await res.json());
+  }
+
+  async function fetchInventories() {
+    const res = await fetch("/api/giftcards/inventory");
+    if (res.ok) {
+      const data = await res.json();
+      // Filter by current platform
+      setInventories(data);
+    }
+  }
+
+  async function fetchInstaDdrGroups() {
+    const res = await fetch("/api/instaddr");
+    if (res.ok) {
+      const data = await res.json();
+      setInstaDdrGroups(data);
+    }
   }
 
   function toggleAccountSelection(accountId: string) {
@@ -171,13 +213,29 @@ export default function NewJobPage() {
       return;
     }
 
+    const computedTotalQty = products.reduce((sum, p) => sum + p.quantity, 0);
+    if (computedTotalQty < 1) {
+      setError("Product quantity must be at least 1");
+      return;
+    }
+
+    if (iterations < 1) {
+      setError("Iterations must be at least 1");
+      return;
+    }
+
     if (paymentMethod === "card" && cardMode === "rotate" && selectedCardIds.length === 0) {
       setError("Select at least one saved card for rotation");
       return;
     }
 
-    if (useAccountRotation && selectedAccountIds.length === 0) {
-      setError("Select at least one account for rotation");
+    if (useAccountRotation && selectedAccountIds.length === 0 && !useInstaDdr) {
+      setError("Select at least one account for rotation, or enable InstaDDR auto-OTP");
+      return;
+    }
+
+    if (useInstaDdr && selectedInstaDdrGroupIds.length === 0) {
+      setError("Select at least one InstaDDR group for auto-OTP");
       return;
     }
 
@@ -220,10 +278,13 @@ export default function NewJobPage() {
           chromeProfileId,
           ...(useRotation
             ? { cardIds: selectedCardIds }
-            : { paymentDetails: getPaymentDetails() }),
+            : paymentMethod === "giftcard" && giftCardSource === "inventory"
+              ? { giftCardInventoryId: selectedInventoryId }
+              : { paymentDetails: getPaymentDetails() }),
           ...(useAccountRotation ? { accountIds: selectedAccountIds } : {}),
           ...(useGstAddress && selectedAddressId ? { addressIds: [selectedAddressId], checkoutPincode: checkoutPincode || undefined } : {}),
           ...(paymentMethod === "rtgs" && maxConcurrentTabs > 1 ? { maxConcurrentTabs } : {}),
+          ...(useInstaDdr && selectedInstaDdrGroupIds.length > 0 ? { instaDdrAccountIds: selectedInstaDdrGroupIds } : {}),
         }),
       });
 
@@ -283,8 +344,12 @@ export default function NewJobPage() {
                 const val = e.target.value as "flipkart" | "amazon";
                 setPlatform(val);
                 // Reset payment if current selection is unsupported on the new platform
-                if (val === "amazon" && paymentMethod === "giftcard") setPaymentMethod("card");
                 if (val === "amazon" && paymentMethod === "rtgs") setPaymentMethod("card");
+                // Clear inventory selection if platform changes (since inventories are platform-specific)
+                if (giftCardSource === "inventory") {
+                  setGiftCardSource("single");
+                  setSelectedInventoryId("");
+                }
               }}
               className={inputClass}
             >
@@ -300,8 +365,8 @@ export default function NewJobPage() {
               className={inputClass}
             >
               <option value="card">Card (Credit/Debit)</option>
-              <option value="giftcard" disabled={platform === "amazon"}>
-                Gift Card{platform === "amazon" ? " (Coming soon)" : ""}
+              <option value="giftcard">
+                Gift Card
               </option>
               <option value="rtgs">
                 RTGS / Net Banking
@@ -395,15 +460,18 @@ export default function NewJobPage() {
             <label className={labelClass}>Iterations</label>
             <input
               type="number"
-              value={useAccountRotation ? selectedAccountIds.length : iterations}
+              value={iterations}
               onChange={(e) => setIterations(parseInt(e.target.value) || 1)}
               min={1}
               required
-              disabled={useAccountRotation}
-              className={`${inputClass} ${useAccountRotation ? "opacity-50 cursor-not-allowed" : ""}`}
+              className={inputClass}
             />
-            {useAccountRotation ? (
-              <p className="text-xs text-blue-400 mt-1">Iterations set by account count</p>
+            {useAccountRotation && selectedAccountIds.length > 0 ? (
+              <p className="text-xs text-blue-400 mt-1">Based on {selectedAccountIds.length} selected account{selectedAccountIds.length !== 1 ? "s" : ""}</p>
+            ) : useInstaDdr && selectedInstaDdrGroupIds.length > 0 ? (
+              <p className="text-xs text-emerald-400 mt-1">
+                Based on selected InstaDDR group{selectedInstaDdrGroupIds.length !== 1 ? "s" : ""}
+              </p>
             ) : (
               <p className="text-xs text-gray-600 mt-1">How many times to repeat</p>
             )}
@@ -433,75 +501,184 @@ export default function NewJobPage() {
           </div>
         )}
 
-        {/* Account Rotation (Flipkart only) */}
+        {/* Account Rotation + InstaDDR (Flipkart only) */}
         {platform === "flipkart" && (
-          <div className="space-y-4 p-5 bg-gray-900 rounded-xl border border-gray-800">
-            <div className="flex items-center justify-between">
-              <div>
-                <h3 className="text-sm font-semibold text-gray-200">Account Rotation</h3>
-                <p className="text-xs text-gray-500 mt-0.5">Login with different accounts per iteration</p>
+          <div className="space-y-4">
+            {/* Account Rotation */}
+            <div className="p-5 bg-gray-900 rounded-xl border border-gray-800">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-200">Account Rotation</h3>
+                  <p className="text-xs text-gray-500 mt-0.5">Login with different Flipkart accounts per iteration</p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={useAccountRotation}
+                    onChange={(e) => {
+                      setUseAccountRotation(e.target.checked);
+                      if (!e.target.checked) setSelectedAccountIds([]);
+                    }}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                </label>
               </div>
-              <label className="relative inline-flex items-center cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={useAccountRotation}
-                  onChange={(e) => {
-                    setUseAccountRotation(e.target.checked);
-                    if (!e.target.checked) setSelectedAccountIds([]);
-                  }}
-                  className="sr-only peer"
-                />
-                <div className="w-11 h-6 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-              </label>
+
+              {useAccountRotation && (
+                <div className="mt-4">
+                  {savedAccounts.length === 0 ? (
+                    <div className="p-4 bg-yellow-500/10 border border-yellow-500/20 rounded-xl text-sm text-yellow-400">
+                      No saved accounts.{" "}
+                      <Link href="/dashboard/accounts" className="underline hover:text-yellow-300">
+                        Add accounts
+                      </Link>{" "}
+                      first.
+                    </div>
+                  ) : (
+                    <>
+                      <p className="text-xs text-gray-500 mb-3">
+                        Each account = 1 iteration. Bot logs in, buys, logs out, moves to next account.
+                      </p>
+                      <div className="space-y-2 max-h-48 overflow-y-auto">
+                        {savedAccounts.map((acc) => (
+                          <label
+                            key={acc._id}
+                            className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${
+                              selectedAccountIds.includes(acc._id)
+                                ? "border-blue-500/40 bg-blue-500/10"
+                                : "border-gray-700 bg-gray-800 hover:border-gray-600"
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedAccountIds.includes(acc._id)}
+                              onChange={() => toggleAccountSelection(acc._id)}
+                              className="accent-blue-500"
+                            />
+                            <div>
+                              <span className="text-sm text-white">{acc.label}</span>
+                              <span className="text-xs text-gray-500 ml-2 font-mono">{acc.maskedEmail}</span>
+                            </div>
+                          </label>
+                        ))}
+                      </div>
+                      {selectedAccountIds.length > 0 && (
+                        <p className="text-xs text-emerald-400 mt-2">
+                          {selectedAccountIds.length} account{selectedAccountIds.length !== 1 ? "s" : ""} — {selectedAccountIds.length} iteration{selectedAccountIds.length !== 1 ? "s" : ""}
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {!useAccountRotation && (
+                <p className="text-xs text-gray-600 mt-3">
+                  Same Flipkart account used for all iterations
+                </p>
+              )}
             </div>
 
-            {useAccountRotation && (
-              <div>
-                {savedAccounts.length === 0 ? (
-                  <div className="p-4 bg-yellow-500/10 border border-yellow-500/20 rounded-xl text-sm text-yellow-400">
-                    No saved accounts.{" "}
-                    <Link href="/dashboard/accounts" className="underline hover:text-yellow-300 transition-colors">
-                      Add accounts
-                    </Link>{" "}
-                    first.
-                  </div>
-                ) : (
-                  <>
-                    <p className="text-xs text-gray-500 mb-3">
-                      Each account = 1 iteration. Bot logs in, buys, logs out, moves to next account. You enter OTP manually.
-                    </p>
-                    <div className="space-y-2 max-h-48 overflow-y-auto">
-                      {savedAccounts.map((acc) => (
-                        <label
-                          key={acc._id}
-                          className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${
-                            selectedAccountIds.includes(acc._id)
-                              ? "border-blue-500/40 bg-blue-500/10"
-                              : "border-gray-700 bg-gray-800 hover:border-gray-600"
-                          }`}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={selectedAccountIds.includes(acc._id)}
-                            onChange={() => toggleAccountSelection(acc._id)}
-                            className="accent-blue-500"
-                          />
-                          <div>
-                            <span className="text-sm text-white">{acc.label}</span>
-                            <span className="text-xs text-gray-500 ml-2 font-mono">{acc.maskedEmail}</span>
-                          </div>
-                        </label>
-                      ))}
-                    </div>
-                    {selectedAccountIds.length > 0 && (
-                      <p className="text-xs text-emerald-400 mt-2">
-                        {selectedAccountIds.length} account{selectedAccountIds.length !== 1 ? "s" : ""} selected = {selectedAccountIds.length} iteration{selectedAccountIds.length !== 1 ? "s" : ""}
-                      </p>
-                    )}
-                  </>
-                )}
+            {/* InstaDDR OTP Automation */}
+            <div className="p-5 bg-gray-900 rounded-xl border border-gray-800">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-200">InstaDDR Auto-OTP</h3>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    Auto-fetch OTP from InstaDDR instead of entering manually
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={useInstaDdr}
+                    onChange={(e) => {
+                      setUseInstaDdr(e.target.checked);
+                      if (!e.target.checked) setSelectedInstaDdrGroupIds([]);
+                    }}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                </label>
               </div>
-            )}
+
+              {useInstaDdr && (
+                <div className="mt-4">
+                  {instaDdrGroups.length === 0 ? (
+                    <div className="p-4 bg-yellow-500/10 border border-yellow-500/20 rounded-xl text-sm text-yellow-400">
+                      No InstaDDR groups found.{" "}
+                      <Link href="/dashboard/accounts/instaddr" className="underline hover:text-yellow-300">
+                        Create one
+                      </Link>{" "}
+                      first.
+                    </div>
+                  ) : (
+                    <>
+                      <p className="text-xs text-gray-500 mb-3">
+                        Select InstaDDR groups. Each account in the group = 1 iteration. OTP is auto-fetched from InstaDDR.
+                      </p>
+                      <div className="space-y-2 max-h-56 overflow-y-auto">
+                        {instaDdrGroups.map((g) => (
+                          <label
+                            key={g._id}
+                            className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${
+                              selectedInstaDdrGroupIds.includes(g._id)
+                                ? "border-blue-500/40 bg-blue-500/10"
+                                : "border-gray-700 bg-gray-800 hover:border-gray-600"
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedInstaDdrGroupIds.includes(g._id)}
+                              onChange={() => {
+                                setSelectedInstaDdrGroupIds((prev) =>
+                                  prev.includes(g._id) ? prev.filter((id) => id !== g._id) : [...prev, g._id]
+                                );
+                              }}
+                              className="accent-blue-500"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="text-sm text-white font-medium">{g.label}</span>
+                                <span className="inline-block text-xs px-2 py-0.5 rounded border bg-blue-500/10 text-blue-400 border-blue-500/20">
+                                  Flipkart OTP
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-4 mt-1">
+                                <span className="text-xs text-gray-500">
+                                  {g.totalAccounts} account{g.totalAccounts !== 1 ? "s" : ""}
+                                </span>
+                                {selectedInstaDdrGroupIds.includes(g._id) && (
+                                  <span className="text-xs text-emerald-400">
+                                    {g.totalAccounts} iteration{g.totalAccounts !== 1 ? "s" : ""}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </label>
+                        ))}
+                      </div>
+                      {selectedInstaDdrGroupIds.length > 0 && (
+                        <p className="text-xs text-emerald-400 mt-3">
+                          {selectedInstaDdrGroupIds.map((id) => {
+                            const g = instaDdrGroups.find((x) => x._id === id);
+                            return g ? `${g.label} (${g.totalAccounts})` : null;
+                          }).filter(Boolean).join(", ")}{" "}
+                          — OTP will be auto-fetched from InstaDDR
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {!useInstaDdr && (
+                <p className="text-xs text-gray-600 mt-3">
+                  Manual OTP — you will be prompted to enter OTP manually for each iteration
+                </p>
+              )}
+            </div>
           </div>
         )}
 
@@ -751,27 +928,91 @@ export default function NewJobPage() {
         {paymentMethod === "giftcard" && (
           <div className="space-y-4 p-5 bg-gray-900 rounded-xl border border-gray-800">
             <h3 className="text-sm font-semibold text-gray-200">Gift Card Details</h3>
-            <div>
-              <label className={labelClass}>Gift Card Code</label>
-              <input
-                type="text"
-                value={giftCardCode}
-                onChange={(e) => setGiftCardCode(e.target.value)}
-                placeholder="Enter gift card code"
-                required
-                className={inputClass}
-              />
+
+            {/* Source toggle */}
+            <div className="flex bg-gray-800 rounded-lg p-0.5 text-xs border border-gray-700">
+              <button
+                type="button"
+                onClick={() => { setGiftCardSource("single"); setGiftCardCode(""); setGiftCardPin(""); setSelectedInventoryId(""); }}
+                className={`px-3 py-1.5 rounded-md transition-all font-medium flex-1 ${
+                  giftCardSource === "single"
+                    ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+                    : "text-gray-400 hover:text-white"
+                }`}
+              >
+                Single Code
+              </button>
+              <button
+                type="button"
+                onClick={() => { setGiftCardSource("inventory"); setGiftCardCode(""); setGiftCardPin(""); }}
+                className={`px-3 py-1.5 rounded-md transition-all font-medium flex-1 ${
+                  giftCardSource === "inventory"
+                    ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+                    : "text-gray-400 hover:text-white"
+                }`}
+              >
+                From Inventory
+              </button>
             </div>
-            <div>
-              <label className={labelClass}>PIN</label>
-              <input
-                type="text"
-                value={giftCardPin}
-                onChange={(e) => setGiftCardPin(e.target.value)}
-                placeholder="PIN (if applicable)"
-                className={inputClass}
-              />
-            </div>
+
+            {giftCardSource === "single" ? (
+              <>
+                <div>
+                  <label className={labelClass}>Gift Card Code</label>
+                  <input
+                    type="text"
+                    value={giftCardCode}
+                    onChange={(e) => setGiftCardCode(e.target.value)}
+                    placeholder="Enter gift card code"
+                    required
+                    className={inputClass}
+                  />
+                </div>
+                <div>
+                  <label className={labelClass}>PIN</label>
+                  <input
+                    type="text"
+                    value={giftCardPin}
+                    onChange={(e) => setGiftCardPin(e.target.value)}
+                    placeholder="PIN (if applicable)"
+                    className={inputClass}
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                {inventories.filter((i) => i.platform === platform).length === 0 ? (
+                  <div className="p-4 bg-yellow-500/10 border border-yellow-500/20 rounded-xl text-sm text-yellow-400">
+                    No {platform} inventory lists.{" "}
+                    <Link href="/dashboard/giftcards/inventory" className="underline hover:text-yellow-300">
+                      Create one
+                    </Link>{" "}
+                    first.
+                  </div>
+                ) : (
+                  <div>
+                    <label className={labelClass}>Select Inventory</label>
+                    <select
+                      value={selectedInventoryId}
+                      onChange={(e) => setSelectedInventoryId(e.target.value)}
+                      className={inputClass}
+                    >
+                      <option value="">Select a list...</option>
+                      {inventories
+                        .filter((i) => i.platform === platform)
+                        .map((inv) => (
+                          <option key={inv._id} value={inv._id}>
+                            {inv.name} — {inv.available} available / {inv.totalCodes} total
+                          </option>
+                        ))}
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Codes are automatically rotated across iterations
+                    </p>
+                  </div>
+                )}
+              </>
+            )}
           </div>
         )}
 

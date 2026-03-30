@@ -18,6 +18,58 @@ export class FlipkartPlatform extends BasePlatform {
     super(page, productUrl);
   }
 
+  /**
+   * Detect if the current page context is stale (destroyed by SPA navigation)
+   * and re-navigate to restore it. Call this after any action that might
+   * trigger a Flipkart SPA navigation (address Change, address selection, etc.).
+   */
+  private async ensurePageValid(): Promise<void> {
+    const STALE_ERRORS = [
+      "Execution context was destroyed",
+      "Session closed",
+      "Target closed",
+      "Protocol error",
+      "Frame detached",
+      "Detached",
+    ];
+
+    const isStaleError = (err: unknown): boolean => {
+      const msg = err instanceof Error ? err.message : String(err);
+      return STALE_ERRORS.some((s) => msg.includes(s));
+    };
+
+    let staleCount = 0;
+    while (staleCount < 3) {
+      try {
+        await this.page.evaluate(() => document.readyState);
+        return;
+      } catch (err) {
+        if (!isStaleError(err)) {
+          throw err;
+        }
+        staleCount++;
+        console.log(`[ensurePageValid] Page context stale (attempt ${staleCount}/3) — re-attaching...`);
+        const currentUrl = this.page.url().split("?")[0];
+        await sleep(500);
+        try {
+          await this.page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+          await sleep(500);
+          await this.page.evaluate(() => document.readyState);
+          console.log("[ensurePageValid] Page re-attached successfully");
+          return;
+        } catch (navErr) {
+          if (!isStaleError(navErr)) {
+            console.log(`[ensurePageValid] Navigation error: ${(navErr as Error).message}`);
+            return;
+          }
+          console.log(`[ensurePageValid] Navigation also stale, retrying...`);
+          await sleep(1000);
+        }
+      }
+    }
+    console.log("[ensurePageValid] WARNING: Could not restore page context after 3 attempts");
+  }
+
   async navigateToProduct(): Promise<void> {
     console.log("Opening product page...");
     await navigateWithRetry(this.page, this.productUrl, {
@@ -1238,8 +1290,14 @@ export class FlipkartPlatform extends BasePlatform {
     // Step 2: Verify delivery address
     await this.verifyDeliveryAddressOnSummary(address);
 
+    // Wait for address change to settle before verifying GST
+    console.log("Waiting for address to settle...");
+    await sleep(2000);
+    await this.ensurePageValid();
+    await sleep(500);
+
     // Step 3: Verify GST invoice checkbox
-    await this.verifyGstCheckboxOnSummary();
+    await this.verifyGstCheckboxOnSummary(address);
 
     // Step 4: Click Continue to proceed to checkout page
     await this.clickContinueToCheckout();
@@ -1272,6 +1330,12 @@ export class FlipkartPlatform extends BasePlatform {
     // Step 1: Verify and fix delivery address (should be no-op if set on summary)
     // ----------------------------------------------------------------
     await this.verifyDeliveryAddress(address);
+
+    // Wait for address change to settle before verifying GST
+    console.log("Waiting for address to settle...");
+    await sleep(2000);
+    await this.ensurePageValid();
+    await sleep(500);
 
     // ----------------------------------------------------------------
     // Step 2: Verify and fix GST invoice details
@@ -1726,11 +1790,13 @@ export class FlipkartPlatform extends BasePlatform {
         }
       }
     }
-    await sleep(300);
   }
 
-  private async verifyGstCheckboxOnSummary(): Promise<void> {
+  private async verifyGstCheckboxOnSummary(address: AddressDetails): Promise<void> {
     console.log("Verifying GST checkbox on order summary...");
+    const gstNumber = address.gstNumber.trim();
+    const companyName = address.companyName.trim();
+    console.log(`Target GST: ${gstNumber} / ${companyName}`);
 
     // Wait for GST section to be visible
     for (let i = 0; i < 5; i++) {
@@ -1742,109 +1808,306 @@ export class FlipkartPlatform extends BasePlatform {
       await sleep(300);
     }
 
-    // Check if already ticked
-    const isChecked = await this.page.evaluate(() => {
-      // Check for checked images
-      const checkedImgs = document.querySelectorAll('img[src*="checked"]');
-      if (checkedImgs.length > 0) return true;
-      // Check aria-checked
-      const checkboxes = document.querySelectorAll('[role="checkbox"]');
-      for (const cb of checkboxes) {
-        if (cb.getAttribute("aria-checked") === "true") return true;
-      }
-      // Check near "Use GST Invoice" text
-      const allDivs = Array.from(document.querySelectorAll("div"));
-      for (const d of allDivs) {
-        const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
-        if (txt.includes("Use GST Invoice")) {
-          let el: HTMLElement | null = d.parentElement;
-          while (el && el !== document.body) {
-            const imgs = el.querySelectorAll('img[src*="checked"]');
-            if (imgs.length > 0) return true;
-            el = el.parentElement;
+    // Helper: check if the GST checkbox (r-d045u9) has a checked image inside
+    const isGstChecked = async (): Promise<boolean> => {
+      return this.page.evaluate(() => {
+        const checkboxDivs = Array.from(document.querySelectorAll("div")).filter(d =>
+          d.className.includes("r-d045u9")
+        );
+        for (const cbDiv of checkboxDivs) {
+          const imgs = cbDiv.querySelectorAll("img");
+          for (const img of imgs) {
+            const srcset = img.getAttribute("srcset") || "";
+            const src = img.getAttribute("src") || "";
+            if (srcset.includes("checked") || src.includes("checked")) return true;
           }
         }
-      }
-      return false;
-    });
+        return false;
+      });
+    };
 
-    if (isChecked) {
-      console.log("GST checkbox already ticked on order summary");
-      return;
-    }
-
-    console.log("GST checkbox not ticked on order summary — clicking it");
-
-    let clicked = false;
-    for (let attempt = 0; attempt < 3 && !clicked; attempt++) {
-      const result = await this.page.evaluate(() => {
+    // Helper: click the GST checkbox (the r-d045u9 div inside a cursor:pointer container)
+    const clickGstCheckbox = async (): Promise<boolean> => {
+      return this.page.evaluate(() => {
         const allDivs = Array.from(document.querySelectorAll("div"));
         for (const d of allDivs) {
-          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
-          if (txt.includes("Use GST Invoice")) {
-            // Walk up to find clickable parent
-            let el: HTMLElement | null = d.parentElement;
+          const className = d.className || "";
+          if (className.includes("r-d045u9")) {
+            let el: HTMLElement | null = d;
             while (el && el !== document.body) {
               const style = el.getAttribute("style") || "";
-              const role = el.getAttribute("role") || "";
-              if (
-                style.includes("cursor: pointer") ||
-                role === "checkbox" ||
-                el.tagName === "INPUT" ||
-                el.tagName === "IMG"
-              ) {
+              if (style.includes("cursor: pointer")) {
                 el.scrollIntoView({ block: "center" });
                 el.click();
                 return true;
               }
               el = el.parentElement;
             }
-            // Fallback: find nearest cursor:pointer ancestor
-            let parentEl: HTMLElement | null = d;
-            while (parentEl && parentEl !== document.body) {
-              const pStyle = parentEl.getAttribute("style") || "";
-              if (pStyle.includes("cursor: pointer")) {
-                parentEl.scrollIntoView({ block: "center" });
-                parentEl.click();
-                return true;
-              }
-              parentEl = parentEl.parentElement;
-            }
-            // Last resort: click the div itself
-            (d as HTMLElement).click();
+            d.scrollIntoView({ block: "center" });
+            d.click();
             return true;
           }
         }
         return false;
       });
+    };
 
-      if (result) {
-        clicked = true;
-        console.log("GST checkbox clicked on order summary");
-      } else {
-        console.log(`GST checkbox click failed (attempt ${attempt + 1}/3)`);
-        await sleep(300);
-      }
-    }
+    // Helper: click "Confirm and Save" or "Confirm and Use"
+    const clickConfirmButton = async (): Promise<boolean> => {
+      return this.page.evaluate(() => {
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (txt === "Confirm and Save" || txt === "Confirm and Use") {
+            let el: HTMLElement | null = d;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              if (style.includes("cursor: pointer")) {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return true;
+              }
+              el = el.parentElement;
+            }
+            d.scrollIntoView({ block: "center" });
+            d.click();
+            return true;
+          }
+        }
+        return false;
+      });
+    };
 
-    await sleep(300);
+    // Helper: click "Add new GST Details"
+    const clickAddNewGst = async (): Promise<boolean> => {
+      return this.page.evaluate(() => {
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (txt === "Add new GST Details") {
+            let el: HTMLElement | null = d;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              if (style.includes("cursor: pointer")) {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return true;
+              }
+              el = el.parentElement;
+            }
+            el = d.parentElement;
+            while (el && el !== document.body) {
+              const cls = el.className || "";
+              if (cls.includes("css-g5y9jx")) {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return true;
+              }
+              el = el.parentElement;
+            }
+            d.scrollIntoView({ block: "center" });
+            d.click();
+            return true;
+          }
+        }
+        return false;
+      });
+    };
 
-    // Verify the checkbox is now ticked
-    const nowChecked = await this.page.evaluate(() => {
-      const checkedImgs = document.querySelectorAll('img[src*="checked"]');
-      if (checkedImgs.length > 0) return true;
-      const checkboxes = document.querySelectorAll('[role="checkbox"]');
-      for (const cb of checkboxes) {
-        if (cb.getAttribute("aria-checked") === "true") return true;
+    // Helper: wait for GST form inputs to appear (max 10s)
+    const waitForGstForm = async (): Promise<boolean> => {
+      for (let i = 0; i < 20; i++) {
+        try {
+          const ready = await this.page.evaluate(() => {
+            const gst = document.querySelector('input[maxlength="15"]');
+            const company = document.querySelector('input[maxlength="60"]');
+            return gst !== null || company !== null;
+          });
+          if (ready) return true;
+        } catch {}
+        await sleep(500);
       }
       return false;
+    };
+
+    // Helper: fill GST form using page.keyboard.type (most reliable for React)
+    const fillGstFormViaKeyboard = async (gstNum: string, compName: string): Promise<void> => {
+      console.log("Filling GST form via keyboard...");
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          const gstInput = await this.page.$('input[maxlength="15"]');
+          if (gstInput) {
+            await gstInput.click({ clickCount: 3 });
+            await this.page.keyboard.type(gstNum, { delay: 80 });
+            console.log(`GSTIN entered: ${gstNum.slice(0, 2)}***${gstNum.slice(-2)}`);
+
+            const companyInput = await this.page.$('input[maxlength="60"]');
+            if (companyInput) {
+              await companyInput.click({ clickCount: 3 });
+              await this.page.keyboard.type(compName, { delay: 80 });
+              console.log(`Company name entered: ${compName}`);
+            }
+            return;
+          }
+        } catch (e) {
+          console.log(`Fill attempt ${attempt + 1} failed: ${(e as Error).message}`);
+          await sleep(500);
+        }
+      }
+      await this.fillGstForm(gstNum, compName);
+    };
+
+    // === Main logic ===
+
+    // Check if our GST number is already on the page
+    const gstNumOnPage = await this.page.evaluate(() => {
+      const match = document.body.innerText.match(/\d{2}[A-Z]{3}[A-Z0-9]{10}/);
+      return match ? match[0] : null;
     });
 
-    if (nowChecked) {
-      console.log("GST checkbox ticked successfully on order summary");
-    } else {
-      console.log("WARNING: GST checkbox may not have ticked — proceeding anyway");
+    if (gstNumOnPage) {
+      console.log(`GST number already on page: ${gstNumOnPage}`);
+      if (await isGstChecked()) {
+        console.log("GST checkbox already ticked");
+        return;
+      }
+      const clicked = await clickGstCheckbox();
+      if (!clicked) {
+        throw new Error("Could not click GST checkbox — cannot proceed");
+      }
+      await sleep(1000);
+      if (await isGstChecked()) {
+        console.log("GST checkbox ticked successfully");
+        return;
+      }
+      // If "Select GST Details" form opened, handle it
+      const formOpened = await this.page.evaluate(() =>
+        document.body.innerText.includes("Select GST Details")
+      );
+      if (formOpened) {
+        console.log("GST selection form opened — selecting existing entry...");
+        const selected = await this.page.evaluate((gst) => {
+          const allDivs = Array.from(document.querySelectorAll("div"));
+          for (const d of allDivs) {
+            if ((d.innerText || "").includes(gst)) {
+              let el = d as HTMLElement | null;
+              while (el && el !== document.body) {
+                const style = el.getAttribute("style") || "";
+                if (style.includes("cursor: pointer")) {
+                  el.scrollIntoView({ block: "center" });
+                  el.click();
+                  return true;
+                }
+                el = el.parentElement;
+              }
+              (d as HTMLElement).click();
+              return true;
+            }
+          }
+          return false;
+        }, gstNumOnPage);
+        if (selected) {
+          await sleep(500);
+          await clickConfirmButton();
+          await sleep(1000);
+        }
+        if (await isGstChecked()) {
+          console.log("GST checkbox ticked after selecting existing entry");
+          return;
+        }
+      }
+      await clickGstCheckbox();
+      await sleep(1000);
+      if (await isGstChecked()) {
+        console.log("GST checkbox ticked successfully");
+        return;
+      }
+      throw new Error("GST invoice checkbox is not ticked after all attempts — cannot proceed to payment");
     }
+
+    // === No GST on page — "Use GST Invoice" case ===
+    console.log("No GST on page — clicking checkbox to open GST form...");
+    const clicked = await clickGstCheckbox();
+    if (!clicked) {
+      throw new Error("Could not click GST checkbox — cannot proceed");
+    }
+    await sleep(1000);
+
+    // Wait for form inputs to appear
+    const formReady = await waitForGstForm();
+    if (!formReady) {
+      const modalOpen = await this.page.evaluate(() =>
+        document.body.innerText.includes("Select GST Details")
+      );
+      if (modalOpen) {
+        console.log("GST selection modal opened...");
+        const exists = await this.page.evaluate((gst) =>
+          (document.body.innerText || "").includes(gst)
+        , gstNumber);
+        if (exists) {
+          console.log("GST found in saved list — selecting...");
+          await this.page.evaluate((gst) => {
+            const allDivs = Array.from(document.querySelectorAll("div"));
+            for (const d of allDivs) {
+              if ((d.innerText || "").includes(gst)) {
+                let el = d as HTMLElement | null;
+                while (el && el !== document.body) {
+                  const style = el.getAttribute("style") || "";
+                  if (style.includes("cursor: pointer")) {
+                    el.scrollIntoView({ block: "center" });
+                    el.click();
+                    return true;
+                  }
+                  el = el.parentElement;
+                }
+                return true;
+              }
+            }
+            return false;
+          }, gstNumber);
+          await sleep(500);
+          await clickConfirmButton();
+          await sleep(1000);
+          if (await isGstChecked()) {
+            console.log("GST checkbox ticked");
+            return;
+          }
+        }
+        console.log("GST not in list — clicking Add new GST Details...");
+        await clickAddNewGst();
+        await sleep(1000);
+        const inputsReady = await waitForGstForm();
+        if (!inputsReady) {
+          throw new Error("GST form inputs never appeared — cannot enter GST details");
+        }
+      } else {
+        throw new Error("GST form never appeared after clicking checkbox — cannot enter GST details");
+      }
+    }
+
+    // Form is open — fill GST details via keyboard
+    console.log("GST form open — entering details...");
+    await fillGstFormViaKeyboard(gstNumber, companyName);
+    await sleep(500);
+
+    console.log("Clicking Confirm and Save...");
+    await clickConfirmButton();
+    await this.ensurePageValid();
+    await sleep(1500);
+
+    if (await isGstChecked()) {
+      console.log("GST checkbox ticked successfully");
+      return;
+    }
+
+    await clickGstCheckbox();
+    await sleep(1000);
+    if (await isGstChecked()) {
+      console.log("GST checkbox ticked successfully");
+      return;
+    }
+
+    throw new Error("GST invoice checkbox is not ticked after all attempts — cannot proceed to payment");
   }
 
   private async clickContinueToCheckout(): Promise<void> {

@@ -192,7 +192,7 @@ export async function navigateWithRetry(
   {
     timeoutMs = 10000,
     maxRetries = 5,
-    waitUntil = "networkidle2" as const,
+    waitUntil = "domcontentloaded" as const,
   } = {}
 ): Promise<void> {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -225,3 +225,45 @@ export async function navigateWithRetry(
     `Page failed to load after ${maxRetries} attempts: ${url}`
   );
 }
+
+/**
+ * Wraps an async operation with a timeout.
+ * If the operation doesn't complete within `timeoutMs`, throws an error.
+ */
+export async function withTimeout<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number,
+  label = "Operation"
+): Promise<T> {
+  return Promise.race([
+    fn(),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+    ),
+  ]);
+}
+
+/**
+ * Waits for any of multiple async conditions to succeed.
+ * Returns the result of the first one that resolves. 
+ * If all fail, throws the last error.
+ */
+export async function waitForAny<T>(
+  fns: Array<() => Promise<T>>,
+  label = "waitForAny"
+): Promise<T> {
+  let lastError: Error | null = null;
+  return Promise.race(
+    fns.map((fn) =>
+      fn().catch((err) => {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        // Return a never-resolving promise so other branches can still win
+        return new Promise<T>(() => {});
+      })
+    )
+  ).then((result) => {
+    if (result !== undefined) return result;
+    throw lastError || new Error(`${label}: all conditions failed`);
+  });
+}
+

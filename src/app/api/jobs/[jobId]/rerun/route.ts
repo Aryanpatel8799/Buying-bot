@@ -5,6 +5,7 @@ import Job from "@/lib/db/models/Job";
 import ChromeProfile from "@/lib/db/models/ChromeProfile";
 import SavedCard from "@/lib/db/models/SavedCard";
 import FlipkartAccount from "@/lib/db/models/FlipkartAccount";
+import InstaDdrAccount from "@/lib/db/models/InstaDdrAccount";
 import { checkRateLimit, rateLimitResponse } from "@/lib/rateLimit";
 
 // POST /api/jobs/[jobId]/rerun — clone a job and create a fresh copy
@@ -31,6 +32,10 @@ export async function POST(
   if (!originalJob) {
     return NextResponse.json({ error: "Job not found" }, { status: 404 });
   }
+
+  console.log(`[rerun] originalJob instaDdrAccountIds:`, JSON.stringify(originalJob.instaDdrAccountIds));
+  console.log(`[rerun] originalJob accountIds:`, JSON.stringify(originalJob.accountIds));
+  console.log(`[rerun] originalJob cardIds:`, JSON.stringify(originalJob.cardIds));
 
   // Validate referenced resources still exist
   const profile = await ChromeProfile.findOne({ _id: originalJob.chromeProfileId, userId });
@@ -67,6 +72,19 @@ export async function POST(
     }
   }
 
+  if (originalJob.instaDdrAccountIds && originalJob.instaDdrAccountIds.length > 0) {
+    const groupCount = await InstaDdrAccount.countDocuments({
+      _id: { $in: originalJob.instaDdrAccountIds },
+      userId,
+    });
+    if (groupCount !== originalJob.instaDdrAccountIds.length) {
+      return NextResponse.json(
+        { error: "One or more InstaDDR groups from the original job no longer exist" },
+        { status: 400 }
+      );
+    }
+  }
+
   const totalIterations = Math.ceil(
     originalJob.totalQuantity / originalJob.perOrderQuantity
   );
@@ -84,6 +102,11 @@ export async function POST(
     paymentDetails: originalJob.paymentDetails, // already encrypted
     cardIds: originalJob.cardIds || [],
     accountIds: originalJob.accountIds || [],
+    instaDdrAccountIds: originalJob.instaDdrAccountIds || [],
+    giftCardInventoryId: originalJob.giftCardInventoryId || undefined,
+    checkoutPincode: originalJob.checkoutPincode || "",
+    maxConcurrentTabs: originalJob.maxConcurrentTabs,
+    addressIds: originalJob.addressIds || [],
     status: "pending",
     progress: {
       totalIterations,

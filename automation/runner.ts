@@ -58,6 +58,20 @@ async function main() {
     });
   }
 
+  if (config.instaDdrAccounts && config.instaDdrAccounts.length > 0) {
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: `Runner config has ${config.instaDdrAccounts.length} InstaDDR account(s) — OTP automation enabled`,
+    });
+  } else {
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: "Runner config has NO InstaDDR accounts — OTP will be manual",
+    });
+  }
+
   // Ensure error-screenshots directory exists
   if (!fs.existsSync("error-screenshots")) {
     fs.mkdirSync("error-screenshots", { recursive: true });

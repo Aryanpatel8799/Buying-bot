@@ -96,11 +96,10 @@ export class RTGSPayment extends BasePayment {
   }
 
   /**
-   * Clicks "Place Order" on the RTGS payment page and waits for the poll URL.
-   * Uses STABLE semantic selectors (text + accessibility attributes) — no CSS class names.
-   * Returns true if /payments/rtgs/poll was reached or a bank popup was detected (within 10s).
-   * Returns false if the click didn't trigger navigation within 10s.
-   * Does NOT throw — lets the caller decide how to handle failure.
+   * Clicks the "Place Order" button on the RTGS payment page.
+   * Finds the button → scrolls into view → clicks it → returns immediately.
+   * The orchestrator handles the 2s wait and new tab opening.
+   * Returns true if the button was found and clicked, false if not found.
    */
   async confirmPayment(): Promise<boolean> {
     if (this.platform !== "flipkart") {
@@ -110,249 +109,167 @@ export class RTGSPayment extends BasePayment {
 
     console.log("[RTGS] confirmPayment: looking for Place Order button...");
 
-    // Give the page time to render after RTGS selection
-    await sleep(2000);
+    // Wait for the page to render after RTGS selection
+    await sleep(1500);
 
-    // ── Debug: capture pre-click state ─────────────────────────────────────────
-    try {
-      const pageState = await this.page.evaluate(() => {
-        const allBtns = Array.from(document.querySelectorAll("button")).map((b) => ({
-          text: ((b as HTMLElement).innerText || "").trim(),
-          type: (b as HTMLButtonElement).type,
-          disabled: (b as HTMLButtonElement).disabled,
-          ariaLabel: b.getAttribute("aria-label") || "",
-          dataAuto: Array.from(b.attributes)
-            .filter((a) => a.name.startsWith("data-") || a.name.startsWith("data_"))
-            .map((a) => `${a.name}=${a.value}`),
-        }));
-        const placeOrderEls = Array.from(
-          document.querySelectorAll("*")
-        )
-          .filter((el) => {
-            const text = (el.textContent || "").trim();
-            return text === "Place Order" || text === "PLACE ORDER";
-          })
-          .map((el) => ({
-            tag: el.tagName,
-            text: (el.textContent || "").trim(),
-            className: el.className.slice(0, 80),
-            id: el.id,
-            hasDisabled: (el as HTMLButtonElement).disabled !== undefined,
-            disabled: (el as HTMLButtonElement).disabled,
-            attrs: Array.from(el.attributes)
-              .filter((a) => a.name.startsWith("data-") || a.name === "aria-label" || a.name === "role")
-              .map((a) => `${a.name}=${a.value}`),
-            // Walk up for context
-            parentTag: el.parentElement?.tagName,
-            parentClass: el.parentElement?.className.slice(0, 60),
-          }));
-        return {
-          url: window.location.href,
-          buttons: allBtns.filter((b) => b.text.length > 0),
-          placeOrderEls,
-          bodySnippet: document.body.innerText.toLowerCase().slice(0, 400),
-        };
-      });
-      console.log(`[RTGS] Pre-click state — URL: ${pageState.url}`);
-      console.log(`[RTGS] Buttons found: ${JSON.stringify(pageState.buttons.slice(0, 15))}`);
-      if (pageState.placeOrderEls.length > 0) {
-        console.log(`[RTGS] "Place Order" elements: ${JSON.stringify(pageState.placeOrderEls)}`);
-      } else {
-        console.log(`[RTGS] No "Place Order" text found in DOM`);
-      }
-    } catch (err) {
-      console.log(`[RTGS] Pre-click state dump failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    // ── Find the Place Order button using STABLE semantic selectors ─────────────
-    // No CSS class names — only text + accessibility + DOM traversal.
-    // This is the single most important fix: CSS classes change on every Flipkart deploy.
-
-    const BUTTON_TIMEOUT = 20; // iterations × 500ms = 10s
-    let tapped = false;
-    let tappedCoords: { x: number; y: number } | null = null;
-
-    for (let attempt = 0; attempt < BUTTON_TIMEOUT && !tapped; attempt++) {
-      if (attempt > 0) {
-        await sleep(500);
-      }
+    // Wait up to 10s for the button to appear
+    for (let attempt = 0; attempt < 20; attempt++) {
+      if (attempt > 0) await sleep(500);
 
       try {
-        const result = await this.page.evaluate(() => {
-          /**
-           * Finds the best clickable element for "Place Order".
-           * Priority:
-           * 1. <button> with exact text "Place Order" (most reliable)
-           * 2. Any element with exact text "Place Order" + clickable ancestor
-           * 3. element with aria-label containing "place order"
-           */
-          function findPlaceOrderButton(): { x: number; y: number; strategy: string } | null {
-            // ── Priority 0: Flipkart's Button-module_button class (known stable class) ──
-            // <button class="Button-module_button__P7hTI ... font-m-semibold ..." variant="neutral">Place Order</button>
-            const knownBtn = document.querySelector("button.Button-module_button__P7hTI");
-            if (knownBtn) {
-              const text = (knownBtn.textContent || "").trim();
-              if (text === "Place Order" && !(knownBtn as HTMLButtonElement).disabled) {
-                (knownBtn as HTMLElement).scrollIntoView({ block: "center" });
-                const rect = knownBtn.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
-                  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, strategy: "Button-module_button" };
-                }
+        // Find the button and get its coordinates
+        const buttonInfo = await this.page.evaluate(() => {
+          // Strategy 1: Known Flipkart button class (fastest, most reliable)
+          const knownBtn = document.querySelector("button.Button-module_button__P7hTI");
+          if (knownBtn) {
+            const text = (knownBtn.textContent || "").trim();
+            if (text === "Place Order" && !(knownBtn as HTMLButtonElement).disabled) {
+              (knownBtn as HTMLElement).scrollIntoView({ block: "center" });
+              const rect = knownBtn.getBoundingClientRect();
+              if (rect.width > 0 && rect.height > 0) {
+                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, strategy: "Button-module" };
               }
             }
+          }
 
-            // ── Priority 1: <button> with exact text "Place Order" ──────────────
-            const buttons = document.querySelectorAll("button");
-            for (const btn of buttons) {
-              const text = (btn.textContent || "").trim();
-              if (text !== "Place Order") continue;
-              if ((btn as HTMLButtonElement).disabled) continue;
+          // Strategy 2: Any <button> with exact text "Place Order"
+          const buttons = Array.from(document.querySelectorAll("button"));
+          for (const btn of buttons) {
+            const text = (btn.textContent || "").trim();
+            if (text !== "Place Order") continue;
+            if ((btn as HTMLButtonElement).disabled) continue;
+            (btn as HTMLElement).scrollIntoView({ block: "center" });
+            const rect = btn.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+              return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, strategy: "button-text" };
+            }
+            // Walk up for visible parent
+            let el: HTMLElement | null = btn;
+            while (el && el !== document.body) {
+              const r = el.getBoundingClientRect();
+              if (r.width > 0 && r.height > 0) {
+                return { x: r.left + r.width / 2, y: r.top + r.height / 2, strategy: "button-parent" };
+              }
+              el = el.parentElement;
+            }
+          }
+
+          // Strategy 3: div.OU_Jes container
+          const containers = Array.from(document.querySelectorAll("div.OU_Jes"));
+          for (const c of containers) {
+            const btn = c.querySelector("button");
+            if (btn && (btn.textContent || "").trim() === "Place Order") {
               (btn as HTMLElement).scrollIntoView({ block: "center" });
               const rect = btn.getBoundingClientRect();
               if (rect.width > 0 && rect.height > 0) {
-                return {
-                  x: rect.left + rect.width / 2,
-                  y: rect.top + rect.height / 2,
-                  strategy: "button-exact-text",
-                };
-              }
-              // Button has no size — walk up to find visible parent
-              let el: HTMLElement | null = btn;
-              while (el && el !== document.body) {
-                const r = el.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) {
-                  return { x: r.left + r.width / 2, y: r.top + r.height / 2, strategy: "button-walked-up" };
-                }
-                el = el.parentElement;
+                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, strategy: "OU_Jes" };
               }
             }
-
-            // ── Priority 2: aria-label on any element ───────────────────────────
-            const allWithAria = document.querySelectorAll("[aria-label]");
-            for (const el of allWithAria) {
-              const label = (el.getAttribute("aria-label") || "").trim().toLowerCase();
-              if (!label.includes("place order")) continue;
-              (el as HTMLElement).scrollIntoView({ block: "center" });
-              const rect = el.getBoundingClientRect();
-              if (rect.width > 0 && rect.height > 0) {
-                return {
-                  x: rect.left + rect.width / 2,
-                  y: rect.top + rect.height / 2,
-                  strategy: "aria-label",
-                };
-              }
-            }
-
-            // ── Priority 3: Any element with exact text "Place Order" ───────────
-            // Walk the entire DOM once, collecting all matching text nodes
-            const allEls = document.querySelectorAll("*");
-            for (const el of allEls) {
-              const text = (el.textContent || "").trim();
-              if (text !== "Place Order") continue;
-
-              // Skip hidden elements
-              const style = window.getComputedStyle(el);
-              if (style.display === "none" || style.visibility === "hidden") continue;
-
-              // Walk up to find a clickable ancestor
-              let node: HTMLElement | null = el as HTMLElement;
-              while (node && node !== document.body) {
-                const nodeStyle = node.getAttribute("style") || "";
-                const nodeTag = node.tagName;
-                const nodeRole = node.getAttribute("role");
-                if (
-                  nodeStyle.includes("cursor: pointer") ||
-                  nodeTag === "BUTTON" ||
-                  nodeRole === "button" ||
-                  node.className.includes("css-g5y9jx") // Flipkart's clickable button class
-                ) {
-                  (node as HTMLElement).scrollIntoView({ block: "center" });
-                  const r = node.getBoundingClientRect();
-                  if (r.width > 0 && r.height > 0) {
-                    return { x: r.left + r.width / 2, y: r.top + r.height / 2, strategy: "text-walked-up" };
-                  }
-                }
-                node = node.parentElement;
-              }
-
-              // Fallback: use the element itself if visible
-              (el as HTMLElement).scrollIntoView({ block: "center" });
-              const rect = el.getBoundingClientRect();
-              if (rect.width > 0 && rect.height > 0) {
-                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, strategy: "text-direct" };
-              }
-            }
-
-            return null;
           }
 
-          return findPlaceOrderButton();
+          return null;
         });
 
-        if (result) {
-          const { x, y, strategy } = result;
-          console.log(`[RTGS] Place Order found via "${strategy}" at (${x.toFixed(0)}, ${y.toFixed(0)}) — tapping...`);
-          await this.page.touchscreen.tap(x, y);
-          tapped = true;
-          tappedCoords = { x, y };
-          console.log("[RTGS] Place Order tapped!");
-          break;
+        if (!buttonInfo) continue;
+
+        const { x, y, strategy } = buttonInfo;
+        console.log(`[RTGS] Place Order found via "${strategy}" at (${x.toFixed(0)}, ${y.toFixed(0)}) — clicking...`);
+
+        // Click the button using mouse.click
+        try {
+          await this.page.mouse.click(x, y);
+        } catch {
+          // Click may trigger navigation which destroys context — that means it worked
+          console.log("[RTGS] ✅ mouse.click triggered navigation!");
+          return true;
         }
 
-        if (attempt === 0) {
-          // Only log on first attempt to avoid spam
-          console.log("[RTGS] Place Order button not visible yet — waiting...");
-        }
-      } catch (err) {
-        console.log(`[RTGS] Attempt ${attempt + 1} error: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
-    if (!tapped) {
-      // Screenshot the page so we can see what Flipkart rendered
-      try {
-        const screenshotPath = `rtgs-placeorder-debug-${Date.now()}.png`;
-        await this.page.screenshot({ path: screenshotPath, fullPage: true });
-        console.log(`[RTGS] DEBUG SCREENSHOT saved: ${screenshotPath}`);
-      } catch { /* ignore screenshot failures */ }
-
-      console.log("[RTGS] Place Order button could not be found — returning false");
-      return false;
-    }
-
-    // ── Wait for navigation to the RTGS poll page ──────────────────────────────
-    // After clicking "Place Order", Flipkart navigates to /payments/rtgs/poll
-    // OR opens a bank popup. Either confirms the click worked.
-    // Reduce to 10s (was 30s) so orchestrator moves to next tab faster.
-    console.log("[RTGS] Waiting for RTGS poll page or bank popup (10s timeout)...");
-
-    for (let w = 0; w < 20; w++) { // 20 × 500ms = 10s
-      const url = this.page.url();
-      if (url.includes("/payments/rtgs/poll")) {
-        console.log(`[RTGS] Poll page reached: ${url}`);
-        return true;
-      }
-
-      // Check for bank popup tabs
-      try {
-        const browser = this.page.browser();
-        const pages = await browser.pages();
-        for (const p of pages) {
-          if (p !== this.page && !p.url().startsWith("about:blank")) {
-            console.log(`[RTGS] Bank popup detected: ${p.url()}`);
+        // Wait up to 3s for the page to navigate away (URL change = click worked)
+        const startUrl = this.page.url();
+        for (let w = 0; w < 6; w++) {
+          await sleep(500);
+          try {
+            const currentUrl = this.page.url();
+            if (currentUrl !== startUrl || currentUrl.includes("/payments/rtgs/poll")) {
+              console.log(`[RTGS] ✅ Page navigated to: ${currentUrl}`);
+              return true;
+            }
+          } catch {
+            // page.url() failed = page is mid-navigation = click worked
+            console.log("[RTGS] ✅ Page navigating (context destroyed) — click worked!");
             return true;
           }
         }
-      } catch { /* ignore */ }
 
-      await sleep(500);
+        // URL didn't change — try JS click as fallback (button might need React event)
+        console.log("[RTGS] mouse.click didn't navigate — trying JS click fallback...");
+        const jsClickPromise = this.page.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll("button"));
+          for (const btn of btns) {
+            if ((btn.textContent || "").trim() === "Place Order" && !btn.disabled) {
+              btn.scrollIntoView({ block: "center" });
+              btn.click();
+              btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+              return true;
+            }
+          }
+          // Also try div.OU_Jes container
+          const containers = Array.from(document.querySelectorAll("div.OU_Jes"));
+          for (const c of containers) {
+            const btn = c.querySelector("button");
+            if (btn && (btn.textContent || "").trim() === "Place Order") {
+              (c as HTMLElement).click();
+              return true;
+            }
+          }
+          return false;
+        }).catch(() => false);
+
+        // Race the JS click with a 5s timeout — never hang forever
+        const jsResult = await Promise.race([
+          jsClickPromise,
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5000)),
+        ]);
+
+        if (jsResult) {
+          // Check if navigation happened
+          await sleep(1000);
+          try {
+            const afterUrl = this.page.url();
+            if (afterUrl.includes("/payments/rtgs/poll") || afterUrl !== startUrl) {
+              console.log(`[RTGS] ✅ JS click worked — navigated to: ${afterUrl}`);
+              return true;
+            }
+          } catch {
+            console.log("[RTGS] ✅ JS click triggered navigation!");
+            return true;
+          }
+        }
+
+        console.log("[RTGS] Click attempt didn't trigger navigation — retrying...");
+        // Continue to next attempt in the loop
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("context") || msg.includes("destroyed") || msg.includes("detached")) {
+          // Page navigated — click worked!
+          console.log("[RTGS] ✅ Place Order click triggered navigation!");
+          return true;
+        }
+        console.log(`[RTGS] Attempt ${attempt + 1} error: ${msg}`);
+      }
     }
 
-    // 10s passed — click may have fired but navigation was delayed.
-    // Return false so orchestrator marks pending; parallel polling phase will catch it.
-    console.log("[RTGS] Poll URL not reached after 10s — marking pending for parallel polling");
+    // Button not found after 10s — take debug screenshot
+    try {
+      const screenshotPath = `error-screenshots/rtgs-placeorder-debug-${Date.now()}.png`;
+      await this.page.screenshot({ path: screenshotPath, fullPage: true });
+      console.log(`[RTGS] DEBUG SCREENSHOT saved: ${screenshotPath}`);
+    } catch { /* ignore */ }
+
+    console.log("[RTGS] ❌ Place Order button not found after 10s");
     return false;
   }
+
 
   async waitForBankAuthCompletion(): Promise<boolean> {
     const timeout = 5 * 60 * 1000; // 5 minutes

@@ -6,6 +6,7 @@ import SavedCard from "@/lib/db/models/SavedCard";
 import FlipkartAccount from "@/lib/db/models/FlipkartAccount";
 import SavedAddress from "@/lib/db/models/SavedAddress";
 import Log from "@/lib/db/models/Log";
+import InstaDdrAccount from "@/lib/db/models/InstaDdrAccount";
 import { decrypt } from "@/lib/encryption";
 import { getProfileDir } from "@/lib/platform/chromePaths";
 import { removeExecutor } from "./jobRegistry";
@@ -86,6 +87,33 @@ export class JobExecutor extends EventEmitter {
         .filter((a): a is string => a !== null);
     }
 
+    // Decrypt InstaDDR accounts for OTP automation
+    let instaDdrAccounts: import("@/types").InstaDdrAccount[] | undefined;
+    const instaDdrAccountIds = (job as any).instaDdrAccountIds;
+    if (instaDdrAccountIds && instaDdrAccountIds.length > 0) {
+      const groups = await InstaDdrAccount.find({ _id: { $in: instaDdrAccountIds } }).lean();
+      const allAccounts: import("@/types").InstaDdrAccount[] = [];
+      for (const group of groups) {
+        for (const a of (group.accounts as any[])) {
+          try {
+            allAccounts.push({
+              instaDdrId: a.instaDdrId,
+              instaDdrPassword: decrypt(a.instaDdrPassword),
+              email: decrypt(a.email),
+            });
+          } catch {
+            console.warn(`[Job ${this.jobId}] Skipping corrupt InstaDDR account ${a._id}`);
+          }
+        }
+      }
+      if (allAccounts.length > 0) {
+        instaDdrAccounts = allAccounts;
+        console.log(`[Job ${this.jobId}] Loaded ${allAccounts.length} InstaDDR accounts from ${groups.length} group(s)`);
+      } else {
+        console.warn(`[Job ${this.jobId}] InstaDDR group(s) selected but all accounts were corrupt — skipping InstaDDR`);
+      }
+    }
+
     // Fetch GST address details
     // Uses job.addressIds if populated, otherwise falls back to the first saved address for Flipkart jobs
     let address: import("@/types").AddressDetails | undefined;
@@ -159,6 +187,7 @@ export class JobExecutor extends EventEmitter {
       ...(accounts && accounts.length > 0 ? { accounts } : {}),
       ...(address ? { address } : {}),
       ...(job.maxConcurrentTabs > 1 ? { maxConcurrentTabs: job.maxConcurrentTabs } : {}),
+      ...(instaDdrAccounts && instaDdrAccounts.length > 0 ? { instaDdrAccounts } : {}),
     };
 
     const configB64 = Buffer.from(JSON.stringify(config)).toString("base64");

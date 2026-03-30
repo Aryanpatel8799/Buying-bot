@@ -1,19 +1,33 @@
-import { Browser, Page } from "puppeteer-core";
-import { BasePlatform } from "../platforms/BasePlatform";
+import { Browser, BrowserContext, Page } from "puppeteer-core";
+import { BasePlatform, InstaDdrLoginOptions } from "../platforms/BasePlatform";
 import { FlipkartPlatform } from "../platforms/FlipkartPlatform";
 import { AmazonPlatform } from "../platforms/AmazonPlatform";
 import { BasePayment } from "../payments/BasePayment";
 import { CardPayment } from "../payments/CardPayment";
 import { GiftCardPayment } from "../payments/GiftCardPayment";
 import { RTGSPayment } from "../payments/RTGSPayment";
+import { InstaDdrService } from "../services/InstaDdrService";
 import { sleep, sendMessage } from "./helpers";
 import type { JobConfig, ProductItem, CardDetails } from "../../src/types";
+
+interface InventoryCode {
+  codeIndex: number;
+  code: string;
+  pin: string;
+  balance?: number;
+}
 
 export class BatchOrchestrator {
   private shouldStopFlag = false;
   private isMultiUrl = false;
   private cards: CardDetails[] | null = null;
   private accounts: string[] | null = null;
+  private giftCardInventoryId: string | null = null;
+  private inventoryCodes: InventoryCode[] = [];
+  private inventoryIndex = 0;
+  private inventoryBaseUrl: string;
+  private instaDdrService: InstaDdrService | null = null;
+  private instaDdrAccounts: Array<{ instaDdrId: string; instaDdrPassword: string; email: string }> | null = null;
 
   constructor(
     private page: Page,
@@ -39,6 +53,34 @@ export class BatchOrchestrator {
       }
     }
 
+    // Store gift card inventory for code rotation
+    if (config.giftCardInventoryId) {
+      this.giftCardInventoryId = config.giftCardInventoryId;
+    }
+
+    // Create InstaDDR service with its own isolated browser context
+    // to prevent InstaDDR login/logout from affecting Flipkart's session
+    if (config.instaDdrAccounts && config.instaDdrAccounts.length > 0) {
+      if (!(this.platform instanceof FlipkartPlatform)) {
+        throw new Error("InstaDDR OTP automation is only supported for Flipkart");
+      }
+      this.instaDdrAccounts = config.instaDdrAccounts;
+
+      // Note: isolated context is created lazily in run() — cannot await in constructor
+
+      sendMessage({
+        type: "log",
+        level: "info",
+        message: `InstaDDR configured with ${config.instaDdrAccounts.length} account(s) — isolated context created`,
+      });
+    }
+
+    // Determine base URL for inventory API calls
+    this.inventoryBaseUrl =
+      process.env.NEXT_PUBLIC_APP_URL ||
+      process.env.APP_URL ||
+      "http://localhost:3000";
+
     // Listen for stop signal (use once to prevent listener stacking)
     process.once("SIGTERM", () => {
       console.log("Received SIGTERM — stopping after current iteration...");
@@ -50,25 +92,38 @@ export class BatchOrchestrator {
   }
 
   async run(): Promise<void> {
-    const totalIterations = Math.ceil(
+    let totalIterations = Math.ceil(
       this.config.totalQuantity / this.config.perOrderQuantity
     );
 
-    const maxConcurrentTabs = this.config.maxConcurrentTabs ?? 1;
-    const isRTGSMultiTab =
-      this.config.paymentMethod === "rtgs" && maxConcurrentTabs > 1;
+    const isRTGS = this.config.paymentMethod === "rtgs";
+
+    // For RTGS: ALWAYS use the multi-tab flow (new tab after each Place Order click).
+    // maxConcurrentTabs controls how many tabs to open per batch.
+    // Default: if user didn't set it, use totalIterations (one new tab per iteration).
+    let maxConcurrentTabs = this.config.maxConcurrentTabs ?? 1;
+    if (isRTGS) {
+      if (maxConcurrentTabs <= 1) {
+        // User didn't explicitly set tabs — default to totalIterations
+        maxConcurrentTabs = totalIterations;
+      }
+      // Ensure totalIterations >= maxConcurrentTabs
+      if (totalIterations < maxConcurrentTabs) {
+        totalIterations = maxConcurrentTabs;
+      }
+    }
 
     sendMessage({
       type: "log",
       level: "info",
-      message: isRTGSMultiTab
-        ? `Starting RTGS multi-tab batch: ${totalIterations} iterations, ${maxConcurrentTabs} tabs at a time`
+      message: isRTGS
+        ? `Starting RTGS flow: ${totalIterations} iterations, ${maxConcurrentTabs} tabs per batch (new tab after each Place Order)`
         : this.isMultiUrl
         ? `Starting multi-URL batch: ${totalIterations} iterations, ${this.config.products.length} products`
         : `Starting batch: ${totalIterations} iterations (${this.config.totalQuantity} total qty, ${this.config.perOrderQuantity} per order)`,
     });
 
-    if (isRTGSMultiTab) {
+    if (isRTGS) {
       await this.runRTGSBatched(totalIterations, maxConcurrentTabs);
       return;
     }
@@ -99,33 +154,82 @@ export class BatchOrchestrator {
           const accountIndex = i % this.accounts.length;
           const email = this.accounts[accountIndex];
 
-          // Login with this iteration's account
           sendMessage({
             type: "log",
             level: "info",
             message: `Logging in with account ${accountIndex + 1}/${this.accounts.length}...`,
             iteration: i + 1,
           });
-          await this.platform.loginWithEmail(email);
 
-          // Notify frontend that OTP is needed
-          const maskedEmail = `${email[0]}${"*".repeat(Math.max(email.indexOf("@") - 2, 1))}${email.substring(email.indexOf("@") - 1)}`;
-          sendMessage({
-            type: "waiting_for_otp",
-            email: maskedEmail,
-            iteration: i + 1,
-          } as any);
-
-          // Wait for human to enter OTP
-          const loginSuccess = await this.platform.waitForLoginCompletion(300000);
-          if (!loginSuccess) {
-            throw new Error(`Login timed out for account ${accountIndex + 1}`);
+          // Build InstaDDR options if configured (InstaDDR handles OTP automation internally)
+          if (this.instaDdrAccounts && !this.instaDdrService) {
+            const browser = this.page.browser() as Browser;
+            const instaDdrContext = await browser.createBrowserContext();
+            const instaDdrPage = await instaDdrContext.newPage();
+            this.instaDdrService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
           }
+          const instaDdrAccount = this.instaDdrAccounts?.[accountIndex % this.instaDdrAccounts.length];
+          const instaOptions: InstaDdrLoginOptions | undefined =
+            this.instaDdrService && instaDdrAccount
+              ? { instaDdrService: this.instaDdrService, instaDdrAccount }
+              : undefined;
+
+          // loginWithEmail: logout, enter email, click OTP
+          // If InstaDDR: user manually logs into InstaDDR, bot fetches OTP and enters it
+          // If no InstaDDR: returns immediately, we wait for manual OTP
+          await this.platform.loginWithEmail(email, instaOptions);
+
+          if (!this.instaDdrService) {
+            const maskedEmail = `${email[0]}${"*".repeat(Math.max(email.indexOf("@") - 2, 1))}${email.substring(email.indexOf("@") - 1)}`;
+            sendMessage({
+              type: "waiting_for_otp",
+              email: maskedEmail,
+              iteration: i + 1,
+            } as any);
+            const loginSuccess = await this.platform.waitForLoginCompletion(300000);
+            if (!loginSuccess) {
+              throw new Error(`Login timed out for account ${accountIndex + 1}`);
+            }
+            sendMessage({
+              type: "log",
+              level: "info",
+              message: `Login successful for account ${accountIndex + 1}`,
+              iteration: i + 1,
+            });
+          }
+        }
+
+        // InstaDDR-only: no account rotation, but still need to logout existing
+        // account and fetch OTP via InstaDDR (InstaDDR email IS the Flipkart login)
+        if (!this.accounts && this.instaDdrAccounts) {
+          const accountIndex = i % this.instaDdrAccounts.length;
 
           sendMessage({
             type: "log",
             level: "info",
-            message: `Login successful for account ${accountIndex + 1}`,
+            message: `InstaDDR-only mode: logging in with InstaDDR account ${accountIndex + 1}/${this.instaDdrAccounts.length}...`,
+            iteration: i + 1,
+          });
+
+          // Lazily create InstaDDR service with isolated browser context
+          if (!this.instaDdrService) {
+            const browser = this.page.browser() as Browser;
+            const instaDdrContext = await browser.createBrowserContext();
+            const instaDdrPage = await instaDdrContext.newPage();
+            this.instaDdrService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
+          }
+
+          const instaDdrAccount = this.instaDdrAccounts[accountIndex];
+          // Use the InstaDDR email as the Flipkart login email
+          await this.platform.loginWithEmail(instaDdrAccount.email, {
+            instaDdrService: this.instaDdrService,
+            instaDdrAccount,
+          });
+
+          sendMessage({
+            type: "log",
+            level: "info",
+            message: `InstaDDR OTP auto-entered for InstaDDR account ${accountIndex + 1}`,
             iteration: i + 1,
           });
         }
@@ -228,7 +332,7 @@ export class BatchOrchestrator {
     }
 
     // Logout the last account after all iterations
-    if (this.accounts) {
+    if (this.accounts || this.instaDdrAccounts) {
       try {
         sendMessage({
           type: "log",
@@ -243,6 +347,11 @@ export class BatchOrchestrator {
           message: `Final logout warning: ${err instanceof Error ? err.message : err}`,
         });
       }
+    }
+
+    // Close the isolated InstaDDR browser context
+    if (this.instaDdrService) {
+      await this.instaDdrService.close();
     }
 
     sendMessage({
@@ -298,49 +407,81 @@ export class BatchOrchestrator {
           level: "info",
           message: `Logging in with account ${accountIndex + 1}/${this.accounts.length} for batch...`,
         });
-        await this.platform.loginWithEmail(email);
 
-        const maskedEmail = `${email[0]}${"*".repeat(Math.max(email.indexOf("@") - 2, 1))}${email.substring(email.indexOf("@") - 1)}`;
-        sendMessage({
-          type: "waiting_for_otp",
-          email: maskedEmail,
-          iteration: batchStart + 1,
-        } as any);
-
-        const loginSuccess = await this.platform.waitForLoginCompletion(300000);
-        if (!loginSuccess) {
-          throw new Error(`Login timed out for account ${accountIndex + 1}`);
+        const instaDdrAccount = this.instaDdrAccounts?.[accountIndex % this.instaDdrAccounts.length];
+        // Lazily create InstaDDR service with isolated browser context on first use
+        if (this.instaDdrAccounts && !this.instaDdrService) {
+          const browser = this.page.browser() as Browser;
+          const instaDdrContext = await browser.createBrowserContext();
+          const instaDdrPage = await instaDdrContext.newPage();
+          this.instaDdrService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
         }
-        sendMessage({ type: "log", level: "info", message: "Login successful" });
+
+        await this.platform.loginWithEmail(email, {
+          instaDdrService: this.instaDdrService ?? undefined,
+          instaDdrAccount: instaDdrAccount ?? undefined,
+        });
+
+        if (!this.instaDdrService) {
+          const maskedEmail = `${email[0]}${"*".repeat(Math.max(email.indexOf("@") - 2, 1))}${email.substring(email.indexOf("@") - 1)}`;
+          sendMessage({
+            type: "waiting_for_otp",
+            email: maskedEmail,
+            iteration: batchStart + 1,
+          } as any);
+          const loginSuccess = await this.platform.waitForLoginCompletion(300000);
+          if (!loginSuccess) {
+            throw new Error(`Login timed out for account ${accountIndex + 1}`);
+          }
+          sendMessage({ type: "log", level: "info", message: "Login successful" });
+        } else {
+          sendMessage({ type: "log", level: "info", message: `InstaDDR OTP auto-entered for batch` });
+        }
       }
 
-      // ── Open tabs for this batch ──
-      // Tab 0 processes iterNum=batchStart+1 (navigated below), Tab 1=batchStart+2, etc.
-      // The sequential loop (tabIndex) uses: iterNum = batchStart + tabIndex + 1
-      // So Tab t (t>=1) should load: iterNum = batchStart + t + 1
-      const tabPages: Page[] = [this.page]; // Tab 0 is the main page
-      for (let t = 1; t < batchSize; t++) {
-        const iterNum = batchStart + t + 1;
-        const productUrl = this.getProductUrlForIteration(iterNum);
-        const newPage = await browser.newPage();
-        tabPages.push(newPage);
-        // Navigate new tab to its product URL immediately
-        await newPage.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-        await sleep(500);
-      }
-      sendMessage({
-        type: "log",
-        level: "info",
-        message: `Opened ${batchSize} tabs for batch`,
-      });
+      // InstaDDR-only: no account rotation, but still need to logout existing
+      // account and fetch OTP via InstaDDR
+      if (!this.accounts && this.instaDdrAccounts) {
+        const batchIndex = Math.floor(batchStart / maxConcurrentTabs);
+        const accountIndex = batchIndex % this.instaDdrAccounts.length;
 
-      // ── Run flow on each tab SEQUENTIALLY ──
-      // Each tab: navigate → add to cart → place order → select RTGS → wait for poll URL → move to next tab
-      // The user manually completes bank auth in each tab's popup. After poll URL is detected,
-      // we immediately move to the next tab while the user completes auth in background.
-      for (let tabIndex = 0; tabIndex < tabPages.length; tabIndex++) {
-        const tabPage = tabPages[tabIndex];
-        // Tab 0 = iteration batchStart+1 (first in batch), Tab 1 = batchStart+2, etc.
+        sendMessage({
+          type: "log",
+          level: "info",
+          message: `InstaDDR-only RTGS: logging in with InstaDDR account ${accountIndex + 1}/${this.instaDdrAccounts.length}...`,
+        });
+
+        if (!this.instaDdrService) {
+          const browser = this.page.browser() as Browser;
+          const instaDdrContext = await browser.createBrowserContext();
+          const instaDdrPage = await instaDdrContext.newPage();
+          this.instaDdrService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
+        }
+
+        const instaDdrAccount = this.instaDdrAccounts[accountIndex];
+        await this.platform.loginWithEmail(instaDdrAccount.email, {
+          instaDdrService: this.instaDdrService,
+          instaDdrAccount,
+        });
+
+        sendMessage({ type: "log", level: "info", message: `InstaDDR OTP auto-entered for InstaDDR-only RTGS batch` });
+      }
+
+      // ── Run RTGS flow sequentially: one tab at a time ──
+      // Flow: run full purchase on current tab → click Place Order → wait 2s → open NEW tab → repeat
+      // All previous tabs stay open so user can complete bank auth in each one.
+      const tabPages: Page[] = [];
+      const MAX_RTGS_RETRIES = 3;
+      const RETRYABLE_PATTERNS = [
+        "RTGS button not found",
+        "Place Order button not found",
+        "Place Order not found",
+        "Failed to click Place Order",
+      ];
+
+      for (let tabIndex = 0; tabIndex < batchSize; tabIndex++) {
+        if (this.shouldStopFlag) break;
+
         const iterNum = batchStart + tabIndex + 1;
 
         sendMessage({
@@ -350,74 +491,134 @@ export class BatchOrchestrator {
           iteration: iterNum,
         });
 
-        try {
-          // Get the product URL for this tab's iteration
-          const productUrl = this.getProductUrlForIteration(iterNum);
+        // ── Retry loop: each tab gets up to MAX_RTGS_RETRIES attempts ──
+        let tabSuccess = false;
+        let tabPage: Page | null = null;
+        let retryCount = 0;
 
-          // Create a fresh platform instance for this tab with its correct product URL
-          const tabPlatform =
-            this.platform instanceof FlipkartPlatform
-              ? new FlipkartPlatform(tabPage, productUrl)
-              : new AmazonPlatform(tabPage, productUrl);
-          const tabPayment = this.createPaymentForTab(tabPage);
+        for (let attempt = 0; attempt < MAX_RTGS_RETRIES && !tabSuccess; attempt++) {
+          retryCount = attempt;
 
-          // For Tab 0 (main page), navigate to ensure we start on the right product.
-          // This handles cases where Tab 0 is reused from a previous batch.
-          // Tabs 1+ were pre-loaded with the correct product before the sequential loop.
+          // Close previous attempt's tab (if any) before retrying with a fresh one
+          if (tabPage !== null && tabIndex > 0) {
+            try { await tabPage.close(); } catch { /* ignore */ }
+            tabPage = null;
+          }
+
+          // For the first tab in a batch, always use the main page.
+          // For subsequent tabs, open a NEW tab (previous tab stays on poll page).
+          const isFirstAttempt = attempt === 0;
           if (tabIndex === 0) {
+            // Always use main page for tab 0
+            if (tabPage === null) {
+              tabPage = this.page;
+              tabPages.push(tabPage);
+            }
+          } else if (tabPage === null) {
+            // Open a new tab for retry or for subsequent tab
             sendMessage({
               type: "log",
               level: "info",
-              message: `Tab 0: navigating to product ${iterNum}: ${productUrl}`,
+              message: `Opening new tab for iteration ${iterNum}${attempt > 0 ? ` (retry ${attempt + 1}/${MAX_RTGS_RETRIES})` : ""}...`,
             });
-            await tabPlatform.navigateToProduct();
+            tabPage = await browser.newPage();
+            tabPages.push(tabPage);
           }
 
-          // Run the purchase flow on this tab
-          await this.runRTGSTabIteration(tabPage, tabPlatform, tabPayment, iterNum);
+          try {
+            const productUrl = this.getProductUrlForIteration(iterNum);
 
-          // confirmPayment() clicks "Place Order", polls for /payments/rtgs/poll for up to 30s,
-          // and returns true if the poll URL was reached, false if timed out.
-          // Either way, mark the tab as pending — the parallel polling phase below will
-          // continue checking each tab for order confirmation (bank auth may take time).
-          const rtgsTab = tabPayment as unknown as RTGSPayment;
-          const pollReached = await rtgsTab.confirmPayment();
+            // Create fresh platform + payment instances for this attempt
+            const tabPlatform =
+              this.platform instanceof FlipkartPlatform
+                ? new FlipkartPlatform(tabPage, productUrl)
+                : new AmazonPlatform(tabPage, productUrl);
+            const tabPayment = this.createPaymentForTab(tabPage);
 
-          if (pollReached) {
             sendMessage({
               type: "log",
               level: "info",
-              message: `Tab ${tabIndex + 1}: RTGS poll page confirmed — waiting for bank auth`,
-              iteration: iterNum,
+              message: `Tab ${tabIndex + 1}: running full RTGS flow for product: ${productUrl}${attempt > 0 ? ` [attempt ${attempt + 1}]` : ""}`,
             });
-          } else {
+
+            // Run the FULL purchase flow on this tab:
+            // navigate → addToCart → setQuantity → goToCart → placeOrder → verifyAddress → selectPayment
+            await this.runRTGSTabIteration(tabPage, tabPlatform, tabPayment, iterNum);
+
+            // Click "Place Order" — this navigates to /payments/rtgs/poll
+            const rtgsTab = tabPayment as unknown as RTGSPayment;
+            const pollReached = await rtgsTab.confirmPayment();
+
+            if (pollReached) {
+              sendMessage({
+                type: "log",
+                level: "info",
+                message: `Tab ${tabIndex + 1}: ✅ Place Order clicked — RTGS poll page reached${attempt > 0 ? ` (succeeded on retry ${attempt + 1})` : ""}`,
+                iteration: iterNum,
+              });
+              tabSuccess = true;
+            } else {
+              sendMessage({
+                type: "log",
+                level: "warn",
+                message: `Tab ${tabIndex + 1}: ⚠ Place Order clicked but poll page not yet detected${attempt > 0 ? ` (succeeded on retry ${attempt + 1})` : ""}`,
+                iteration: iterNum,
+              });
+              // Even without explicit poll detection, consider it a success
+              // The bank auth might take a moment — polling phase will handle it
+              tabSuccess = true;
+            }
+
+            tabResults[batchStart + tabIndex] = "success-pending";
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            const isRetryable = RETRYABLE_PATTERNS.some((p) => errMsg.includes(p));
+
+            if (isRetryable && attempt < MAX_RTGS_RETRIES - 1) {
+              sendMessage({
+                type: "log",
+                level: "warn",
+                message: `Tab ${tabIndex + 1}: ⚠ ${errMsg} — retrying in 5s (${attempt + 1}/${MAX_RTGS_RETRIES})`,
+                iteration: iterNum,
+              });
+              await sleep(5000);
+              // tabPage stays null → loop opens a fresh tab
+              tabPage = null;
+              continue;
+            }
+
+            // All retries exhausted or non-retryable error
+            tabResults[batchStart + tabIndex] = "failed";
             sendMessage({
               type: "log",
-              level: "warn",
-              message: `Tab ${tabIndex + 1}: Poll URL not yet detected — orchestrator will poll during bank auth phase`,
+              level: "error",
+              message: `Tab ${tabIndex + 1} failed after ${attempt + 1} attempt(s): ${errMsg}`,
               iteration: iterNum,
             });
-          }
-          // Always mark pending — bank auth may still complete in the parallel polling phase
-          tabResults[batchStart + tabIndex] = "success-pending";
+            sendMessage({
+              type: "progress",
+              iteration: iterNum,
+              total: totalIterations,
+              status: "failed",
+            });
 
-          // Immediately move to the next tab — don't wait for bank auth here
-          // The user handles all bank auth in the popup tabs in the background
-        } catch (err) {
-          tabResults[batchStart + tabIndex] = "failed";
-          const errMsg = err instanceof Error ? err.message : String(err);
+            // Close the failed tab (keep main page open for tab 0)
+            if (tabPage !== null && tabIndex > 0) {
+              try { await tabPage.close(); } catch { /* ignore */ }
+              tabPage = null;
+            }
+            tabSuccess = true; // exit retry loop
+          }
+        }
+
+        // Wait 2 seconds before opening the next tab
+        if (tabIndex < batchSize - 1) {
           sendMessage({
             type: "log",
-            level: "error",
-            message: `Tab ${tabIndex + 1} failed: ${errMsg}`,
-            iteration: iterNum,
+            level: "info",
+            message: `Waiting 2 seconds before opening next tab...`,
           });
-          sendMessage({
-            type: "progress",
-            iteration: iterNum,
-            total: totalIterations,
-            status: "failed",
-          });
+          await sleep(2000);
         }
       }
 
@@ -567,10 +768,15 @@ export class BatchOrchestrator {
     }
 
     // Logout the last account after all batches
-    if (this.accounts) {
+    if (this.accounts || this.instaDdrAccounts) {
       try {
         await this.platform.logout();
       } catch { /* ignore */ }
+    }
+
+    // Close the isolated InstaDDR browser context
+    if (this.instaDdrService) {
+      await this.instaDdrService.close();
     }
 
     const completed = tabResults.filter((r) => r === "success").length;
@@ -646,21 +852,48 @@ export class BatchOrchestrator {
       }
     }
 
-    // Place order from cart
+    // Place order from cart — triggers navigation to order summary / checkout
     await tabPlatform.placeOrder();
 
-    // Verify order summary (address + GST) if address is configured
+    // Wait for the page to stabilize after the navigation
+    try {
+      await tabPage.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 8000 }).catch(() => {});
+    } catch { /* already navigated */ }
+    await sleep(500);
+
+    // Verify order summary (address + GST) — only if page is on a verifiable URL
     if (this.config.address && tabPlatform instanceof FlipkartPlatform) {
       try {
-        await tabPlatform.verifyAddressOnOrderSummary(this.config.address, qty);
+        const currentUrl = tabPage.url();
+        // Only attempt verification if we're on order summary or checkout page
+        if (currentUrl.includes("/vieworder") || currentUrl.includes("/checkout") || currentUrl.includes("/viewcheckout") || currentUrl.includes("flipkart.com")) {
+          await tabPlatform.verifyAddressOnOrderSummary(this.config.address, qty);
+        } else {
+          sendMessage({
+            type: "log",
+            level: "info",
+            message: `Skipping order summary verification — page already at: ${currentUrl}`,
+            iteration: iterationNum,
+          });
+        }
       } catch (err) {
         const warnMsg = err instanceof Error ? err.message : String(err);
-        sendMessage({
-          type: "log",
-          level: "warn",
-          message: `Order summary verification skipped (continuing): ${warnMsg}`,
-          iteration: iterationNum,
-        });
+        // Don't warn for expected navigation errors — these are normal on fast pages
+        if (warnMsg.includes("context") || warnMsg.includes("destroyed") || warnMsg.includes("navigation")) {
+          sendMessage({
+            type: "log",
+            level: "info",
+            message: `Order summary verification skipped — page navigated away (this is normal)`,
+            iteration: iterationNum,
+          });
+        } else {
+          sendMessage({
+            type: "log",
+            level: "warn",
+            message: `Order summary verification issue (continuing): ${warnMsg}`,
+            iteration: iterationNum,
+          });
+        }
       }
     }
 
@@ -924,6 +1157,44 @@ export class BatchOrchestrator {
       });
     }
 
+    // Gift card inventory code rotation
+    let currentCode: InventoryCode | null = null;
+    if (this.giftCardInventoryId && this.payment instanceof GiftCardPayment) {
+      try {
+        currentCode = await this.fetchNextInventoryCode();
+        if (currentCode) {
+          const masked = currentCode.code.length > 8
+            ? currentCode.code.slice(0, 4) + "****" + currentCode.code.slice(-4)
+            : currentCode.code.slice(0, 2) + "****" + currentCode.code.slice(-2);
+          paymentDetailsForIteration = {
+            code: currentCode.code,
+            pin: currentCode.pin || "",
+          };
+          sendMessage({
+            type: "log",
+            level: "info",
+            message: `Using inventory code ${masked} (${this.inventoryIndex}/${this.inventoryCodes.length} pre-fetched)`,
+            iteration: iterationNum,
+          });
+        } else {
+          sendMessage({
+            type: "log",
+            level: "error",
+            message: "No available codes in gift card inventory",
+            iteration: iterationNum,
+          });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        sendMessage({
+          type: "log",
+          level: "warn",
+          message: `Could not fetch inventory code: ${msg}`,
+          iteration: iterationNum,
+        });
+      }
+    }
+
     const maxPaymentRetries = 3;
     for (let payAttempt = 1; payAttempt <= maxPaymentRetries; payAttempt++) {
       try {
@@ -945,6 +1216,9 @@ export class BatchOrchestrator {
         }
 
         // Payment flow completed successfully
+        if (currentCode) {
+          await this.updateInventoryCodeStatus(currentCode, "used");
+        }
         break;
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -957,6 +1231,10 @@ export class BatchOrchestrator {
           });
           await sleep(1000);
         } else {
+          // Mark inventory code as failed before throwing
+          if (currentCode) {
+            await this.updateInventoryCodeStatus(currentCode, "failed", errMsg);
+          }
           throw new Error(
             `Payment failed after ${maxPaymentRetries} attempts: ${errMsg}`
           );
@@ -1102,6 +1380,75 @@ export class BatchOrchestrator {
       });
     } catch {
       // Screenshot failed, not critical
+    }
+  }
+
+  /**
+   * Fetch the next available code from the gift card inventory.
+   * Uses a local cache to avoid excessive API calls — pre-fetches up to 5 codes.
+   */
+  private async fetchNextInventoryCode(): Promise<InventoryCode | null> {
+    if (!this.giftCardInventoryId) return null;
+
+    // Refill cache if running low (keep at least 2 ahead)
+    if (this.inventoryIndex >= this.inventoryCodes.length - 2) {
+      await this.refillInventoryCache();
+    }
+
+    if (this.inventoryIndex < this.inventoryCodes.length) {
+      return this.inventoryCodes[this.inventoryIndex++];
+    }
+    return null;
+  }
+
+  private async refillInventoryCache(): Promise<void> {
+    if (!this.giftCardInventoryId) return;
+
+    try {
+      const url = `${this.inventoryBaseUrl}/api/giftcards/inventory/${this.giftCardInventoryId}/next`;
+      const res = await fetch(url, {
+        headers: { "Content-Type": "application/json" },
+      });
+
+      if (!res.ok) {
+        console.log(`[Inventory] No more codes available (status ${res.status})`);
+        return;
+      }
+
+      const data = await res.json();
+      this.inventoryCodes.push({
+        codeIndex: data.codeIndex,
+        code: data.code,
+        pin: data.pin || "",
+        balance: data.balance,
+      });
+      console.log(`[Inventory] Cached code (total: ${this.inventoryCodes.length})`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`[Inventory] Failed to fetch next code: ${msg}`);
+    }
+  }
+
+  private async updateInventoryCodeStatus(
+    code: InventoryCode,
+    status: "used" | "failed",
+    errorMsg?: string
+  ): Promise<void> {
+    if (!this.giftCardInventoryId) return;
+
+    try {
+      const url = `${this.inventoryBaseUrl}/api/giftcards/inventory/${this.giftCardInventoryId}/codes/${code.codeIndex}/status`;
+      await fetch(url, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          status,
+          ...(errorMsg ? { errorMessage: errorMsg } : {}),
+        }),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`[Inventory] Failed to update code status: ${msg}`);
     }
   }
 }

@@ -6,6 +6,8 @@ import ChromeProfile from "@/lib/db/models/ChromeProfile";
 import SavedCard from "@/lib/db/models/SavedCard";
 import FlipkartAccount from "@/lib/db/models/FlipkartAccount";
 import SavedAddress from "@/lib/db/models/SavedAddress";
+import GiftCardInventory from "@/lib/db/models/GiftCardInventory";
+import InstaDdrAccount from "@/lib/db/models/InstaDdrAccount";
 import { encrypt } from "@/lib/encryption";
 import { checkRateLimit, rateLimitResponse } from "@/lib/rateLimit";
 import { z } from "zod";
@@ -30,6 +32,8 @@ const createJobSchema = z.object({
   addressIds: z.array(z.string()).optional(),
   checkoutPincode: z.string().optional(),
   maxConcurrentTabs: z.number().int().positive().optional(),
+  giftCardInventoryId: z.string().optional(),
+  instaDdrAccountIds: z.array(z.string()).optional(),
 });
 
 // GET /api/jobs — list user's jobs
@@ -73,12 +77,7 @@ export async function POST(req: NextRequest) {
     console.log("[CreateJob] Parsed checkoutPincode:", data.checkoutPincode);
 
     // Block unsupported payment methods
-    if (data.paymentMethod === "giftcard" && data.platform === "amazon") {
-      return NextResponse.json(
-        { error: "Amazon gift card payment is not yet supported" },
-        { status: 400 }
-      );
-    }
+    // (Amazon gift card is now supported via inventory system)
 
     // Validate product URLs match the selected platform
     for (const p of data.products) {
@@ -211,6 +210,59 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // Validate gift card inventory if provided
+    let giftCardInventoryId: string | undefined;
+    if (data.giftCardInventoryId) {
+      const inventory = await GiftCardInventory.findOne({
+        _id: data.giftCardInventoryId,
+        userId,
+      }).lean();
+      if (!inventory) {
+        return NextResponse.json(
+          { error: "Gift card inventory not found" },
+          { status: 400 }
+        );
+      }
+      const available = inventory.codes.filter((c: any) => c.status === "available").length;
+      if (available === 0) {
+        return NextResponse.json(
+          { error: "Gift card inventory has no available codes" },
+          { status: 400 }
+        );
+      }
+      giftCardInventoryId = data.giftCardInventoryId;
+    }
+
+    // Validate InstaDDR account groups if provided
+    let instaDdrAccountIds: string[] = [];
+    if (data.instaDdrAccountIds && data.instaDdrAccountIds.length > 0) {
+      if (data.platform !== "flipkart") {
+        return NextResponse.json(
+          { error: "InstaDDR OTP automation is only supported for Flipkart" },
+          { status: 400 }
+        );
+      }
+      const userGroups = await InstaDdrAccount.find({
+        _id: { $in: data.instaDdrAccountIds },
+        userId,
+      }).select("_id");
+      if (userGroups.length !== data.instaDdrAccountIds.length) {
+        return NextResponse.json(
+          { error: "One or more InstaDDR account groups not found" },
+          { status: 400 }
+        );
+      }
+      instaDdrAccountIds = data.instaDdrAccountIds;
+    }
+
+    // Require either a single gift card code OR an inventory for giftcard payment
+    if (data.paymentMethod === "giftcard" && !data.giftCardInventoryId && !data.paymentDetails) {
+      return NextResponse.json(
+        { error: "Gift card code or inventory is required" },
+        { status: 400 }
+      );
+    }
+
     const totalIterations = Math.ceil(totalQuantity / data.perOrderQuantity);
 
     console.log("[CreateJob] Storing with addressIds:", addressIdsToStore, "checkoutPincode:", data.checkoutPincode);
@@ -233,6 +285,8 @@ export async function POST(req: NextRequest) {
       addressIds: addressIdsToStore,
       checkoutPincode: data.checkoutPincode || "",
       maxConcurrentTabs: data.maxConcurrentTabs || 1,
+      giftCardInventoryId,
+      instaDdrAccountIds: instaDdrAccountIds.length > 0 ? instaDdrAccountIds : undefined,
       status: "pending",
       progress: {
         totalIterations,

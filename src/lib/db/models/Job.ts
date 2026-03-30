@@ -19,6 +19,8 @@ export interface IJob extends Document {
   cardIds: mongoose.Types.ObjectId[]; // saved cards for rotation
   accountIds: mongoose.Types.ObjectId[]; // Flipkart accounts for rotation
   addressIds: mongoose.Types.ObjectId[]; // saved addresses for GST address verification
+  giftCardInventoryId?: mongoose.Types.ObjectId;
+  instaDdrAccountIds?: mongoose.Types.ObjectId[]; // InstaDDR account groups for OTP automation
   checkoutPincode: string;
   maxConcurrentTabs: number; // max simultaneous tabs for RTGS multi-tab mode
   status: "pending" | "running" | "paused" | "completed" | "failed" | "cancelled";
@@ -102,6 +104,15 @@ const JobSchema = new Schema<IJob>(
     addressIds: {
       type: [{ type: Schema.Types.ObjectId, ref: "SavedAddress" }],
       default: [],
+    },
+    instaDdrAccountIds: {
+      type: [{ type: Schema.Types.ObjectId, ref: "InstaDdrAccount" }],
+      default: undefined,
+    },
+    giftCardInventoryId: {
+      type: Schema.Types.ObjectId,
+      ref: "GiftCardInventory",
+      required: false,
     },
     checkoutPincode: {
       type: String,
