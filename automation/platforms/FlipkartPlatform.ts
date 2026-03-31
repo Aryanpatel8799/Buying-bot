@@ -1119,12 +1119,15 @@ export class FlipkartPlatform extends BasePlatform {
       await instaDdrService.login(instaDdrAccount.instaDdrId, instaDdrAccount.instaDdrPassword);
 
       // 6b: Wait for OTP email to arrive (Flipkart takes a few seconds to send)
-      console.log("[InstaDDR] Waiting for OTP email to arrive...");
-      await sleep(5000);
+      console.log("[InstaDDR] Waiting 10s for OTP email to arrive...");
+      await sleep(10000);
 
-      // 6c: Fetch OTP from InstaDDR inbox with retries
+      // 6c: Fetch OTP from InstaDDR inbox with retries — 2 minutes total
+      // 24 attempts × 5s between retries = 120s (2 minutes)
+      const MAX_OTP_ATTEMPTS = 24;
+      const OTP_RETRY_DELAY = 5000;
       let otp: string | null = null;
-      for (let attempt = 1; attempt <= 5; attempt++) {
+      for (let attempt = 1; attempt <= MAX_OTP_ATTEMPTS; attempt++) {
         try {
           otp = await instaDdrService.fetchOtp({
             instaDdrId: instaDdrAccount.instaDdrId,
@@ -1133,13 +1136,16 @@ export class FlipkartPlatform extends BasePlatform {
           });
           if (otp) break;
         } catch (err) {
-          console.log(`[InstaDDR] OTP fetch attempt ${attempt}/5 failed: ${err instanceof Error ? err.message : err}`);
-          if (attempt < 5) await sleep(3000);
+          console.log(`[InstaDDR] OTP fetch attempt ${attempt}/${MAX_OTP_ATTEMPTS} failed: ${err instanceof Error ? err.message : err}`);
+          if (attempt < MAX_OTP_ATTEMPTS) {
+            console.log(`[InstaDDR] Retrying in ${OTP_RETRY_DELAY / 1000}s...`);
+            await sleep(OTP_RETRY_DELAY);
+          }
         }
       }
 
       if (!otp) {
-        throw new Error("Failed to fetch OTP from InstaDDR after 5 attempts");
+        throw new Error(`Failed to fetch OTP from InstaDDR after ${MAX_OTP_ATTEMPTS} attempts (~2 minutes)`);
       }
 
       console.log(`[InstaDDR] OTP fetched: ${otp} — entering into Flipkart...`);

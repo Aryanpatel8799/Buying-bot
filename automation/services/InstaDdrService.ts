@@ -235,7 +235,7 @@ export class InstaDdrService {
   private async getOtpFromInbox(email: string): Promise<string> {
     console.log(`[InstaDDR] Fetching OTP for: ${email.substring(0, 3)}***`);
 
-    // Navigate to inbox
+    // Navigate to inbox at m.kuku.lu/recv.php
     await this.page.goto(INBOX_URL, {
       waitUntil: "domcontentloaded",
       timeout: 15000,
@@ -244,35 +244,62 @@ export class InstaDdrService {
 
     // Reload to catch latest emails
     await this.page.reload({ waitUntil: "domcontentloaded" });
-    await sleep(1000);
+    await sleep(2000);
 
-    // Parse email subject lines for Flipkart OTP
-    const otp = await this.page.evaluate(() => {
-      const anchors = document.querySelectorAll("a[href*='recv.php'], a[href*='read.php']");
-      for (const anchor of anchors) {
-        const text = anchor.textContent?.trim() || "";
-        if (text.toLowerCase().includes("flipkart") && text.includes("verification")) {
-          const match = text.match(/\d{6}/);
-          if (match) return match[0];
+    // Extract OTP from the FIRST (newest) Flipkart email in the inbox.
+    // Mail links have id="link_maildata_<id>" and the subject is inside
+    // a <b><span> with text like "Flipkart Account - 161794 is your verification code..."
+    const result = await this.page.evaluate(() => {
+      // Strategy 1: Target mail links by id pattern (most reliable)
+      // These are ordered top-to-bottom = newest first
+      const mailLinks = document.querySelectorAll('a[id^="link_maildata_"]');
+      for (const link of mailLinks) {
+        const text = link.textContent?.trim() || "";
+        const lower = text.toLowerCase();
+        if (lower.includes("flipkart") && lower.includes("verification")) {
+          const match = text.match(/\b(\d{6})\b/);
+          if (match) return { otp: match[1], method: "link_maildata", text: text.substring(0, 100) };
         }
       }
-      // Fallback: search all elements
-      const allEls = document.querySelectorAll("a, div, span, td");
-      for (const el of allEls) {
+
+      // Strategy 2: Target mail title divs by id pattern
+      const titleDivs = document.querySelectorAll('div[id^="area_mail_title_"]');
+      for (const div of titleDivs) {
+        const text = div.textContent?.trim() || "";
+        const lower = text.toLowerCase();
+        if (lower.includes("flipkart") && lower.includes("verification")) {
+          const match = text.match(/\b(\d{6})\b/);
+          if (match) return { otp: match[1], method: "area_mail_title", text: text.substring(0, 100) };
+        }
+      }
+
+      // Strategy 3: Search all bold/span elements inside mail area
+      const boldSpans = document.querySelectorAll('b span, b');
+      for (const el of boldSpans) {
         const text = el.textContent?.trim() || "";
-        if (text.toLowerCase().includes("flipkart") && /\d{6}/.test(text)) {
-          const match = text.match(/\d{6}/);
-          if (match) return match[0];
+        const lower = text.toLowerCase();
+        if (lower.includes("flipkart") && lower.includes("verification")) {
+          const match = text.match(/\b(\d{6})\b/);
+          if (match) return { otp: match[1], method: "bold_span", text: text.substring(0, 100) };
         }
       }
-      return null;
+
+      // Collect debug info: first 5 mail link subjects
+      const debugSubjects: string[] = [];
+      for (let i = 0; i < Math.min(mailLinks.length, 5); i++) {
+        const titleDiv = mailLinks[i].querySelector('div[id^="area_mail_title_"]');
+        debugSubjects.push(titleDiv?.textContent?.trim().substring(0, 80) || mailLinks[i].textContent?.trim().substring(0, 80) || "(no title)");
+      }
+
+      return { otp: null, method: "none", text: `Found ${mailLinks.length} mails. Top 5: ${debugSubjects.join(" | ")}` };
     });
 
-    if (otp) {
-      console.log(`[InstaDDR] OTP found: ${otp}`);
-      return otp;
+    if (result.otp) {
+      console.log(`[InstaDDR] OTP found: ${result.otp} (via ${result.method}) from: ${result.text}`);
+      return result.otp;
     }
 
+    console.log(`[InstaDDR] No OTP found. Debug: ${result.text}`);
     throw new Error(`No Flipkart OTP found in InstaDDR inbox for ${email}`);
   }
 }
