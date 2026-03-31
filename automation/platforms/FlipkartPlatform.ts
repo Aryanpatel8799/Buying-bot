@@ -1003,6 +1003,7 @@ export class FlipkartPlatform extends BasePlatform {
     console.log("Typing into login email input ...");
 
     const typed = await this.page.evaluate((emailToType: string) => {
+      if (typeof (globalThis as any).__name === "undefined") (globalThis as any).__name = (fn: any) => fn;
       // Helper: type value into input using React-compatible keyboard events
       function typeIntoInput(input: HTMLInputElement, value: string): void {
         input.focus();
@@ -1989,19 +1990,24 @@ export class FlipkartPlatform extends BasePlatform {
     const companyName = address.companyName.trim();
     console.log(`Target GST: ${gstNumber} / ${companyName}`);
 
-    // Wait for GST section to be visible
-    for (let i = 0; i < 5; i++) {
+    // Wait for GST section to be visible (up to 10s for slower pages / multi-tab flows)
+    let gstSectionVisible = false;
+    for (let i = 0; i < 20; i++) {
       const visible = await this.page.evaluate(() => {
         const body = document.body.innerText || "";
         return body.includes("Use GST Invoice") || body.includes("GST Invoice") || body.includes("GST invoice");
       });
-      if (visible) break;
-      await sleep(300);
+      if (visible) { gstSectionVisible = true; break; }
+      await sleep(500);
+    }
+    if (!gstSectionVisible) {
+      console.log("WARNING: GST section not found on page after 10s wait");
     }
 
-    // Helper: check if the GST checkbox (r-d045u9) has a checked image inside
+    // Helper: check if the GST checkbox is ticked (multiple detection strategies)
     const isGstChecked = async (): Promise<boolean> => {
       return this.page.evaluate(() => {
+        // Strategy 1: r-d045u9 class with checked image
         const checkboxDivs = Array.from(document.querySelectorAll("div")).filter(d =>
           d.className.includes("r-d045u9")
         );
@@ -2013,13 +2019,33 @@ export class FlipkartPlatform extends BasePlatform {
             if (srcset.includes("checked") || src.includes("checked")) return true;
           }
         }
+        // Strategy 2: Look for checked image near "Use GST Invoice" text
+        const allDivs = Array.from(document.querySelectorAll("div"));
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (txt.includes("Use GST Invoice") || txt.includes("GST Invoice")) {
+            const imgs = d.querySelectorAll("img");
+            for (const img of imgs) {
+              const srcset = img.getAttribute("srcset") || "";
+              const src = img.getAttribute("src") || "";
+              if (srcset.includes("checked") || src.includes("checked")) return true;
+            }
+          }
+        }
+        // Strategy 3: ARIA checkbox
+        const ariaCheckboxes = document.querySelectorAll('[role="checkbox"][aria-checked="true"]');
+        for (const cb of ariaCheckboxes) {
+          const parent = cb.closest("div");
+          if (parent && (parent.innerText || "").includes("GST")) return true;
+        }
         return false;
       });
     };
 
-    // Helper: click the GST checkbox (the r-d045u9 div inside a cursor:pointer container)
+    // Helper: click the GST checkbox (multiple strategies)
     const clickGstCheckbox = async (): Promise<boolean> => {
       return this.page.evaluate(() => {
+        // Strategy 1: r-d045u9 class div inside cursor:pointer container
         const allDivs = Array.from(document.querySelectorAll("div"));
         for (const d of allDivs) {
           const className = d.className || "";
@@ -2036,6 +2062,39 @@ export class FlipkartPlatform extends BasePlatform {
             }
             d.scrollIntoView({ block: "center" });
             d.click();
+            return true;
+          }
+        }
+        // Strategy 2: Find "Use GST Invoice" text and click the clickable area near it
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (txt === "Use GST Invoice" || txt === "Use GST invoice") {
+            let el: HTMLElement | null = d;
+            while (el && el !== document.body) {
+              const style = el.getAttribute("style") || "";
+              if (style.includes("cursor: pointer")) {
+                el.scrollIntoView({ block: "center" });
+                el.click();
+                return true;
+              }
+              el = el.parentElement;
+            }
+            // Click the parent that likely contains the checkbox
+            const parent = d.parentElement;
+            if (parent) {
+              parent.scrollIntoView({ block: "center" });
+              parent.click();
+              return true;
+            }
+          }
+        }
+        // Strategy 3: ARIA checkbox role
+        const ariaCheckboxes = document.querySelectorAll('[role="checkbox"]');
+        for (const cb of ariaCheckboxes) {
+          const parent = cb.closest("div");
+          if (parent && (parent.innerText || "").includes("GST")) {
+            (cb as HTMLElement).scrollIntoView({ block: "center" });
+            (cb as HTMLElement).click();
             return true;
           }
         }
@@ -2150,16 +2209,16 @@ export class FlipkartPlatform extends BasePlatform {
 
     // === Main logic ===
 
-    // Check if our GST number is already on the page
-    const gstNumOnPage = await this.page.evaluate(() => {
-      const match = document.body.innerText.match(/\d{2}[A-Z]{3}[A-Z0-9]{10}/);
-      return match ? match[0] : null;
-    });
+    // Check if the TARGET GST number is already on the page (not just any GSTIN)
+    const targetGstOnPage = await this.page.evaluate((targetGst: string) => {
+      const body = document.body.innerText || "";
+      return body.includes(targetGst);
+    }, gstNumber);
 
-    if (gstNumOnPage) {
-      console.log(`GST number already on page: ${gstNumOnPage}`);
+    if (targetGstOnPage) {
+      console.log(`Target GST number found on page: ${gstNumber}`);
       if (await isGstChecked()) {
-        console.log("GST checkbox already ticked");
+        console.log("GST checkbox already ticked with correct GST");
         return;
       }
       const clicked = await clickGstCheckbox();
@@ -2176,8 +2235,8 @@ export class FlipkartPlatform extends BasePlatform {
         document.body.innerText.includes("Select GST Details")
       );
       if (formOpened) {
-        console.log("GST selection form opened — selecting existing entry...");
-        const selected = await this.page.evaluate((gst) => {
+        console.log("GST selection form opened — selecting target GST entry...");
+        const selected = await this.page.evaluate((gst: string) => {
           const allDivs = Array.from(document.querySelectorAll("div"));
           for (const d of allDivs) {
             if ((d.innerText || "").includes(gst)) {
@@ -2196,14 +2255,14 @@ export class FlipkartPlatform extends BasePlatform {
             }
           }
           return false;
-        }, gstNumOnPage);
+        }, gstNumber);
         if (selected) {
           await sleep(500);
           await clickConfirmButton();
           await sleep(1000);
         }
         if (await isGstChecked()) {
-          console.log("GST checkbox ticked after selecting existing entry");
+          console.log("GST checkbox ticked after selecting target entry");
           return;
         }
       }
@@ -3429,28 +3488,28 @@ export class FlipkartPlatform extends BasePlatform {
 
   /** Click the Save button on the address form */
   private async clickSaveButton(page: import("puppeteer-core").Page): Promise<void> {
-    // Wait for the button to appear — handle detached frame errors from async navigation
+    // Wait for a Save button to appear — search by text content, not class name
     let buttonFound = false;
-    for (let attempt = 0; attempt < 5 && !buttonFound; attempt++) {
+    for (let attempt = 0; attempt < 10 && !buttonFound; attempt++) {
       try {
-        await page.waitForFunction(
-          () => {
-            const btns = document.querySelectorAll("button.dSM5Ub");
-            return btns.length > 0;
-          },
-          { timeout: 10000 }
-        );
-        buttonFound = true;
+        buttonFound = await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll("button"));
+          for (const btn of buttons) {
+            const txt = (btn.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+            if (txt === "save" || txt === "save address" || txt === "save and deliver here") {
+              return true;
+            }
+          }
+          return false;
+        });
+        if (buttonFound) break;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("detached") || msg.includes("Frame")) {
-          console.log(`[clickSaveButton] Frame detached during wait (attempt ${attempt + 1}/5), retrying...`);
-          await sleep(300);
-        } else {
-          console.log(`WARNING: Could not find Save button: ${msg}`);
-          return;
+          console.log(`[clickSaveButton] Frame detached during wait (attempt ${attempt + 1}/10), retrying...`);
         }
       }
+      await sleep(500);
     }
 
     if (!buttonFound) {
@@ -3459,54 +3518,37 @@ export class FlipkartPlatform extends BasePlatform {
     }
     console.log("Save button found");
 
-    // Use Puppeteer's native click() instead of page.evaluate(btn.click())
-    // native click() waits for element to be actionable and fires proper events
-    try {
-      await page.click("button.dSM5Ub", { delay: 50 });
-      console.log("Clicked: Save (native click)");
-      return;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("detached") || msg.includes("Frame")) {
-        console.log(`[clickSaveButton] Frame detached — page navigated, save may have succeeded`);
-        return;
-      }
-      console.log(`[clickSaveButton] Native click failed: ${msg}, trying fallback...`);
-    }
-
-    // Fallback: evaluate-based click
+    // Click the Save button by text content with mouse events for React compatibility
     let clicked = false;
     try {
       clicked = await page.evaluate(() => {
-        const btn = document.querySelector("button.dSM5Ub") as HTMLButtonElement | null;
-        if (!btn) return false;
-
-        // Try mouse click at button center (most reliable for React buttons)
-        const rect = btn.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          const x = rect.left + rect.width / 2;
-          const y = rect.top + rect.height / 2;
-          btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y, button: 0 }));
-          btn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y, button: 0 }));
-          btn.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y, button: 0 }));
-          return true;
+        const buttons = Array.from(document.querySelectorAll("button"));
+        for (const btn of buttons) {
+          const txt = (btn.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+          if (txt === "save" || txt === "save address" || txt === "save and deliver here") {
+            btn.scrollIntoView({ block: "center" });
+            const rect = btn.getBoundingClientRect();
+            const x = rect.left + rect.width / 2;
+            const y = rect.top + rect.height / 2;
+            btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y, button: 0 }));
+            btn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y, button: 0 }));
+            btn.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y, button: 0 }));
+            return true;
+          }
         }
-
-        btn.scrollIntoView({ block: "center" });
-        btn.click();
-        return true;
+        return false;
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("detached") || msg.includes("Frame")) {
-        console.log(`[clickSaveButton] Frame detached during fallback — page navigated, save likely succeeded`);
+        console.log(`[clickSaveButton] Frame detached — page navigated, save likely succeeded`);
         return;
       }
-      console.log(`[clickSaveButton] Fallback evaluate error: ${msg}`);
+      console.log(`[clickSaveButton] Click error: ${msg}`);
     }
 
-    if (clicked) console.log("Clicked: Save (fallback mouse event)");
-    else console.log("WARNING: Could not click Save");
+    if (clicked) console.log("Clicked: Save button");
+    else console.log("WARNING: Could not click Save button");
   }
 
   /** Click the "Confirm and Save" button in the GST form — div.css-g5y9jx with grey background */
@@ -3883,20 +3925,40 @@ export class FlipkartPlatform extends BasePlatform {
       }
     }
 
-    // Click Home or Work radio
+    // Click Home or Work radio — radio inputs are readonly, so click the <label> instead
     const radioId = address.addressType === "Home" ? "HOME" : "WORK";
     let typeSet = false;
     for (let attempt = 0; attempt < 5 && !typeSet; attempt++) {
       const result = await page.evaluate((id: string) => {
+        // Strategy 1: Click the <label> for the radio (most reliable since input is readonly)
+        const label = document.querySelector(`label[for="${id}"]`) as HTMLLabelElement | null;
+        if (label) {
+          label.scrollIntoView({ block: "center" });
+          label.click();
+          return "label";
+        }
+        // Strategy 2: Click the radio input directly + set checked property
         const radio = document.getElementById(id) as HTMLInputElement | null;
-        if (radio && radio.name === "locationTypeTag") {
-          radio.click();
-          return "found";
+        if (radio) {
+          radio.checked = true;
+          radio.dispatchEvent(new Event("change", { bubbles: true }));
+          radio.dispatchEvent(new Event("click", { bubbles: true }));
+          return "radio";
+        }
+        // Strategy 3: Find by text content "Home" or "Work"
+        const targetText = id === "HOME" ? "home" : "work";
+        const allLabels = Array.from(document.querySelectorAll("label"));
+        for (const l of allLabels) {
+          if ((l.textContent || "").trim().toLowerCase() === targetText) {
+            l.scrollIntoView({ block: "center" });
+            l.click();
+            return "text";
+          }
         }
         return "not_found";
       }, radioId);
-      if (result === "found") {
-        console.log(`Selected address type: ${address.addressType}`);
+      if (result !== "not_found") {
+        console.log(`Selected address type: ${address.addressType} (via ${result})`);
         typeSet = true;
         await sleep(300);
       } else {

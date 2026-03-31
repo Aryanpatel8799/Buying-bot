@@ -1022,6 +1022,46 @@ export class BatchOrchestrator {
         message: "No GST address configured for this job — skipping order summary address/GST verification.",
         iteration: iterationNum,
       });
+      // Still need to click Continue on order summary to get to payment page
+      if (this.platform instanceof FlipkartPlatform) {
+        for (let i = 0; i < 20; i++) {
+          try {
+            const bodyLen = await this.page.evaluate(() => document.body.innerText.length);
+            if (bodyLen > 100) break;
+          } catch { /* ignore */ }
+          await sleep(500);
+        }
+        await sleep(500);
+        try {
+          const clicked = await this.page.evaluate(() => {
+            const allDivs = Array.from(document.querySelectorAll("div"));
+            for (const d of allDivs) {
+              const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
+              if (txt === "continue" || txt === "continue ") {
+                let el: HTMLElement | null = d;
+                while (el && el !== document.body) {
+                  const style = el.getAttribute("style") || "";
+                  if (style.includes("cursor: pointer") || el.getAttribute("role") === "button") {
+                    el.scrollIntoView({ block: "center" });
+                    el.click();
+                    return true;
+                  }
+                  el = el.parentElement;
+                }
+              }
+            }
+            return false;
+          });
+          if (clicked) {
+            console.log("Continue clicked on multi-URL order summary");
+            for (let i = 0; i < 30; i++) {
+              await sleep(500);
+              const url = this.page.url();
+              if (!url.includes("/viewcheckout")) break;
+            }
+          }
+        } catch { /* ignore navigation errors */ }
+      }
     }
 
     // At this point we're on the payment page. proceedToCheckout() is NOT called —
