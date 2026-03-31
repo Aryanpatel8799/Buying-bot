@@ -1,5 +1,5 @@
 import { Page } from "puppeteer-core";
-import { BasePlatform, AddressDetails } from "./BasePlatform";
+import { BasePlatform, AddressDetails, InstaDdrLoginOptions } from "./BasePlatform";
 import {
   sleep,
   clearAndType,
@@ -968,29 +968,28 @@ export class FlipkartPlatform extends BasePlatform {
     }
   }
 
-  async loginWithEmail(email: string): Promise<void> {
+  async loginWithEmail(email: string, options?: InstaDdrLoginOptions): Promise<void> {
     console.log(`Logging in with email: ${email.substring(0, 3)}***`);
 
-    // Check if already logged in — if so, log out first
+    // Step 1: Check if already logged in — if so, log out first
     if (await this.isLoggedIn()) {
       console.log("Already logged in. Logging out first...");
       await this.logout();
     }
 
-    // Navigate to Flipkart login page
+    // Step 2: Navigate to Flipkart login page
     await navigateWithRetry(this.page, "https://www.flipkart.com/account/login?ret=/", {
       timeoutMs: 15000,
       maxRetries: 3,
     });
     await sleep(DELAYS.long);
 
-    // Wait for email input field
+    // Step 3: Wait for email input field
     await waitWithRetry(
       this.page,
       async () => {
         await this.page.waitForFunction(
           () => {
-            // Look for text input in the login form
             const inputs = document.querySelectorAll('input[type="text"], input[type="email"]');
             return inputs.length > 0;
           },
@@ -1000,94 +999,286 @@ export class FlipkartPlatform extends BasePlatform {
       { label: "Login email input", timeoutMs: 10000, maxRetries: 5 }
     );
 
-    // Find the email input by its label text, focus it, and type using keyboard events
-    // dispatched from within the browser context so React properly registers the input
+    // Step 4: Enter email into login form
     console.log("Typing into login email input ...");
+
     const typed = await this.page.evaluate((emailToType: string) => {
-      // Find the label/span containing "Enter Email/Mobile number"
+      // Helper: type value into input using React-compatible keyboard events
+      function typeIntoInput(input: HTMLInputElement, value: string): void {
+        input.focus();
+        input.value = "";
+        for (const char of value) {
+          input.dispatchEvent(new KeyboardEvent("keydown", { key: char, bubbles: true, cancelable: true }));
+          const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+          nativeSetter?.call(input, input.value + char);
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          input.dispatchEvent(new KeyboardEvent("keyup", { key: char, bubbles: true, cancelable: true }));
+        }
+        input.dispatchEvent(new Event("blur", { bubbles: true }));
+      }
+
+      // Strategy 1: Find by label text containing "email" + "mobile"/"phone"
       const allSpans = document.querySelectorAll('label span, span');
       for (const el of allSpans) {
-        if (el.textContent?.trim() === "Enter Email/Mobile number") {
-          // Walk up to find the input inside the container
+        const text = el.textContent?.trim().toLowerCase() || "";
+        if (text.includes("email") && (text.includes("mobile") || text.includes("phone"))) {
           let input: HTMLInputElement | null = null;
-          const parent = el.closest('div');
-          if (parent) {
-            input = parent.querySelector('input[type="text"]') as HTMLInputElement | null;
+          let curr: HTMLElement | null = el.closest('div');
+          while (curr && curr !== document.body) {
+            input = curr.querySelector('input[type="text"], input[type="email"]') as HTMLInputElement | null;
+            if (input) break;
+            curr = curr.parentElement;
           }
-          // Fallback: walk up the DOM tree looking for the input
-          if (!input) {
-            let curr: HTMLElement | null = el.closest('div');
-            while (curr && curr !== document.body) {
-              input = curr.querySelector('input[type="text"]') as HTMLInputElement | null;
-              if (input) break;
-              curr = curr.parentElement;
-            }
-          }
-
           if (input) {
-            // Focus the input so keyboard events go to the right element
-            input.focus();
-
-            // Clear existing value
-            input.value = "";
-
-            // Type character by character using keyboard events React can respond to
-            for (const char of emailToType) {
-              const keyEvent = new KeyboardEvent("keydown", {
-                key: char,
-                bubbles: true,
-                cancelable: true,
-              });
-              input.dispatchEvent(keyEvent);
-
-              // Update the value
-              const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype,
-                "value"
-              )?.set;
-              nativeInputValueSetter?.call(input, input.value + char);
-
-              input.dispatchEvent(new Event("input", { bubbles: true }));
-              input.dispatchEvent(new Event("change", { bubbles: true }));
-
-              const keyUpEvent = new KeyboardEvent("keyup", {
-                key: char,
-                bubbles: true,
-                cancelable: true,
-              });
-              input.dispatchEvent(keyUpEvent);
-            }
-
-            input.dispatchEvent(new Event("blur", { bubbles: true }));
-            return true;
+            typeIntoInput(input, emailToType);
+            return "label";
           }
         }
       }
-      return false;
+
+      // Strategy 2: Find input near email/mobile/login text
+      const inputs = document.querySelectorAll('input[type="text"], input[type="email"]');
+      for (const inp of inputs) {
+        const input = inp as HTMLInputElement;
+        if (input.offsetParent !== null && !input.disabled && !input.readOnly) {
+          const placeholder = (input.placeholder || "").toLowerCase();
+          const nearbyText = (input.closest("div")?.parentElement?.textContent || "").toLowerCase();
+          if (
+            placeholder.includes("email") || placeholder.includes("mobile") ||
+            nearbyText.includes("email") || nearbyText.includes("mobile") ||
+            nearbyText.includes("login") || nearbyText.includes("sign in")
+          ) {
+            typeIntoInput(input, emailToType);
+            return "placeholder";
+          }
+        }
+      }
+
+      // Strategy 3: Fallback — first visible text input on the page
+      for (const inp of inputs) {
+        const input = inp as HTMLInputElement;
+        if (input.offsetParent !== null && !input.disabled && !input.readOnly) {
+          typeIntoInput(input, emailToType);
+          return "fallback";
+        }
+      }
+
+      return null;
     }, email);
 
     if (!typed) {
       throw new Error("Could not find email input on login page");
     }
+    console.log(`Email entered via ${typed} strategy`);
     await sleep(DELAYS.medium);
 
-    // Click "Request OTP" button directly by class
+    // Step 5: Click "Request OTP" button
     console.log("Clicking Request OTP...");
     const otpRequested = await this.page.evaluate(() => {
-      // Target the button by its class names
-      const btn = document.querySelector('button.dSM5Ub.Kv3ekh.KcXDCU') as HTMLButtonElement | null;
-      if (btn) {
-        btn.click();
-        return true;
+      // Strategy 1: Find by exact class names
+      const btn1 = document.querySelector('button.dSM5Ub.Kv3ekh.KcXDCU') as HTMLButtonElement | null;
+      if (btn1) { btn1.click(); return "class"; }
+
+      // Strategy 2: Find button by text content
+      const buttons = document.querySelectorAll('button');
+      for (const btn of buttons) {
+        const text = btn.textContent?.trim().toLowerCase() || "";
+        if (text.includes("request otp") || text.includes("get otp") || text.includes("send otp")) {
+          btn.click();
+          return "text";
+        }
       }
-      return false;
+
+      // Strategy 3: Find any submit-like button near the login form
+      for (const btn of buttons) {
+        const text = btn.textContent?.trim().toLowerCase() || "";
+        if (text.includes("continue") || text.includes("next") || text.includes("login") || text.includes("submit")) {
+          btn.click();
+          return "submit";
+        }
+      }
+
+      return null;
     });
 
     if (!otpRequested) {
       throw new Error("Could not find Request OTP button");
     }
+    console.log(`OTP request button clicked via ${otpRequested} strategy`);
 
-    console.log("OTP requested — waiting for human to enter OTP...");
+    console.log("OTP requested on Flipkart");
+
+    // Step 6: If InstaDDR is configured, auto-fetch and enter OTP
+    if (options?.instaDdrService && options?.instaDdrAccount) {
+      const { instaDdrService, instaDdrAccount } = options;
+
+      // 6a: Login to InstaDDR in isolated context
+      console.log("[InstaDDR] Logging into InstaDDR to fetch OTP...");
+      await instaDdrService.login(instaDdrAccount.instaDdrId, instaDdrAccount.instaDdrPassword);
+
+      // 6b: Wait for OTP email to arrive (Flipkart takes a few seconds to send)
+      console.log("[InstaDDR] Waiting for OTP email to arrive...");
+      await sleep(5000);
+
+      // 6c: Fetch OTP from InstaDDR inbox with retries
+      let otp: string | null = null;
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          otp = await instaDdrService.fetchOtp({
+            instaDdrId: instaDdrAccount.instaDdrId,
+            instaDdrPassword: instaDdrAccount.instaDdrPassword,
+            email: instaDdrAccount.email,
+          });
+          if (otp) break;
+        } catch (err) {
+          console.log(`[InstaDDR] OTP fetch attempt ${attempt}/5 failed: ${err instanceof Error ? err.message : err}`);
+          if (attempt < 5) await sleep(3000);
+        }
+      }
+
+      if (!otp) {
+        throw new Error("Failed to fetch OTP from InstaDDR after 5 attempts");
+      }
+
+      console.log(`[InstaDDR] OTP fetched: ${otp} — entering into Flipkart...`);
+
+      // 6d: Enter OTP into Flipkart's OTP input field
+      await this.enterOtpOnFlipkart(otp);
+
+      // 6e: Wait for login to complete
+      const loginSuccess = await this.waitForLoginCompletion(60000);
+      if (!loginSuccess) {
+        throw new Error("Login did not complete after entering OTP");
+      }
+
+      console.log("InstaDDR auto-login complete — logged into Flipkart");
+    } else {
+      console.log("OTP requested — waiting for human to enter OTP...");
+    }
+  }
+
+  /**
+   * Enter a 6-digit OTP into Flipkart's OTP input field after requesting OTP.
+   */
+  private async enterOtpOnFlipkart(otp: string): Promise<void> {
+    // Wait for OTP input field(s) to appear
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForFunction(
+          () => {
+            // Flipkart may use individual digit inputs or a single input
+            const otpInputs = document.querySelectorAll('input[type="text"], input[type="tel"], input[type="number"]');
+            return otpInputs.length > 0;
+          },
+          { timeout: 10000 }
+        );
+      },
+      { label: "OTP input field", timeoutMs: 10000, maxRetries: 3 }
+    );
+
+    await sleep(1000);
+
+    // Try to enter OTP — Flipkart uses either individual digit inputs or a single field
+    const entered = await this.page.evaluate((otpValue: string) => {
+      // Strategy 1: Look for multiple single-character OTP input fields
+      const allInputs = document.querySelectorAll('input[type="text"], input[type="tel"], input[type="number"]');
+      const otpInputs: HTMLInputElement[] = [];
+      for (const inp of allInputs) {
+        const input = inp as HTMLInputElement;
+        // OTP inputs are typically short maxlength (1-6) and in the OTP section
+        if (input.maxLength === 1 || input.getAttribute("data-otp") !== null) {
+          otpInputs.push(input);
+        }
+      }
+
+      // If we found individual digit inputs (one per digit)
+      if (otpInputs.length >= 6) {
+        for (let i = 0; i < 6; i++) {
+          const input = otpInputs[i];
+          input.focus();
+          const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+          nativeSetter?.call(input, otpValue[i]);
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        return "individual";
+      }
+
+      // Strategy 2: Look for a single OTP input field (maxLength 6 or nearby "otp"/"verify" text)
+      for (const inp of allInputs) {
+        const input = inp as HTMLInputElement;
+        const parent = input.closest("div")?.parentElement;
+        const nearbyText = parent?.textContent?.toLowerCase() || "";
+        if (
+          input.maxLength === 6 ||
+          nearbyText.includes("otp") ||
+          nearbyText.includes("verification code") ||
+          nearbyText.includes("enter the otp")
+        ) {
+          input.focus();
+          input.value = "";
+          const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+          nativeSetter?.call(input, otpValue);
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          input.dispatchEvent(new Event("blur", { bubbles: true }));
+          return "single";
+        }
+      }
+
+      // Strategy 3: Fallback — type into the first focused/visible text input
+      for (const inp of allInputs) {
+        const input = inp as HTMLInputElement;
+        if (input.offsetParent !== null && !input.disabled && !input.readOnly) {
+          input.focus();
+          input.value = "";
+          const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+          nativeSetter?.call(input, otpValue);
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          return "fallback";
+        }
+      }
+
+      return null;
+    }, otp);
+
+    if (!entered) {
+      throw new Error("Could not find OTP input field on Flipkart");
+    }
+
+    console.log(`OTP entered via ${entered} strategy`);
+    await sleep(500);
+
+    // Click Verify/Submit OTP button
+    const submitted = await this.page.evaluate(() => {
+      // Look for verify/submit button
+      const buttons = document.querySelectorAll("button, a[role='button']");
+      for (const btn of buttons) {
+        const text = btn.textContent?.trim().toLowerCase() || "";
+        if (text.includes("verify") || text.includes("submit") || text.includes("login")) {
+          (btn as HTMLElement).click();
+          return true;
+        }
+      }
+      // Fallback: click the same class button used for Request OTP (Flipkart reuses it)
+      const fallbackBtn = document.querySelector('button.dSM5Ub.Kv3ekh.KcXDCU') as HTMLButtonElement | null;
+      if (fallbackBtn) {
+        fallbackBtn.click();
+        return true;
+      }
+      return false;
+    });
+
+    if (submitted) {
+      console.log("OTP submit button clicked");
+    } else {
+      console.log("No explicit submit button found — OTP may auto-submit");
+    }
+
+    await sleep(2000);
   }
 
   async waitForLoginCompletion(timeoutMs = 300000): Promise<boolean> {

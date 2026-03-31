@@ -71,9 +71,22 @@ export class BatchOrchestrator {
       sendMessage({
         type: "log",
         level: "info",
-        message: `InstaDDR configured with ${config.instaDdrAccounts.length} account(s) — isolated context created`,
+        message: `InstaDDR configured with ${config.instaDdrAccounts.length} account(s) — emails: ${config.instaDdrAccounts.map(a => a.email.substring(0, 3) + "***").join(", ")}`,
+      });
+    } else {
+      sendMessage({
+        type: "log",
+        level: "warn",
+        message: `No InstaDDR accounts in config (instaDdrAccounts: ${JSON.stringify(config.instaDdrAccounts ?? "undefined")})`,
       });
     }
+
+    // Log configuration summary
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: `Login config: accounts=${this.accounts?.length ?? 0}, instaDDR=${this.instaDdrAccounts?.length ?? 0}, needsLogin=${!!(this.accounts || this.instaDdrAccounts)}`,
+    });
 
     // Determine base URL for inventory API calls
     this.inventoryBaseUrl =
@@ -149,38 +162,86 @@ export class BatchOrchestrator {
       });
 
       try {
-        // Account rotation: logout previous account and login next one
-        if (this.accounts) {
-          const accountIndex = i % this.accounts.length;
-          const email = this.accounts[accountIndex];
+        // ── Login block: handle account rotation, InstaDDR, or both ──
+        // Determine if login is needed and which email/InstaDDR account to use
+        const needsLogin = !!(this.accounts || this.instaDdrAccounts);
 
-          sendMessage({
-            type: "log",
-            level: "info",
-            message: `Logging in with account ${accountIndex + 1}/${this.accounts.length}...`,
-            iteration: i + 1,
-          });
+        if (needsLogin) {
+          // Determine the email to use for Flipkart login and the InstaDDR account (if any)
+          let loginEmail: string;
+          let instaDdrAccount: { instaDdrId: string; instaDdrPassword: string; email: string } | undefined;
 
-          // Build InstaDDR options if configured (InstaDDR handles OTP automation internally)
-          if (this.instaDdrAccounts && !this.instaDdrService) {
+          if (this.accounts) {
+            // Account rotation mode: use Flipkart account email
+            const accountIndex = i % this.accounts.length;
+            loginEmail = this.accounts[accountIndex];
+            // If InstaDDR is also configured, pair with the corresponding InstaDDR account
+            instaDdrAccount = this.instaDdrAccounts?.[accountIndex % this.instaDdrAccounts.length];
+
+            sendMessage({
+              type: "log",
+              level: "info",
+              message: `Account rotation: using account ${accountIndex + 1}/${this.accounts.length}` +
+                (instaDdrAccount ? ` with InstaDDR` : ` (manual OTP)`),
+              iteration: i + 1,
+            });
+          } else {
+            // InstaDDR-only mode: use InstaDDR email as the Flipkart login email
+            const accountIndex = i % this.instaDdrAccounts!.length;
+            instaDdrAccount = this.instaDdrAccounts![accountIndex];
+            loginEmail = instaDdrAccount.email;
+
+            sendMessage({
+              type: "log",
+              level: "info",
+              message: `InstaDDR-only mode: using InstaDDR account ${accountIndex + 1}/${this.instaDdrAccounts!.length}`,
+              iteration: i + 1,
+            });
+          }
+
+          // Lazily create InstaDDR service with isolated browser context
+          if (instaDdrAccount && !this.instaDdrService) {
+            sendMessage({ type: "log", level: "info", message: "Creating isolated InstaDDR browser context..." });
             const browser = this.page.browser() as Browser;
             const instaDdrContext = await browser.createBrowserContext();
             const instaDdrPage = await instaDdrContext.newPage();
             this.instaDdrService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
           }
-          const instaDdrAccount = this.instaDdrAccounts?.[accountIndex % this.instaDdrAccounts.length];
+
+          // Build InstaDDR options
           const instaOptions: InstaDdrLoginOptions | undefined =
             this.instaDdrService && instaDdrAccount
               ? { instaDdrService: this.instaDdrService, instaDdrAccount }
               : undefined;
 
-          // loginWithEmail: logout, enter email, click OTP
-          // If InstaDDR: user manually logs into InstaDDR, bot fetches OTP and enters it
-          // If no InstaDDR: returns immediately, we wait for manual OTP
-          await this.platform.loginWithEmail(email, instaOptions);
+          sendMessage({
+            type: "log",
+            level: "info",
+            message: `Logging in to Flipkart with email: ${loginEmail.substring(0, 3)}***` +
+              (instaOptions ? ` (InstaDDR will auto-fetch OTP)` : ` (manual OTP)`),
+            iteration: i + 1,
+          });
 
-          if (!this.instaDdrService) {
-            const maskedEmail = `${email[0]}${"*".repeat(Math.max(email.indexOf("@") - 2, 1))}${email.substring(email.indexOf("@") - 1)}`;
+          // loginWithEmail handles:
+          // 1. Logout from Flipkart if already logged in
+          // 2. Navigate to Flipkart login page
+          // 3. Enter email
+          // 4. Click "Request OTP"
+          // 5. If InstaDDR: login to InstaDDR → fetch OTP → enter OTP → wait for login completion
+          // 6. If no InstaDDR: return (we wait for manual OTP below)
+          await this.platform.loginWithEmail(loginEmail, instaOptions);
+
+          if (instaOptions) {
+            // InstaDDR handled everything — login is complete
+            sendMessage({
+              type: "log",
+              level: "info",
+              message: `InstaDDR auto-login complete`,
+              iteration: i + 1,
+            });
+          } else {
+            // No InstaDDR — wait for manual OTP entry
+            const maskedEmail = `${loginEmail[0]}${"*".repeat(Math.max(loginEmail.indexOf("@") - 2, 1))}${loginEmail.substring(loginEmail.indexOf("@") - 1)}`;
             sendMessage({
               type: "waiting_for_otp",
               email: maskedEmail,
@@ -188,48 +249,20 @@ export class BatchOrchestrator {
             } as any);
             const loginSuccess = await this.platform.waitForLoginCompletion(300000);
             if (!loginSuccess) {
-              throw new Error(`Login timed out for account ${accountIndex + 1}`);
+              throw new Error(`Login timed out for ${maskedEmail}`);
             }
             sendMessage({
               type: "log",
               level: "info",
-              message: `Login successful for account ${accountIndex + 1}`,
+              message: `Manual login successful`,
               iteration: i + 1,
             });
           }
-        }
-
-        // InstaDDR-only: no account rotation, but still need to logout existing
-        // account and fetch OTP via InstaDDR (InstaDDR email IS the Flipkart login)
-        if (!this.accounts && this.instaDdrAccounts) {
-          const accountIndex = i % this.instaDdrAccounts.length;
-
+        } else {
           sendMessage({
             type: "log",
             level: "info",
-            message: `InstaDDR-only mode: logging in with InstaDDR account ${accountIndex + 1}/${this.instaDdrAccounts.length}...`,
-            iteration: i + 1,
-          });
-
-          // Lazily create InstaDDR service with isolated browser context
-          if (!this.instaDdrService) {
-            const browser = this.page.browser() as Browser;
-            const instaDdrContext = await browser.createBrowserContext();
-            const instaDdrPage = await instaDdrContext.newPage();
-            this.instaDdrService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
-          }
-
-          const instaDdrAccount = this.instaDdrAccounts[accountIndex];
-          // Use the InstaDDR email as the Flipkart login email
-          await this.platform.loginWithEmail(instaDdrAccount.email, {
-            instaDdrService: this.instaDdrService,
-            instaDdrAccount,
-          });
-
-          sendMessage({
-            type: "log",
-            level: "info",
-            message: `InstaDDR OTP auto-entered for InstaDDR account ${accountIndex + 1}`,
+            message: `No account rotation or InstaDDR configured — using existing browser session`,
             iteration: i + 1,
           });
         }
@@ -396,34 +429,48 @@ export class BatchOrchestrator {
         message: `RTGS batch ${Math.floor(batchStart / maxConcurrentTabs) + 1}: iterations ${batchStart + 1}–${batchEnd} (${batchSize} tabs)`,
       });
 
-      // ── Account rotation (once per batch — all tabs in a batch share the same session) ──
-      if (this.accounts) {
+      // ── Login block for RTGS batch (once per batch — all tabs share the same session) ──
+      const needsLoginRTGS = !!(this.accounts || this.instaDdrAccounts);
+      if (needsLoginRTGS) {
         const batchIndex = Math.floor(batchStart / maxConcurrentTabs);
-        const accountIndex = batchIndex % this.accounts.length;
-        const email = this.accounts[accountIndex];
+        let loginEmail: string;
+        let instaDdrAccount: { instaDdrId: string; instaDdrPassword: string; email: string } | undefined;
 
-        sendMessage({
-          type: "log",
-          level: "info",
-          message: `Logging in with account ${accountIndex + 1}/${this.accounts.length} for batch...`,
-        });
+        if (this.accounts) {
+          const accountIndex = batchIndex % this.accounts.length;
+          loginEmail = this.accounts[accountIndex];
+          instaDdrAccount = this.instaDdrAccounts?.[accountIndex % this.instaDdrAccounts.length];
+        } else {
+          const accountIndex = batchIndex % this.instaDdrAccounts!.length;
+          instaDdrAccount = this.instaDdrAccounts![accountIndex];
+          loginEmail = instaDdrAccount.email;
+        }
 
-        const instaDdrAccount = this.instaDdrAccounts?.[accountIndex % this.instaDdrAccounts.length];
-        // Lazily create InstaDDR service with isolated browser context on first use
-        if (this.instaDdrAccounts && !this.instaDdrService) {
+        // Lazily create InstaDDR service
+        if (instaDdrAccount && !this.instaDdrService) {
           const browser = this.page.browser() as Browser;
           const instaDdrContext = await browser.createBrowserContext();
           const instaDdrPage = await instaDdrContext.newPage();
           this.instaDdrService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
         }
 
-        await this.platform.loginWithEmail(email, {
-          instaDdrService: this.instaDdrService ?? undefined,
-          instaDdrAccount: instaDdrAccount ?? undefined,
+        const instaOptions = this.instaDdrService && instaDdrAccount
+          ? { instaDdrService: this.instaDdrService, instaDdrAccount }
+          : undefined;
+
+        sendMessage({
+          type: "log",
+          level: "info",
+          message: `RTGS batch login: ${loginEmail.substring(0, 3)}***` +
+            (instaOptions ? ` (InstaDDR auto-OTP)` : ` (manual OTP)`),
         });
 
-        if (!this.instaDdrService) {
-          const maskedEmail = `${email[0]}${"*".repeat(Math.max(email.indexOf("@") - 2, 1))}${email.substring(email.indexOf("@") - 1)}`;
+        await this.platform.loginWithEmail(loginEmail, instaOptions);
+
+        if (instaOptions) {
+          sendMessage({ type: "log", level: "info", message: `InstaDDR auto-login complete for RTGS batch` });
+        } else {
+          const maskedEmail = `${loginEmail[0]}${"*".repeat(Math.max(loginEmail.indexOf("@") - 2, 1))}${loginEmail.substring(loginEmail.indexOf("@") - 1)}`;
           sendMessage({
             type: "waiting_for_otp",
             email: maskedEmail,
@@ -431,40 +478,10 @@ export class BatchOrchestrator {
           } as any);
           const loginSuccess = await this.platform.waitForLoginCompletion(300000);
           if (!loginSuccess) {
-            throw new Error(`Login timed out for account ${accountIndex + 1}`);
+            throw new Error(`Login timed out for RTGS batch`);
           }
-          sendMessage({ type: "log", level: "info", message: "Login successful" });
-        } else {
-          sendMessage({ type: "log", level: "info", message: `InstaDDR OTP auto-entered for batch` });
+          sendMessage({ type: "log", level: "info", message: "RTGS batch login successful" });
         }
-      }
-
-      // InstaDDR-only: no account rotation, but still need to logout existing
-      // account and fetch OTP via InstaDDR
-      if (!this.accounts && this.instaDdrAccounts) {
-        const batchIndex = Math.floor(batchStart / maxConcurrentTabs);
-        const accountIndex = batchIndex % this.instaDdrAccounts.length;
-
-        sendMessage({
-          type: "log",
-          level: "info",
-          message: `InstaDDR-only RTGS: logging in with InstaDDR account ${accountIndex + 1}/${this.instaDdrAccounts.length}...`,
-        });
-
-        if (!this.instaDdrService) {
-          const browser = this.page.browser() as Browser;
-          const instaDdrContext = await browser.createBrowserContext();
-          const instaDdrPage = await instaDdrContext.newPage();
-          this.instaDdrService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
-        }
-
-        const instaDdrAccount = this.instaDdrAccounts[accountIndex];
-        await this.platform.loginWithEmail(instaDdrAccount.email, {
-          instaDdrService: this.instaDdrService,
-          instaDdrAccount,
-        });
-
-        sendMessage({ type: "log", level: "info", message: `InstaDDR OTP auto-entered for InstaDDR-only RTGS batch` });
       }
 
       // ── Run RTGS flow sequentially: one tab at a time ──

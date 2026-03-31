@@ -90,8 +90,10 @@ export class JobExecutor extends EventEmitter {
     // Decrypt InstaDDR accounts for OTP automation
     let instaDdrAccounts: import("@/types").InstaDdrAccount[] | undefined;
     const instaDdrAccountIds = (job as any).instaDdrAccountIds;
+    console.log(`[Job ${this.jobId}] InstaDDR accountIds from job: ${JSON.stringify(instaDdrAccountIds ?? "undefined")}`);
     if (instaDdrAccountIds && instaDdrAccountIds.length > 0) {
       const groups = await InstaDdrAccount.find({ _id: { $in: instaDdrAccountIds } }).lean();
+      console.log(`[Job ${this.jobId}] Found ${groups.length} InstaDDR group(s) in DB, total accounts: ${groups.reduce((n, g) => n + ((g.accounts as any[])?.length ?? 0), 0)}`);
       const allAccounts: import("@/types").InstaDdrAccount[] = [];
       for (const group of groups) {
         for (const a of (group.accounts as any[])) {
@@ -101,8 +103,8 @@ export class JobExecutor extends EventEmitter {
               instaDdrPassword: decrypt(a.instaDdrPassword),
               email: decrypt(a.email),
             });
-          } catch {
-            console.warn(`[Job ${this.jobId}] Skipping corrupt InstaDDR account ${a._id}`);
+          } catch (err) {
+            console.warn(`[Job ${this.jobId}] Skipping corrupt InstaDDR account ${a._id}: ${err instanceof Error ? err.message : err}`);
           }
         }
       }
@@ -112,6 +114,8 @@ export class JobExecutor extends EventEmitter {
       } else {
         console.warn(`[Job ${this.jobId}] InstaDDR group(s) selected but all accounts were corrupt — skipping InstaDDR`);
       }
+    } else {
+      console.log(`[Job ${this.jobId}] No InstaDDR accountIds in job document — InstaDDR disabled`);
     }
 
     // Fetch GST address details

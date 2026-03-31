@@ -201,8 +201,18 @@ export class InstaDdrService {
     console.log("[InstaDDR] Login complete");
   }
 
-  /** Navigate to InstaDDR login page. For manual login flow. */
+  /** Login to InstaDDR. Logout first if credentials changed. */
   async login(id: string, password: string): Promise<void> {
+    // If already logged in with different credentials, logout first
+    if (this.currentId && (this.currentId !== id || this.currentPassword !== password)) {
+      console.log("[InstaDDR] Credentials changed — logging out first...");
+      await this.logout();
+    }
+    // Skip login if already logged in with same credentials
+    if (this.currentId === id && this.currentPassword === password) {
+      console.log("[InstaDDR] Already logged in with these credentials — skipping login");
+      return;
+    }
     await this.waitForManualLogin(id, password);
   }
 
