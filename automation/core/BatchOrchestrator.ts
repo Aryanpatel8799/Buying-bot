@@ -136,6 +136,19 @@ export class BatchOrchestrator {
         : `Starting batch: ${totalIterations} iterations (${this.config.totalQuantity} total qty, ${this.config.perOrderQuantity} per order)`,
     });
 
+    // Always logout from any previous Flipkart session at the start of a new job
+    // to ensure a clean state, regardless of payment method or login mode
+    if (this.platform instanceof FlipkartPlatform) {
+      try {
+        sendMessage({ type: "log", level: "info", message: "Logging out previous Flipkart session (if any)..." });
+        await this.platform.logout();
+        sendMessage({ type: "log", level: "info", message: "Previous session cleared" });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        sendMessage({ type: "log", level: "warn", message: `Logout at job start failed (continuing): ${msg}` });
+      }
+    }
+
     if (isRTGS) {
       await this.runRTGSBatched(totalIterations, maxConcurrentTabs);
       return;
