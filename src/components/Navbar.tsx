@@ -12,6 +12,7 @@ const navLinks = [
   { href: "/dashboard/giftcards", label: "Gift Cards" },
   { href: "/dashboard/addresses", label: "Addresses" },
   { href: "/dashboard/accounts", label: "Accounts" },
+  { href: "/dashboard/instaddr", label: "InstaDDR" },
   { href: "/dashboard/history", label: "History" },
 ];
 
