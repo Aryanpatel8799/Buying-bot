@@ -1118,9 +1118,9 @@ export class FlipkartPlatform extends BasePlatform {
       console.log("[InstaDDR] Logging into InstaDDR to fetch OTP...");
       await instaDdrService.login(instaDdrAccount.instaDdrId, instaDdrAccount.instaDdrPassword);
 
-      // 6b: Wait for OTP email to arrive (Flipkart takes a few seconds to send)
-      console.log("[InstaDDR] Waiting 10s for OTP email to arrive...");
-      await sleep(10000);
+      // 6b: Wait for OTP email to arrive (Flipkart takes time to send)
+      console.log("[InstaDDR] Waiting 60s for OTP email to arrive...");
+      await sleep(60000);
 
       // 6c: Fetch OTP from InstaDDR inbox with retries — 2 minutes total
       // 24 attempts × 5s between retries = 120s (2 minutes)
