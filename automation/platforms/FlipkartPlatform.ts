@@ -1568,20 +1568,32 @@ export class FlipkartPlatform extends BasePlatform {
     address: AddressDetails,
     expectedQty: number
   ): Promise<void> {
-    const pageUrl = this.page.url();
-    console.log(`Verifying order summary page: ${pageUrl}`);
+    console.log(`Verifying order summary page...`);
 
-    // Wait for the page to be fully loaded (document.body must exist)
-    for (let i = 0; i < 30; i++) {
+    // Wait for any pending navigation to finish (Place Order / Buy Now triggers navigation)
+    try {
+      await this.page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
+    } catch { /* already navigated or no navigation pending */ }
+
+    // Wait for the page to be fully loaded (document.body must exist and have content)
+    let pageReady = false;
+    for (let i = 0; i < 40; i++) {
       try {
         const ready = await this.page.evaluate(() =>
-          document.body !== null && (document.body?.innerText || "").length > 50
+          document.body !== null && (document.body?.innerText || "").length > 100
         );
-        if (ready) break;
-      } catch { /* page still loading */ }
+        if (ready) { pageReady = true; break; }
+      } catch { /* page still loading / context destroyed */ }
       await sleep(500);
     }
+
+    if (!pageReady) {
+      console.log("WARNING: Page did not fully load within 20s, attempting verification anyway");
+    }
+
     await this.ensurePageValid();
+    const pageUrl = this.page.url();
+    console.log(`Order summary page URL: ${pageUrl}`);
 
     // Step 1: Verify quantity on order summary
     await this.verifyQuantityOnOrderSummary(expectedQty);

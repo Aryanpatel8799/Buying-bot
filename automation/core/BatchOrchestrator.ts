@@ -1012,6 +1012,29 @@ export class BatchOrchestrator {
     // Step 4: Place order / proceed to checkout from cart
     await this.platform.placeOrder();
 
+    // Wait for navigation to order summary / checkout page after Place Order
+    // Place Order triggers a page navigation — must wait for it to complete
+    // before attempting any DOM operations
+    if (this.platform instanceof FlipkartPlatform) {
+      sendMessage({ type: "log", level: "info", message: "Waiting for order summary page after Place Order...", iteration: iterationNum });
+      try {
+        await this.page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+      } catch { /* already navigated */ }
+      await sleep(1000);
+
+      // Wait for page body to be ready
+      for (let i = 0; i < 20; i++) {
+        try {
+          const ready = await this.page.evaluate(() =>
+            document.body !== null && (document.body?.innerText || "").length > 100
+          );
+          if (ready) break;
+        } catch { /* context still loading */ }
+        await sleep(500);
+      }
+      await sleep(500);
+    }
+
     // Step 5: Verify order summary page (Flipkart only) — handles address, GST, then Continue to checkout.
     // verifyAddressOnOrderSummary() clicks Continue which navigates to the payment page.
     // DO NOT call proceedToCheckout() here — it would reload /viewcheckout and destroy the payment page.
