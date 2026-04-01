@@ -115,8 +115,42 @@ export class FlipkartPlatform extends BasePlatform {
 
       const logs: string[] = [];
 
-      // --- Strategy 1: Find yellow gradient div (the Buy Now button background) ---
-      // Structure: parent > div(position:absolute, border-radius:12px) > div(yellow gradient)
+      // --- Strategy 1 (HIGHEST PRIORITY): Find "Buy Now" text and walk up ---
+      // This avoids clicking "Buy Combo" or other yellow-gradient buttons
+      const allEls = document.querySelectorAll("div, span, button");
+      for (const label of allEls) {
+        const text = label.textContent?.trim().toLowerCase();
+        if (text !== "buy now" && text !== "buy now!") continue;
+        if (label.children.length > 3) continue;
+
+        // REJECT if parent text contains "combo" — this is Buy Combo, not Buy Now
+        const parentText = (label.parentElement?.textContent || "").toLowerCase();
+        if (parentText.includes("combo")) {
+          logs.push(`Skipped: "Buy Now" inside a combo context: "${parentText.slice(0, 60)}"`);
+          continue;
+        }
+
+        logs.push(`Found "Buy Now" text in <${label.tagName.toLowerCase()}> class="${label.className}"`);
+
+        let best: HTMLElement = label as HTMLElement;
+        let el: HTMLElement | null = label as HTMLElement;
+        while (el && el !== document.body) {
+          const s = el.getAttribute("style") || "";
+          if (el.getAttribute("role") === "button" || s.includes("cursor: pointer") || s.includes("cursor:pointer") || el.tagName === "BUTTON") {
+            best = el;
+          }
+          if (el.getBoundingClientRect().width > 400) break;
+          el = el.parentElement;
+        }
+
+        best.scrollIntoView({ block: "center" });
+        const rect = best.getBoundingClientRect();
+        logs.push(`Text-based pressable at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
+        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "text", logs };
+      }
+
+      // --- Strategy 2: Find yellow gradient that is specifically Buy Now (not Buy Combo) ---
+      // The Buy Now gradient has: linear-gradient(90deg, rgb(255, 229, 31), rgb(255, 205, 3))
       const gradients = document.querySelectorAll('div[style*="linear-gradient"]');
       for (const g of gradients) {
         const style = g.getAttribute("style") || "";
@@ -147,46 +181,26 @@ export class FlipkartPlatform extends BasePlatform {
           el = el.parentElement;
         }
 
+        // REJECT if the pressable contains "combo" text
+        const containerText = best.textContent?.trim().toLowerCase() || "";
+        if (containerText.includes("combo")) {
+          logs.push(`Skipped yellow gradient: contains 'combo' text`);
+          continue;
+        }
+
         best.scrollIntoView({ block: "center" });
         const rect = best.getBoundingClientRect();
         logs.push(`Yellow gradient pressable at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
 
         // Confirm it's the Buy Now button
-        const parentText = best.textContent?.trim().toLowerCase() || "";
-        if (parentText.includes("buy now")) {
+        if (containerText.includes("buy now")) {
           logs.push("Confirmed: contains 'buy now' text");
           return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "yellow-gradient", logs };
         }
         if (rect.width < 300 && rect.height > 30 && rect.height < 70) {
-          logs.push("Likely Buy Now based on size");
+          logs.push("Likely Buy Now based on size (no combo text)");
           return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "yellow-gradient-size", logs };
         }
-      }
-
-      // --- Strategy 2: Find "Buy Now" text and walk up ---
-      const allEls = document.querySelectorAll("div, span, button");
-      for (const label of allEls) {
-        const text = label.textContent?.trim().toLowerCase();
-        if (text !== "buy now" && text !== "buy now!") continue;
-        if (label.children.length > 3) continue;
-
-        logs.push(`Found "Buy Now" text in <${label.tagName.toLowerCase()}> class="${label.className}"`);
-
-        let best: HTMLElement = label as HTMLElement;
-        let el: HTMLElement | null = label as HTMLElement;
-        while (el && el !== document.body) {
-          const s = el.getAttribute("style") || "";
-          if (el.getAttribute("role") === "button" || s.includes("cursor: pointer") || s.includes("cursor:pointer") || el.tagName === "BUTTON") {
-            best = el;
-          }
-          if (el.getBoundingClientRect().width > 400) break;
-          el = el.parentElement;
-        }
-
-        best.scrollIntoView({ block: "center" });
-        const rect = best.getBoundingClientRect();
-        logs.push(`Text-based pressable at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
-        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "text", logs };
       }
 
       logs.push("No Buy Now button found");
