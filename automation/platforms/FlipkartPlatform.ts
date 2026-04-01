@@ -1909,8 +1909,9 @@ export class FlipkartPlatform extends BasePlatform {
   }
 
   private async verifyDeliveryAddressOnSummary(address: AddressDetails): Promise<void> {
+    const effectivePincode = (address.checkoutPincode || address.pincode).trim();
     console.log("Verifying delivery address on order summary...");
-    console.log(`Looking for: city="${address.city}", pincode="${address.pincode}"`);
+    console.log(`Looking for: city="${address.city}", pincode="${effectivePincode}"${address.checkoutPincode ? ` (checkout override, original: ${address.pincode})` : ""}`);
 
     // Wait for the order summary page to fully load the address section
     try {
@@ -1949,7 +1950,7 @@ export class FlipkartPlatform extends BasePlatform {
     console.log(`Current address text: "${(currentText || "").slice(0, 150)}"`);
 
     const matchScore = this.scoreAddressMatch(currentText, address);
-    const hasPincode = (currentText || "").includes(address.pincode.trim());
+    const hasPincode = (currentText || "").includes(effectivePincode);
     const hasCity = (currentText || "").toLowerCase().includes(address.city.trim().toLowerCase());
     console.log(`Address match score: ${matchScore}/6, pincode=${hasPincode}, city=${hasCity}`);
 
@@ -2638,8 +2639,9 @@ export class FlipkartPlatform extends BasePlatform {
   }
 
   private async verifyDeliveryAddress(address: AddressDetails): Promise<void> {
+    const effectivePincode = (address.checkoutPincode || address.pincode).trim();
     console.log("Checking delivery address...");
-    console.log(`Looking for: city="${address.city}", pincode="${address.pincode}", locality="${address.locality}"`);
+    console.log(`Looking for: city="${address.city}", pincode="${effectivePincode}", locality="${address.locality}"`);
 
     // Wait for the checkout page to load
     try {
@@ -2670,7 +2672,7 @@ export class FlipkartPlatform extends BasePlatform {
     });
     console.log(`Current address: "${currentText.slice(0, 150)}"`);
 
-    const hasPincode = currentText.includes(address.pincode.trim());
+    const hasPincode = currentText.includes(effectivePincode);
     const hasCity = currentText.toLowerCase().includes(address.city.trim().toLowerCase());
     const matchScore = this.scoreAddressMatch(currentText, address);
 
@@ -4239,7 +4241,7 @@ export class FlipkartPlatform extends BasePlatform {
     if (!text) return 0;
 
     const lowerText = text.toLowerCase();
-    const pincode = address.pincode.trim();
+    const pincode = (address.checkoutPincode || address.pincode).trim();
     const city = address.city.trim().toLowerCase();
     const locality = address.locality.trim().toLowerCase();
     const name = address.name.trim().toLowerCase();
