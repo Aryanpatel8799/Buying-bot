@@ -557,18 +557,43 @@ export class FlipkartPlatform extends BasePlatform {
         }
       }
 
-      // --- Pattern 3: SVG cart icon ---
+      // --- Pattern 3: SVG cart icon (by AddToCart clipPath id) ---
+      const addToCartClip = document.querySelector('clipPath[id*="AddToCart"]');
+      if (addToCartClip) {
+        logs.push("Found SVG with AddToCart clipPath id");
+        let best: HTMLElement = (addToCartClip.closest("svg") as unknown as HTMLElement) || (addToCartClip as unknown as HTMLElement);
+        let el: HTMLElement | null = best;
+        while (el && el !== document.body) {
+          const style = el.getAttribute("style") || "";
+          // Target the 44x44 border-radius:12px container
+          if ((style.includes("width: 44px") || style.includes("width:44px")) && style.includes("border-radius")) {
+            best = el;
+            break;
+          }
+          if (style.includes("cursor") || el.getAttribute("role") === "button") {
+            best = el;
+            break;
+          }
+          el = el.parentElement;
+        }
+        best.scrollIntoView({ block: "center" });
+        const rect = best.getBoundingClientRect();
+        logs.push(`AddToCart clipPath button at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
+        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "svg-clip", logs };
+      }
+
+      // --- Pattern 4: SVG cart icon (by path d attribute) ---
       const allPaths = document.querySelectorAll("path");
       for (const p of allPaths) {
         if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) {
-          logs.push("Found SVG cart icon");
-          // Walk up to 44x44 container or nearest css-g5y9jx
+          logs.push("Found SVG cart icon by path d");
           let best: HTMLElement = p as unknown as HTMLElement;
           let el: HTMLElement | null = p as unknown as HTMLElement;
           while (el && el !== document.body) {
             const style = el.getAttribute("style") || "";
-            if (style.includes("width: 44px") || style.includes("width:44px") || el.classList.contains("css-g5y9jx")) {
+            if ((style.includes("width: 44px") || style.includes("width:44px")) && style.includes("border-radius")) {
               best = el;
+              break;
             }
             if (style.includes("cursor") || el.getAttribute("role") === "button") {
               best = el;
@@ -578,7 +603,7 @@ export class FlipkartPlatform extends BasePlatform {
           }
           best.scrollIntoView({ block: "center" });
           const rect = best.getBoundingClientRect();
-          logs.push(`SVG button at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
+          logs.push(`SVG path button at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
           return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "svg", logs };
         }
       }
@@ -599,18 +624,82 @@ export class FlipkartPlatform extends BasePlatform {
       throw new Error("Add to Cart button not found");
     }
 
-    // Step 2: Use touchscreen.tap — most reliable for React Native Web Pressable
+    // Step 2: Try multiple click strategies
     await sleep(300);
-    await this.page.touchscreen.tap(btnCoords.x, btnCoords.y);
-    console.log(`Tapped Add to Cart at (${btnCoords.x.toFixed(0)}, ${btnCoords.y.toFixed(0)})`);
 
-    // Step 3: If tap didn't work, try React fiber handler as backup
+    // Strategy A: mouse.click (works for most elements including React Native Web)
+    try {
+      await this.page.mouse.click(btnCoords.x, btnCoords.y);
+      console.log(`Mouse clicked Add to Cart at (${btnCoords.x.toFixed(0)}, ${btnCoords.y.toFixed(0)})`);
+    } catch (err) {
+      console.log(`Mouse click failed: ${(err as Error).message}`);
+    }
     await sleep(800);
-    const cartChanged = await this.page.evaluate(() => {
+
+    // Check if cart was updated
+    let cartChanged = await this.page.evaluate(() => {
       const badge = document.querySelector("span.m2YAMv");
       return badge?.textContent || "0";
     });
-    console.log(`Cart badge after tap: ${cartChanged}`);
+    console.log(`Cart badge after mouse click: ${cartChanged}`);
+
+    // Strategy B: touchscreen.tap if mouse click didn't work
+    if (cartChanged === "0") {
+      console.log("Mouse click may not have worked, trying touchscreen.tap...");
+      try {
+        await this.page.touchscreen.tap(btnCoords.x, btnCoords.y);
+        console.log(`Tapped Add to Cart at (${btnCoords.x.toFixed(0)}, ${btnCoords.y.toFixed(0)})`);
+      } catch (err) {
+        console.log(`Tap failed: ${(err as Error).message}`);
+      }
+      await sleep(800);
+      cartChanged = await this.page.evaluate(() => {
+        const badge = document.querySelector("span.m2YAMv");
+        return badge?.textContent || "0";
+      });
+      console.log(`Cart badge after tap: ${cartChanged}`);
+    }
+
+    // Strategy C: Direct DOM click with full mouse event sequence on the element
+    if (cartChanged === "0") {
+      console.log("Tap may not have worked, trying direct DOM click...");
+      const domClicked = await this.page.evaluate(() => {
+        // Find the 44x44 AddToCart button container
+        const clip = document.querySelector('clipPath[id*="AddToCart"]');
+        let target: HTMLElement | null = clip?.closest("svg")?.parentElement?.parentElement as HTMLElement || null;
+        if (!target) {
+          // Fallback: find by path d
+          const paths = document.querySelectorAll("path");
+          for (const p of paths) {
+            if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) {
+              target = p.closest('div[style*="border-radius"]') as HTMLElement || p.closest("div.css-g5y9jx") as HTMLElement;
+              break;
+            }
+          }
+        }
+        if (!target) return false;
+        target.scrollIntoView({ block: "center" });
+        const rect = target.getBoundingClientRect();
+        const x = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
+        // Full pointer event sequence for React Native Web Pressable
+        target.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: x, clientY: y, pointerId: 1 }));
+        target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y, button: 0 }));
+        target.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, clientX: x, clientY: y, pointerId: 1 }));
+        target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y, button: 0 }));
+        target.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y, button: 0 }));
+        return true;
+      });
+      if (domClicked) {
+        console.log("Direct DOM click dispatched");
+        await sleep(800);
+        cartChanged = await this.page.evaluate(() => {
+          const badge = document.querySelector("span.m2YAMv");
+          return badge?.textContent || "0";
+        });
+        console.log(`Cart badge after DOM click: ${cartChanged}`);
+      }
+    }
 
     if (cartChanged === "0") {
       console.log("Tap may not have worked, trying React fiber handler...");
