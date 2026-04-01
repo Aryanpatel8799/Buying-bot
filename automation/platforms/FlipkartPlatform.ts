@@ -430,7 +430,7 @@ export class FlipkartPlatform extends BasePlatform {
       console.log(`Already on checkout page (${currentUrl}) — waiting for content to render...`);
       // Wait for React to render the payment section (poll until body has enough text)
       for (let i = 0; i < 20; i++) {
-        const bodyLen = await this.page.evaluate(() => document.body.innerText.length);
+        const bodyLen = await this.page.evaluate(() => (document.body?.innerText || "").length);
         if (bodyLen > 100) break;
         await sleep(500);
       }
@@ -446,7 +446,7 @@ export class FlipkartPlatform extends BasePlatform {
 
     // Wait for page to settle
     for (let i = 0; i < 20; i++) {
-      const bodyLen = await this.page.evaluate(() => document.body.innerText.length);
+      const bodyLen = await this.page.evaluate(() => (document.body?.innerText || "").length);
       if (bodyLen > 100) break;
       await sleep(500);
     }
@@ -457,7 +457,7 @@ export class FlipkartPlatform extends BasePlatform {
   async isPaymentPage(): Promise<boolean> {
     try {
       const hasPaymentElements = await this.page.evaluate(() => {
-        const text = document.body.innerText;
+        const text = document.body?.innerText || "";
         return (
           text.includes("PAYMENT OPTIONS") ||
           text.includes("Credit / Debit / ATM Card") ||
@@ -922,7 +922,7 @@ export class FlipkartPlatform extends BasePlatform {
     try {
       const result = await this.page.evaluate(() => {
         const url = window.location.href.toLowerCase();
-        const text = document.body.innerText.toLowerCase();
+        const text = (document.body?.innerText || "").toLowerCase();
 
         // URL-based detection (most reliable)
         if (
@@ -1301,7 +1301,7 @@ export class FlipkartPlatform extends BasePlatform {
             return true;
           }
           // Check for logged-in indicators on the page
-          const text = document.body.innerText.toLowerCase();
+          const text = (document.body?.innerText || "").toLowerCase();
           if (text.includes("my account") || text.includes("my orders")) {
             return true;
           }
@@ -1355,7 +1355,7 @@ export class FlipkartPlatform extends BasePlatform {
       return await this.page.evaluate(() => {
         const url = window.location.href.toLowerCase();
         if (url.includes("/account/login")) return false;
-        const text = document.body.innerText.toLowerCase();
+        const text = (document.body?.innerText || "").toLowerCase();
         return (
           text.includes("my account") ||
           text.includes("my orders") ||
@@ -1481,6 +1481,18 @@ export class FlipkartPlatform extends BasePlatform {
   ): Promise<void> {
     const pageUrl = this.page.url();
     console.log(`Verifying order summary page: ${pageUrl}`);
+
+    // Wait for the page to be fully loaded (document.body must exist)
+    for (let i = 0; i < 30; i++) {
+      try {
+        const ready = await this.page.evaluate(() =>
+          document.body !== null && (document.body?.innerText || "").length > 50
+        );
+        if (ready) break;
+      } catch { /* page still loading */ }
+      await sleep(500);
+    }
+    await this.ensurePageValid();
 
     // Step 1: Verify quantity on order summary
     await this.verifyQuantityOnOrderSummary(expectedQty);
@@ -1693,7 +1705,7 @@ export class FlipkartPlatform extends BasePlatform {
           !!document.querySelector('input[placeholder*="Quantity" i]') ||
           !!document.querySelector('input[placeholder*="Qty" i]') ||
           !!document.querySelector(".css-146c3p1") ||
-          document.body.innerText.includes("APPLY")
+          (document.body?.innerText || "").includes("APPLY")
         );
       });
       if (!dialogReady) await sleep(300);
@@ -1789,7 +1801,7 @@ export class FlipkartPlatform extends BasePlatform {
     try {
       await this.page.waitForFunction(
         () => {
-          const body = document.body.innerText || "";
+          const body = document.body?.innerText || "";
           return body.includes("Deliver to") || body.includes("Delivery Address");
         },
         { timeout: 15000 }
@@ -1841,7 +1853,7 @@ export class FlipkartPlatform extends BasePlatform {
     for (let i = 0; i < 8 && !addressListLoaded; i++) {
       await sleep(300);
       addressListLoaded = await this.page.evaluate(() => {
-        const body = document.body.innerText || "";
+        const body = document.body?.innerText || "";
         return (
           body.includes("Deliver to") ||
           body.includes("Select Delivery") ||
@@ -1872,7 +1884,7 @@ export class FlipkartPlatform extends BasePlatform {
         await sleep(300);
         try {
           const stillOpen = await this.page.evaluate(() => {
-            const body = document.body.innerText || "";
+            const body = document.body?.innerText || "";
             return (
               body.includes("Select Delivery Address") ||
               body.includes("Edit Address") ||
@@ -1974,7 +1986,7 @@ export class FlipkartPlatform extends BasePlatform {
       await sleep(300);
       try {
         const stillOpen = await this.page.evaluate(() => {
-          const body = document.body.innerText || "";
+          const body = document.body?.innerText || "";
           return body.includes("Select Delivery Address") || body.includes("Edit Address") || body.includes("ADD A NEW ADDRESS");
         });
         if (!stillOpen) {
@@ -2000,7 +2012,7 @@ export class FlipkartPlatform extends BasePlatform {
     let gstSectionVisible = false;
     for (let i = 0; i < 20; i++) {
       const visible = await this.page.evaluate(() => {
-        const body = document.body.innerText || "";
+        const body = document.body?.innerText || "";
         return body.includes("Use GST Invoice") || body.includes("GST Invoice") || body.includes("GST invoice");
       });
       if (visible) { gstSectionVisible = true; break; }
@@ -2217,7 +2229,7 @@ export class FlipkartPlatform extends BasePlatform {
 
     // Check if the TARGET GST number is already on the page (not just any GSTIN)
     const targetGstOnPage = await this.page.evaluate((targetGst: string) => {
-      const body = document.body.innerText || "";
+      const body = document.body?.innerText || "";
       return body.includes(targetGst);
     }, gstNumber);
 
@@ -2238,7 +2250,7 @@ export class FlipkartPlatform extends BasePlatform {
       }
       // If "Select GST Details" form opened, handle it
       const formOpened = await this.page.evaluate(() =>
-        document.body.innerText.includes("Select GST Details")
+        (document.body?.innerText || "").includes("Select GST Details")
       );
       if (formOpened) {
         console.log("GST selection form opened — selecting target GST entry...");
@@ -2293,12 +2305,12 @@ export class FlipkartPlatform extends BasePlatform {
     const formReady = await waitForGstForm();
     if (!formReady) {
       const modalOpen = await this.page.evaluate(() =>
-        document.body.innerText.includes("Select GST Details")
+        (document.body?.innerText || "").includes("Select GST Details")
       );
       if (modalOpen) {
         console.log("GST selection modal opened...");
         const exists = await this.page.evaluate((gst) =>
-          (document.body.innerText || "").includes(gst)
+          (document.body?.innerText || "").includes(gst)
         , gstNumber);
         if (exists) {
           console.log("GST found in saved list — selecting...");
@@ -2480,7 +2492,7 @@ export class FlipkartPlatform extends BasePlatform {
           for (let j = 0; j < 30; j++) { // 30 * 200ms = 6s max
             await sleep(200);
             try {
-              const bodyLen = await this.page.evaluate(() => document.body.innerText.length);
+              const bodyLen = await this.page.evaluate(() => (document.body?.innerText || "").length);
               const currentUrl = this.page.url();
               // Check we're still on the same page (not redirected back)
               if (currentUrl === url && bodyLen > 100) {
@@ -2567,7 +2579,7 @@ export class FlipkartPlatform extends BasePlatform {
     for (let i = 0; i < 8; i++) {
       await sleep(300);
       const listVisible = await this.page.evaluate(() => {
-        const body = document.body.innerText || "";
+        const body = document.body?.innerText || "";
         return (
           body.includes("Deliver to") ||
           body.includes("Select Delivery") ||
@@ -2588,7 +2600,7 @@ export class FlipkartPlatform extends BasePlatform {
       console.log("WARNING: Address list did not appear, taking screenshot");
       // Dump page content to understand what happened
       const dump = await this.page.evaluate(() => {
-        const body = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+        const body = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
         return body.slice(0, 800);
       });
       console.log(`[verifyDeliveryAddress] Page text after Change click: "${dump}"`);
@@ -2612,7 +2624,7 @@ export class FlipkartPlatform extends BasePlatform {
         await sleep(300);
         try {
           const isModalOpen = await this.page.evaluate(() => {
-            const body = document.body.innerText || "";
+            const body = document.body?.innerText || "";
             return (
               body.includes("Select Delivery Address") ||
               body.includes("Edit Address") ||
@@ -2652,7 +2664,7 @@ export class FlipkartPlatform extends BasePlatform {
 
       // Check if the address is now correctly set on the checkout page
       const stillWrong = await this.page.evaluate((addr: AddressDetails) => {
-        const body = document.body.innerText || "";
+        const body = document.body?.innerText || "";
         return !body.includes(addr.pincode.trim());
       }, address);
 
@@ -2681,7 +2693,7 @@ export class FlipkartPlatform extends BasePlatform {
     // Wait for the page to fully load — handle detached frame errors
     try {
       await newTab.waitForFunction(
-        () => document.body.innerText.length > 100,
+        () => (document.body?.innerText || "").length > 100,
         { timeout: 15000 }
       );
     } catch (err) {
@@ -2730,7 +2742,7 @@ export class FlipkartPlatform extends BasePlatform {
       await sleep(300);
       try {
         const pageState = await newTab.evaluate(() => {
-          const body = document.body.innerText || "";
+          const body = document.body?.innerText || "";
           return {
             text: body.replace(/\s+/g, " ").trim().slice(0, 200),
             url: window.location.href,
@@ -2789,7 +2801,7 @@ export class FlipkartPlatform extends BasePlatform {
     let gstSectionVisible = false;
     for (let attempt = 0; attempt < 5 && !gstSectionVisible; attempt++) {
       gstSectionVisible = await this.page.evaluate(() => {
-        const body = document.body.innerText || "";
+        const body = document.body?.innerText || "";
         return (
           body.includes("GST Invoice") ||
           body.includes("Tax Invoice") ||
@@ -2811,7 +2823,7 @@ export class FlipkartPlatform extends BasePlatform {
     console.log("GST section found on page, checking current details...");
 
     // Extract all text from the page to search for GST number
-    const pageText = await this.page.evaluate(() => document.body.innerText || "");
+    const pageText = await this.page.evaluate(() => document.body?.innerText || "");
 
     const gstNumberClean = address.gstNumber.trim().replace(/\s/g, "");
     const companyNameClean = address.companyName.trim().toLowerCase();
@@ -2917,7 +2929,7 @@ export class FlipkartPlatform extends BasePlatform {
     let gstFormReady = false;
     for (let i = 0; i < 5 && !gstFormReady; i++) {
       gstFormReady = await this.page.evaluate(() => {
-        const body = document.body.innerText || "";
+        const body = document.body?.innerText || "";
         return (
           body.includes("Add new GST Details") ||
           document.querySelector('input[maxlength="15"]') !== null ||
@@ -2931,7 +2943,7 @@ export class FlipkartPlatform extends BasePlatform {
 
     // Check if "Add new GST Details" button is visible and click it
     const hasAddNewGst = await this.page.evaluate(() => {
-      return document.body.innerText.includes("Add new GST Details");
+      return (document.body?.innerText || "").includes("Add new GST Details");
     });
 
     if (hasAddNewGst) {
@@ -2968,7 +2980,7 @@ export class FlipkartPlatform extends BasePlatform {
     // Wait for GST section to be visible first
     for (let i = 0; i < 5; i++) {
       const visible = await this.page.evaluate(() => {
-        const body = document.body.innerText || "";
+        const body = document.body?.innerText || "";
         return body.includes("Use GST Invoice") || body.includes("GST Invoice");
       });
       if (visible) break;
@@ -3640,7 +3652,7 @@ export class FlipkartPlatform extends BasePlatform {
     for (let attempt = 0; attempt < 8 && !modalFound; attempt++) {
       try {
         modalFound = await this.page.evaluate(() => {
-          const body = document.body.innerText || "";
+          const body = document.body?.innerText || "";
           return (
             body.includes("Deliver to") ||
             body.includes("Select Delivery Address") ||
