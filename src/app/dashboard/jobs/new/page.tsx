@@ -178,7 +178,9 @@ export default function NewJobPage() {
           cvv,
         };
       case "giftcard":
-        return { code: giftCardCode, pin: giftCardPin };
+        // Flipkart: no code needed, gift card balance is already on account (checkbox only)
+        // Amazon: code entry required
+        return platform === "flipkart" ? { code: "", pin: "" } : { code: giftCardCode, pin: giftCardPin };
       case "rtgs":
         return { bankName };
     }
@@ -278,9 +280,11 @@ export default function NewJobPage() {
           chromeProfileId,
           ...(useRotation
             ? { cardIds: selectedCardIds }
-            : paymentMethod === "giftcard" && giftCardSource === "inventory"
-              ? { giftCardInventoryId: selectedInventoryId }
-              : { paymentDetails: getPaymentDetails() }),
+            : paymentMethod === "giftcard" && platform === "flipkart"
+              ? { paymentDetails: getPaymentDetails() }
+              : paymentMethod === "giftcard" && giftCardSource === "inventory"
+                ? { giftCardInventoryId: selectedInventoryId }
+                : { paymentDetails: getPaymentDetails() }),
           ...(useAccountRotation ? { accountIds: selectedAccountIds } : {}),
           ...(useGstAddress && selectedAddressId ? { addressIds: [selectedAddressId], checkoutPincode: checkoutPincode || undefined } : {}),
           ...(paymentMethod === "rtgs" && maxConcurrentTabs > 1 ? { maxConcurrentTabs } : {}),
@@ -929,87 +933,95 @@ export default function NewJobPage() {
           <div className="space-y-4 p-5 bg-gray-900 rounded-xl border border-gray-800">
             <h3 className="text-sm font-semibold text-gray-200">Gift Card Details</h3>
 
-            {/* Source toggle */}
-            <div className="flex bg-gray-800 rounded-lg p-0.5 text-xs border border-gray-700">
-              <button
-                type="button"
-                onClick={() => { setGiftCardSource("single"); setGiftCardCode(""); setGiftCardPin(""); setSelectedInventoryId(""); }}
-                className={`px-3 py-1.5 rounded-md transition-all font-medium flex-1 ${
-                  giftCardSource === "single"
-                    ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
-                    : "text-gray-400 hover:text-white"
-                }`}
-              >
-                Single Code
-              </button>
-              <button
-                type="button"
-                onClick={() => { setGiftCardSource("inventory"); setGiftCardCode(""); setGiftCardPin(""); }}
-                className={`px-3 py-1.5 rounded-md transition-all font-medium flex-1 ${
-                  giftCardSource === "inventory"
-                    ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
-                    : "text-gray-400 hover:text-white"
-                }`}
-              >
-                From Inventory
-              </button>
-            </div>
-
-            {giftCardSource === "single" ? (
-              <>
-                <div>
-                  <label className={labelClass}>Gift Card Code</label>
-                  <input
-                    type="text"
-                    value={giftCardCode}
-                    onChange={(e) => setGiftCardCode(e.target.value)}
-                    placeholder="Enter gift card code"
-                    required
-                    className={inputClass}
-                  />
-                </div>
-                <div>
-                  <label className={labelClass}>PIN</label>
-                  <input
-                    type="text"
-                    value={giftCardPin}
-                    onChange={(e) => setGiftCardPin(e.target.value)}
-                    placeholder="PIN (if applicable)"
-                    className={inputClass}
-                  />
-                </div>
-              </>
+            {platform === "flipkart" ? (
+              <div className="p-4 bg-green-500/10 border border-green-500/20 rounded-xl text-sm text-green-400">
+                Gift card balance is already added to your Flipkart account. The bot will automatically tick the gift card checkbox during checkout to apply the balance.
+              </div>
             ) : (
               <>
-                {inventories.filter((i) => i.platform === platform).length === 0 ? (
-                  <div className="p-4 bg-yellow-500/10 border border-yellow-500/20 rounded-xl text-sm text-yellow-400">
-                    No {platform} inventory lists.{" "}
-                    <Link href="/dashboard/giftcards/inventory" className="underline hover:text-yellow-300">
-                      Create one
-                    </Link>{" "}
-                    first.
-                  </div>
+                {/* Source toggle — Amazon only */}
+                <div className="flex bg-gray-800 rounded-lg p-0.5 text-xs border border-gray-700">
+                  <button
+                    type="button"
+                    onClick={() => { setGiftCardSource("single"); setGiftCardCode(""); setGiftCardPin(""); setSelectedInventoryId(""); }}
+                    className={`px-3 py-1.5 rounded-md transition-all font-medium flex-1 ${
+                      giftCardSource === "single"
+                        ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+                        : "text-gray-400 hover:text-white"
+                    }`}
+                  >
+                    Single Code
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setGiftCardSource("inventory"); setGiftCardCode(""); setGiftCardPin(""); }}
+                    className={`px-3 py-1.5 rounded-md transition-all font-medium flex-1 ${
+                      giftCardSource === "inventory"
+                        ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+                        : "text-gray-400 hover:text-white"
+                    }`}
+                  >
+                    From Inventory
+                  </button>
+                </div>
+
+                {giftCardSource === "single" ? (
+                  <>
+                    <div>
+                      <label className={labelClass}>Gift Card Code</label>
+                      <input
+                        type="text"
+                        value={giftCardCode}
+                        onChange={(e) => setGiftCardCode(e.target.value)}
+                        placeholder="Enter gift card code"
+                        required
+                        className={inputClass}
+                      />
+                    </div>
+                    <div>
+                      <label className={labelClass}>PIN</label>
+                      <input
+                        type="text"
+                        value={giftCardPin}
+                        onChange={(e) => setGiftCardPin(e.target.value)}
+                        placeholder="PIN (if applicable)"
+                        className={inputClass}
+                      />
+                    </div>
+                  </>
                 ) : (
-                  <div>
-                    <label className={labelClass}>Select Inventory</label>
-                    <select
-                      value={selectedInventoryId}
-                      onChange={(e) => setSelectedInventoryId(e.target.value)}
-                      className={inputClass}
-                    >
-                      <option value="">Select a list...</option>
-                      {inventories
-                        .filter((i) => i.platform === platform)
-                        .map((inv) => (
-                          <option key={inv._id} value={inv._id}>
-                            {inv.name} — {inv.available} available / {inv.totalCodes} total
-                          </option>
-                        ))}
-                    </select>
-                    <p className="text-xs text-gray-500 mt-1">
-                      Codes are automatically rotated across iterations
-                    </p>
-                  </div>
+                  <>
+                    {inventories.filter((i) => i.platform === platform).length === 0 ? (
+                      <div className="p-4 bg-yellow-500/10 border border-yellow-500/20 rounded-xl text-sm text-yellow-400">
+                        No {platform} inventory lists.{" "}
+                        <Link href="/dashboard/giftcards/inventory" className="underline hover:text-yellow-300">
+                          Create one
+                        </Link>{" "}
+                        first.
+                      </div>
+                    ) : (
+                      <div>
+                        <label className={labelClass}>Select Inventory</label>
+                        <select
+                          value={selectedInventoryId}
+                          onChange={(e) => setSelectedInventoryId(e.target.value)}
+                          className={inputClass}
+                        >
+                          <option value="">Select a list...</option>
+                          {inventories
+                            .filter((i) => i.platform === platform)
+                            .map((inv) => (
+                              <option key={inv._id} value={inv._id}>
+                                {inv.name} — {inv.available} available / {inv.totalCodes} total
+                              </option>
+                            ))}
+                        </select>
+                        <p className="text-xs text-gray-500 mt-1">
+                          Codes are automatically rotated across iterations
+                        </p>
+                      </div>
+                    )}
+                  </>
                 )}
               </>
             )}

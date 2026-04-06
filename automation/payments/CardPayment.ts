@@ -292,6 +292,35 @@ export class CardPayment extends BasePayment {
   }
 
   private async flipkartConfirmPayment(): Promise<void> {
+    // Strategy 1: Click the <button> "Pay ₹..." button (payment gateway page)
+    const btnClicked = await this.page.evaluate(() => {
+      // Match button with class containing "Button-module_button" and text starting with "Pay"
+      const buttons = document.querySelectorAll('button[class*="Button-module_button"]');
+      for (const btn of buttons) {
+        const text = (btn.textContent || "").trim();
+        if (text.startsWith("Pay") || text.includes("Pay ")) {
+          (btn as HTMLElement).click();
+          return "button-module";
+        }
+      }
+      // Also try any <button> whose text starts with "Pay ₹"
+      const allButtons = document.querySelectorAll("button");
+      for (const btn of allButtons) {
+        const text = (btn.textContent || "").trim();
+        if (/^Pay\s*₹/.test(text)) {
+          (btn as HTMLElement).click();
+          return "button-pay-rupee";
+        }
+      }
+      return null;
+    });
+
+    if (btnClicked) {
+      console.log(`Payment confirmation clicked (${btnClicked})`);
+      return;
+    }
+
+    // Strategy 2: Yellow background div (Flipkart checkout page)
     try {
       await waitAndClick(
         this.page,
@@ -299,19 +328,22 @@ export class CardPayment extends BasePayment {
         "Pay / Place Order button",
         15000
       );
-    } catch {
-      await this.page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll("div.css-146c3p1"));
-        for (const btn of buttons) {
-          const text = btn.textContent?.trim().toUpperCase() || "";
-          if (text === "PAY" || text.includes("PLACE ORDER") || text.includes("PAY ")) {
-            (btn.closest("div[style*='cursor']") as HTMLElement)?.click();
-            return;
-          }
+      console.log("Payment confirmation clicked (yellow div)");
+      return;
+    } catch { /* fall through */ }
+
+    // Strategy 3: Text-based fallback in React Native Web divs
+    await this.page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("div.css-146c3p1"));
+      for (const btn of buttons) {
+        const text = btn.textContent?.trim().toUpperCase() || "";
+        if (text === "PAY" || text.includes("PLACE ORDER") || text.includes("PAY ")) {
+          (btn.closest("div[style*='cursor']") as HTMLElement)?.click();
+          return;
         }
-      });
-    }
-    console.log("Payment confirmation clicked");
+      }
+    });
+    console.log("Payment confirmation clicked (text fallback)");
   }
 
   // ─── Amazon Card Flow ───
@@ -319,67 +351,214 @@ export class CardPayment extends BasePayment {
   private async amazonSelectCard(): Promise<void> {
     console.log("Selecting Credit or debit card on Amazon...");
 
-    // Click the "Credit or debit card" payment option
+    // Wait for the "Credit or debit card" row to appear
     await waitWithRetry(
       this.page,
       async () => {
-        await this.page.waitForSelector(
-          ".pmts-selectable-add-credit-card, .pmts-instrument-box",
-          { visible: true, timeout: 10000 }
-        );
+        const found = await this.page.evaluate(() => {
+          const divs = document.querySelectorAll('[data-pmts-component-id]');
+          for (const div of divs) {
+            if ((div.textContent || "").includes("Credit or debit card")) return true;
+          }
+          return !!document.querySelector('.pmts-selectable-add-credit-card, .pmts-instrument-box');
+        });
+        if (!found) throw new Error("Credit card payment row not found");
       },
       { label: "Credit card payment option", timeoutMs: 10000, maxRetries: 5, isPaymentPage: this.isPaymentPage }
     );
 
-    await this.page.evaluate(() => {
-      // Click the radio button or the payment row for "Credit or debit card"
-      const row = document.querySelector(".pmts-selectable-add-credit-card");
-      if (row) {
-        const radio = row.querySelector('input[type="radio"]') as HTMLInputElement;
-        if (radio) {
-          radio.click();
-        } else {
-          (row as HTMLElement).click();
-        }
-        return;
-      }
-      // Fallback: find by text
-      const boxes = Array.from(document.querySelectorAll(".pmts-instrument-box"));
-      for (const box of boxes) {
-        if (box.textContent?.includes("Credit or debit card")) {
-          const r = box.querySelector('input[type="radio"]') as HTMLInputElement;
-          if (r) r.click();
-          else (box as HTMLElement).click();
-          return;
-        }
-      }
-    });
+    // Strategy 1: Native Puppeteer click on the radio button (fires real mouse events)
+    let expanded = false;
+    const radioSelector = 'input[type="radio"][name="ppw-instrumentRowSelection"][value="SelectableAddCreditCard"]';
+    const radioEl = await this.page.$(radioSelector);
+    if (radioEl) {
+      await radioEl.click();
+      console.log("Clicked credit card radio button (native)");
+      await sleep(1500);
+      expanded = await this.isAddCardLinkVisible();
+    }
 
-    console.log("Selected Credit or debit card");
-    await sleep(300);
+    // Strategy 2: Native click on the label wrapping the radio
+    if (!expanded) {
+      const labelClicked = await this.page.evaluate((sel: string) => {
+        const input = document.querySelector(sel);
+        if (input) {
+          const label = input.closest("label");
+          if (label) { label.click(); return "label"; }
+        }
+        return null;
+      }, radioSelector);
+      if (labelClicked) {
+        console.log("Clicked radio label");
+        await sleep(1500);
+        expanded = await this.isAddCardLinkVisible();
+      }
+    }
 
-    // Click "Add a new credit or debit card" link
-    console.log("Clicking Add a new card...");
+    // Strategy 3: Native Puppeteer click on the row div containing "Credit or debit card"
+    if (!expanded) {
+      const rowHandle = await this.page.evaluateHandle(() => {
+        const divs = document.querySelectorAll('[data-pmts-component-id]');
+        for (const div of divs) {
+          if ((div.textContent || "").includes("Credit or debit card")) {
+            return div as HTMLElement;
+          }
+        }
+        return null;
+      });
+      const rowEl = rowHandle.asElement() as import("puppeteer-core").ElementHandle<Element> | null;
+      if (rowEl) {
+        try {
+          await this.page.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center" }), rowEl);
+          await sleep(300);
+          await rowEl.click();
+          console.log("Clicked credit card row (native Puppeteer click)");
+          await sleep(1500);
+          expanded = await this.isAddCardLinkVisible();
+        } catch (e) {
+          console.log(`Row native click failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
+
+    // Strategy 4: Click the bold "Credit or debit card" text span itself
+    if (!expanded) {
+      const boldSpans = await this.page.$$('span.a-text-bold');
+      for (const boldHandle of boldSpans) {
+        const textContent = await this.page.evaluate(el => el.textContent || "", boldHandle);
+        if (textContent.includes("Credit or debit card")) {
+          await boldHandle.click();
+          console.log("Clicked bold text span (native)");
+          await sleep(1500);
+          expanded = await this.isAddCardLinkVisible();
+          break;
+        }
+      }
+    }
+
+    // Strategy 5: Force-unhide the hidden "Add a new card" section
+    if (!expanded) {
+      console.log("All click strategies failed to expand — force-unhiding the hidden section...");
+      await this.page.evaluate(() => {
+        // Find all hidden divs that contain "Add a new credit"
+        const hiddenDivs = document.querySelectorAll('.a-hidden, .aok-hidden, [style*="display: none"]');
+        for (const div of hiddenDivs) {
+          if ((div.textContent || "").includes("Add a new credit")) {
+            (div as HTMLElement).classList.remove("a-hidden", "aok-hidden");
+            (div as HTMLElement).style.display = "";
+          }
+        }
+        // Also try by ID pattern: pp-XXXXX-115
+        const innerDivs = document.querySelectorAll('div[id^="pp-"][id$="-115"]');
+        for (const div of innerDivs) {
+          if ((div.textContent || "").includes("Add a new credit")) {
+            (div as HTMLElement).classList.remove("a-hidden", "aok-hidden");
+            (div as HTMLElement).style.display = "";
+          }
+        }
+      });
+      await sleep(1000);
+      expanded = await this.isAddCardLinkVisible();
+      console.log(`After force-unhide, 'Add a new card' visible: ${expanded}`);
+    }
+
+    console.log(`Selected Credit or debit card (expanded: ${expanded})`);
+
+    // Now click "Add a new credit or debit card" link
+    console.log("Clicking 'Add a new credit or debit card'...");
     await waitWithRetry(
       this.page,
       async () => {
-        await this.page.waitForSelector(
-          "#apx-add-credit-card-action-test-id, .pmts-add-cc-default-trigger-link",
-          { visible: true, timeout: 10000 }
-        );
+        const visible = await this.isAddCardLinkVisible();
+        if (!visible) throw new Error("Add new card link not visible yet");
       },
-      { label: "Add new card link", timeoutMs: 10000, maxRetries: 3, isPaymentPage: this.isPaymentPage }
+      { label: "Add new card link", timeoutMs: 10000, maxRetries: 5, isPaymentPage: this.isPaymentPage }
     );
+    await sleep(300);
 
-    await this.page.evaluate(() => {
-      const link =
-        document.querySelector("#apx-add-credit-card-action-test-id") ||
-        document.querySelector(".pmts-add-cc-default-trigger-link");
-      if (link) (link as HTMLElement).click();
-    });
+    // Use native Puppeteer click on the link for real mouse events
+    let linkClicked = false;
+
+    // Try #apx-add-credit-card-action-test-id first
+    const triggerEl = await this.page.$("#apx-add-credit-card-action-test-id");
+    if (triggerEl) {
+      try {
+        await triggerEl.click();
+        linkClicked = true;
+        console.log("Clicked via #apx-add-credit-card-action-test-id (native)");
+      } catch { /* fall through */ }
+    }
+
+    // Try the link itself
+    if (!linkClicked) {
+      const linkEl = await this.page.$(".pmts-add-cc-default-trigger-link");
+      if (linkEl) {
+        try {
+          await linkEl.click();
+          linkClicked = true;
+          console.log("Clicked via .pmts-add-cc-default-trigger-link (native)");
+        } catch { /* fall through */ }
+      }
+    }
+
+    // Fallback: find visible link by text with native click
+    if (!linkClicked) {
+      const linkHandle = await this.page.evaluateHandle(() => {
+        const links = document.querySelectorAll('a[href="#"]');
+        for (const el of links) {
+          if ((el.textContent || "").toLowerCase().includes("add a new credit") &&
+              (el as HTMLElement).offsetWidth > 0) {
+            return el as HTMLElement;
+          }
+        }
+        return null;
+      });
+      const el = linkHandle.asElement() as import("puppeteer-core").ElementHandle<Element> | null;
+      if (el) {
+        await el.click();
+        linkClicked = true;
+        console.log("Clicked 'Add a new card' link by text (native)");
+      }
+    }
+
+    // Last resort: evaluate click
+    if (!linkClicked) {
+      await this.page.evaluate(() => {
+        const trigger = document.getElementById("apx-add-credit-card-action-test-id");
+        if (trigger) { (trigger as HTMLElement).click(); return; }
+        const links = document.querySelectorAll('a');
+        for (const el of links) {
+          if ((el.textContent || "").toLowerCase().includes("add a new credit")) {
+            el.click();
+            return;
+          }
+        }
+      });
+      console.log("Clicked 'Add a new card' via evaluate fallback");
+    }
 
     console.log("Clicked Add a new card");
     await sleep(500);
+  }
+
+  /** Check if the "Add a new credit or debit card" link is visible on page */
+  private async isAddCardLinkVisible(): Promise<boolean> {
+    return await this.page.evaluate(() => {
+      // Check #apx-add-credit-card-action-test-id
+      const trigger = document.getElementById("apx-add-credit-card-action-test-id");
+      if (trigger && (trigger as HTMLElement).offsetWidth > 0 && (trigger as HTMLElement).offsetHeight > 0) {
+        return true;
+      }
+      // Check links with "Add a new credit" text
+      const links = document.querySelectorAll('a[href="#"]');
+      for (const el of links) {
+        if ((el.textContent || "").toLowerCase().includes("add a new credit") &&
+            (el as HTMLElement).offsetWidth > 0 && (el as HTMLElement).offsetHeight > 0) {
+          return true;
+        }
+      }
+      return false;
+    });
   }
 
   private async amazonFillCard(details: CardDetails): Promise<void> {
@@ -406,170 +585,264 @@ export class CardPayment extends BasePayment {
 
     console.log(`Parsed expiry: month=${expiryMonth}, year=${expiryYear}`);
 
-    // ── Step 1: Enter card number ──
-    // <input type="tel" name="addCreditCardNumber" class="a-input-text a-form-normal pmts-account-Number">
-    console.log("Entering card number...");
-    const cardSel = "input.pmts-account-Number";
+    // Step 0 & 1 are now handled by amazonSelectCard() which is called before fillDetails().
+    // Verify the card form is ready by checking if "Add a new card" was already clicked.
+    const addCardVisible = await this.isAddCardLinkVisible();
+    if (addCardVisible) {
+      // The link is still visible meaning it wasn't clicked yet — click it now as a safety net
+      console.log("[amazonFillCard] 'Add a new card' link still visible — clicking it...");
+      const triggerEl = await this.page.$("#apx-add-credit-card-action-test-id");
+      if (triggerEl) {
+        await triggerEl.click();
+      } else {
+        const linkEl = await this.page.$(".pmts-add-cc-default-trigger-link");
+        if (linkEl) await linkEl.click();
+      }
+      await sleep(2000);
+    }
+
+    // ── Step 2: Find the card number input (may be in an iframe) ──
+    console.log("Looking for card number input...");
+    const cardSel = 'input[type="tel"][name="addCreditCardNumber"]';
+
+    // Debug: list all frames
+    const allFrames = this.page.frames();
+    console.log(`[amazonFillCard] Total frames: ${allFrames.length}`);
+    for (let i = 0; i < allFrames.length; i++) {
+      const f = allFrames[i];
+      console.log(`[amazonFillCard] Frame ${i}: url=${f.url().substring(0, 80)} name=${f.name()}`);
+    }
+
+    // Wait for card input to appear in any frame
+    const cardResult: { el: import("puppeteer-core").ElementHandle | null; frame: import("puppeteer-core").Frame | null } = { el: null, frame: null };
+
     await waitWithRetry(
       this.page,
       async () => {
-        await this.page.waitForSelector(cardSel, {
-          visible: true,
-          timeout: 10000,
-        });
+        // Try main page
+        const found = await this.page.$(cardSel);
+        if (found) { cardResult.el = found; cardResult.frame = this.page.mainFrame(); return; }
+        // Try each frame
+        for (const frame of allFrames) {
+          try {
+            const fEl = await frame.$(cardSel);
+            if (fEl) { cardResult.el = fEl; cardResult.frame = frame; return; }
+          } catch {
+            // Frame not accessible, skip
+          }
+        }
+        // Fallback: id-based selector
+        for (const frame of allFrames) {
+          try {
+            const fEl = await frame.$('input[id^="pp-"][type="tel"]');
+            if (fEl) { cardResult.el = fEl; cardResult.frame = frame; return; }
+          } catch {
+            // skip
+          }
+        }
+        // Fallback: just the name attribute (type may not always be "tel")
+        for (const frame of allFrames) {
+          try {
+            const fEl = await frame.$('input[name="addCreditCardNumber"]');
+            if (fEl) { cardResult.el = fEl; cardResult.frame = frame; return; }
+          } catch {
+            // skip
+          }
+        }
+        throw new Error("Card input not found yet");
       },
-      { label: "Card number input", timeoutMs: 10000, maxRetries: 5, isPaymentPage: this.isPaymentPage }
+      { label: "Card number input", timeoutMs: 15000, maxRetries: 10, isPaymentPage: this.isPaymentPage }
     );
-    await sleep(300); // extra wait for the input to become interactive
+
+    if (!cardResult.el || !cardResult.frame) {
+      throw new Error("Card input not found after waiting — check debug logs");
+    }
+
+    const cardInput = cardResult.el;
+    const cardFrame = cardResult.frame;
+    console.log(`[amazonFillCard] Card input found in frame: ${cardFrame.url().substring(0, 80)}`);
+    await sleep(300);
 
     const cleanCardNumber = details.cardNumber.replace(/\s/g, "");
 
-    // Method 1: Puppeteer's page.type() — clicks the element and types
+    // Helper: verify card value via the correct frame
+    const getCardValue = async (): Promise<string> => {
+      return await cardFrame.evaluate(() => {
+        // Try name-only selector — more stable than type+name combo
+        const el = (
+          document.querySelector('input[name="addCreditCardNumber"]') ||
+          document.querySelector('input[type="tel"][name="addCreditCardNumber"]')
+        ) as HTMLInputElement | null;
+        return el?.value || "";
+      });
+    };
+
+    // Method 1: Click the element, then type via frame context
     try {
-      await this.page.click(cardSel);
-      await sleep(100);
-      await this.page.type(cardSel, cleanCardNumber, { delay: 100 });
+      await cardInput.click();
+      await sleep(150);
+      await cardFrame.evaluate((val: string) => {
+        const el = document.querySelector('input[type="tel"][name="addCreditCardNumber"]') as HTMLInputElement | null;
+        if (!el) return;
+        el.focus();
+        el.select();
+        el.value = val;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      }, cleanCardNumber);
       await sleep(100);
     } catch (e) {
-      console.log(`page.type failed: ${e instanceof Error ? e.message : e}`);
+      console.log(`Method 1 failed: ${e instanceof Error ? e.message : String(e)}`);
     }
 
-    // Check if value was entered
-    let enteredValue = await this.page.evaluate((sel: string) => {
-      const el = document.querySelector(sel) as HTMLInputElement;
-      return el?.value || "";
-    }, cardSel);
-    console.log(`After page.type: card value = "${enteredValue}"`);
+    let enteredValue = await getCardValue();
+    console.log(`After method 1: card value = "${enteredValue}"`);
 
-    // Method 2: If empty, try keyboard.type on focused element
+    // Method 2: If empty, triple-click to select all, then keyboard.type
     if (!enteredValue) {
-      console.log("Method 1 failed, trying keyboard.type...");
-      await this.page.evaluate((sel: string) => {
-        const el = document.querySelector(sel) as HTMLInputElement;
-        if (el) { el.scrollIntoView({ block: "center" }); el.focus(); el.click(); }
-      }, cardSel);
-      await sleep(100);
-      await this.page.keyboard.type(cleanCardNumber, { delay: 100 });
-      await sleep(100);
-
-      enteredValue = await this.page.evaluate((sel: string) => {
-        const el = document.querySelector(sel) as HTMLInputElement;
-        return el?.value || "";
-      }, cardSel);
-      console.log(`After keyboard.type: card value = "${enteredValue}"`);
+      console.log("Method 1 failed, trying method 2 (triple-click + keyboard.type)...");
+      try {
+        await cardInput.click({ clickCount: 3 });
+        await sleep(150);
+        await this.page.keyboard.type(cleanCardNumber, { delay: 80 });
+        await sleep(100);
+      } catch (e) {
+        console.log(`Method 2 failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      enteredValue = await getCardValue();
+      console.log(`After method 2: card value = "${enteredValue}"`);
     }
 
-    // Method 3: If still empty, force via JS native setter
+    // Method 3: If still empty, force via JS native setter within the frame
     if (!enteredValue) {
-      console.log("Method 2 failed, forcing via JS native setter...");
-      await this.page.evaluate((sel: string, val: string) => {
-        const el = document.querySelector(sel) as HTMLInputElement;
-        if (el) {
+      console.log("Method 2 failed, forcing via JS native setter in frame...");
+      try {
+        await cardFrame.evaluate((val: string) => {
+          const el = document.querySelector('input[type="tel"][name="addCreditCardNumber"]') as HTMLInputElement | null;
+          if (!el) return;
           el.focus();
-          // Use native setter to bypass React/framework interception
-          const setter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, "value"
-          )?.set;
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
           setter?.call(el, val);
           el.dispatchEvent(new Event("input", { bubbles: true }));
           el.dispatchEvent(new Event("change", { bubbles: true }));
           el.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true }));
           el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
-        }
-      }, cardSel, cleanCardNumber);
-      await sleep(200);
-
-      enteredValue = await this.page.evaluate((sel: string) => {
-        const el = document.querySelector(sel) as HTMLInputElement;
-        return el?.value || "";
-      }, cardSel);
-      console.log(`After JS setter: card value = "${enteredValue}"`);
+        }, cleanCardNumber);
+        await sleep(200);
+      } catch (e) {
+        console.log(`Method 3 failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      enteredValue = await getCardValue();
+      console.log(`After method 3: card value = "${enteredValue}"`);
     }
 
-    // Method 4: If STILL empty, try direct assignment
+    // Method 4: If STILL empty, direct value assignment in frame
     if (!enteredValue) {
-      console.log("Method 3 failed, trying direct value assignment...");
-      await this.page.evaluate((sel: string, val: string) => {
-        const el = document.querySelector(sel) as HTMLInputElement;
-        if (el) {
+      console.log("Method 3 failed, trying method 4 (direct assignment in frame)...");
+      try {
+        await cardFrame.evaluate((val: string) => {
+          const el = document.querySelector('input[type="tel"][name="addCreditCardNumber"]') as HTMLInputElement | null;
+          if (!el) return;
           el.value = val;
           ["input", "change", "keydown", "keypress", "keyup"].forEach(evt => {
             el.dispatchEvent(new Event(evt, { bubbles: true }));
           });
-        }
-      }, cardSel, cleanCardNumber);
-      await sleep(200);
-
-      enteredValue = await this.page.evaluate((sel: string) => {
-        const el = document.querySelector(sel) as HTMLInputElement;
-        return el?.value || "";
-      }, cardSel);
-      console.log(`After direct assignment: card value = "${enteredValue}"`);
+        }, cleanCardNumber);
+        await sleep(200);
+      } catch (e) {
+        console.log(`Method 4 failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      enteredValue = await getCardValue();
+      console.log(`After method 4: card value = "${enteredValue}"`);
     }
 
     if (!enteredValue) {
-      // Log debug info
-      const debugInfo = await this.page.evaluate((sel: string) => {
-        const el = document.querySelector(sel) as HTMLInputElement;
-        if (!el) return "ELEMENT NOT FOUND";
-        return JSON.stringify({
-          tagName: el.tagName,
-          type: el.type,
-          name: el.name,
-          id: el.id,
-          className: el.className,
-          disabled: el.disabled,
-          readOnly: el.readOnly,
-          hidden: el.hidden,
-          offsetWidth: el.offsetWidth,
-          offsetHeight: el.offsetHeight,
+      // Log all inputs visible in the frame for debugging
+      try {
+        const frameDebug = await cardFrame.evaluate(() => {
+          return Array.from(document.querySelectorAll("input")).slice(0, 15).map(el => ({
+            type: el.type,
+            name: el.name,
+            id: el.id,
+            placeholder: el.placeholder,
+            maxLength: el.maxLength,
+            className: el.className,
+            visible: el.offsetWidth > 0 && el.offsetHeight > 0,
+          }));
         });
-      }, cardSel);
-      console.log(`Card input debug: ${debugInfo}`);
+        console.log(`[amazonFillCard] Inputs in frame: ${JSON.stringify(frameDebug)}`);
+      } catch {
+        // ignore
+      }
       throw new Error("Failed to enter card number after all methods");
     }
 
     console.log(`Card number entered successfully: ${enteredValue.length} chars`);
 
-    // ── Step 2: Select expiry month ──
+    // ── Step 4: Select expiry month ──
     // Find all dropdown triggers near the card form
     // Month is the first .a-button-dropdown, year is the second
     console.log(`Selecting expiry month: ${expiryMonth}...`);
     await this.selectAmazonExpiryDropdown(0, expiryMonth);
     await sleep(100);
 
-    // ── Step 3: Select expiry year ──
+    // ── Step 5: Select expiry year ──
     console.log(`Selecting expiry year: ${expiryYear}...`);
     await this.selectAmazonExpiryDropdown(1, expiryYear);
     await sleep(100);
 
-    // ── Step 4: Click Continue ──
+    // ── Step 6: Click Continue ──
+    // <input name="ppw-widgetEvent:AddCreditCardEvent" class="a-button-input" type="submit">
     console.log("Clicking Continue...");
-    const continueBtn = await this.page.$(
-      'input[name="ppw-widgetEvent:AddCreditCardEvent"]'
-    );
-    if (continueBtn) {
-      await continueBtn.click();
-    } else {
-      // Fallback: find by text
-      await this.page.evaluate(() => {
-        const spans = Array.from(document.querySelectorAll("span.a-button-text"));
-        for (const span of spans) {
-          if (span.textContent?.trim() === "Continue") {
-            const input = span
-              .closest(".a-button")
-              ?.querySelector("input") as HTMLElement;
-            if (input) { input.click(); return; }
-            (span as HTMLElement).click();
-            return;
-          }
+    await waitWithRetry(
+      this.page,
+      async () => {
+        // Search all frames for the Continue button
+        for (const frame of allFrames) {
+          try {
+            const btn = await frame.$('input[name="ppw-widgetEvent:AddCreditCardEvent"]');
+            if (btn) return;
+          } catch { /* skip */ }
         }
-      });
+        // Also check main page
+        const mainBtn = await this.page.$('input[name="ppw-widgetEvent:AddCreditCardEvent"]');
+        if (mainBtn) return;
+        throw new Error("Continue button not found");
+      },
+      { label: "Continue button", timeoutMs: 10000, maxRetries: 3, isPaymentPage: this.isPaymentPage }
+    );
+    await sleep(300);
+    const continueClicked = await this.page.evaluate(() => {
+      const inputs = document.querySelectorAll('input[name="ppw-widgetEvent:AddCreditCardEvent"]');
+      for (const input of inputs) {
+        if ((input as HTMLInputElement).disabled) continue;
+        (input as HTMLInputElement).click();
+        return true;
+      }
+      return false;
+    });
+    if (continueClicked) {
+      console.log("Clicked Continue");
+    } else {
+      // Fallback: try in frames
+      for (const frame of allFrames) {
+        try {
+          const clicked = await frame.evaluate(() => {
+            const inputs = document.querySelectorAll('input[name="ppw-widgetEvent:AddCreditCardEvent"]');
+            for (const input of inputs) {
+              if ((input as HTMLInputElement).disabled) continue;
+              (input as HTMLInputElement).click();
+              return true;
+            }
+            return false;
+          });
+          if (clicked) { console.log("Clicked Continue (from frame)"); break; }
+        } catch { /* skip */ }
+      }
     }
-    console.log("Clicked Continue");
     await sleep(100);
 
-    // ── Step 5: Enter CVV ──
+    // ── Step 7: Enter CVV ──
     console.log("Entering CVV...");
     await this.amazonEnterCVV(details.cvv);
     await sleep(100);
@@ -583,85 +856,135 @@ export class CardPayment extends BasePayment {
     dropdownIndex: number,
     value: string
   ): Promise<void> {
-    // Find all .a-button-dropdown elements inside the card form area
-    // The card form has exactly 2 dropdowns: month (0) and year (1)
-    const dropdowns = await this.page.$$('.a-button-dropdown');
+    const allFrames = this.page.frames();
+    let targetDropdowns: import("puppeteer-core").ElementHandle[] = [];
+    let targetFrame: import("puppeteer-core").Frame | null = null;
 
-    // Filter to only dropdowns near the card number input
-    // by checking which ones are inside the add-card section
-    let targetDropdowns = await this.page.$$(
-      '.pmts-add-credit-card-component-container .a-button-dropdown'
-    );
+    // Search in each frame
+    for (const frame of allFrames) {
+      try {
+        const containers = await frame.$$('.pmts-add-credit-card-component-container .a-button-dropdown');
+        if (containers.length > 0) {
+          targetDropdowns = containers;
+          targetFrame = frame;
+          console.log(`[expiryDropdown] Found ${containers.length} dropdowns in frame: ${frame.url().substring(0, 80)}`);
+          break;
+        }
+      } catch {
+        // skip inaccessible frame
+      }
+    }
 
-    // If no dropdowns found in the container, try broader search
+    // Fallback: search all .a-button-dropdown in all frames
     if (targetDropdowns.length === 0) {
-      // Get dropdowns that have a-dropdown-prompt inside (expiry dropdowns)
-      const filtered = [];
-      for (const dd of dropdowns) {
-        const prompt = await dd.$('.a-dropdown-prompt');
-        if (prompt) {
-          const text = await this.page.evaluate(
-            (el: Element) => el.textContent?.trim() || "",
-            prompt
-          );
-          // Month shows 01-12, year shows 20XX
-          if (/^\d{1,2}$/.test(text) || /^\d{4}$/.test(text)) {
-            filtered.push(dd);
+      for (const frame of allFrames) {
+        try {
+          const dropdowns = await frame.$$('.a-button-dropdown');
+          const filtered = [];
+          for (const dd of dropdowns) {
+            const prompt = await dd.$('.a-dropdown-prompt');
+            if (prompt) {
+              const text = await frame.evaluate((el: Element) => el.textContent?.trim() || "", prompt);
+              if (/^\d{1,2}$/.test(text) || /^\d{4}$/.test(text)) {
+                filtered.push(dd);
+              }
+            }
           }
+          if (filtered.length > 0) {
+            targetDropdowns = filtered;
+            targetFrame = frame;
+            console.log(`[expiryDropdown] Found ${filtered.length} expiry dropdowns in frame: ${frame.url().substring(0, 80)}`);
+            break;
+          }
+        } catch {
+          // skip
         }
       }
-      targetDropdowns = filtered;
     }
 
-    console.log(`Found ${targetDropdowns.length} expiry dropdowns, clicking index ${dropdownIndex}`);
-
-    if (!targetDropdowns[dropdownIndex]) {
-      throw new Error(
-        `Expiry dropdown index ${dropdownIndex} not found (found ${targetDropdowns.length} dropdowns)`
-      );
+    // If still nothing, search main page
+    if (targetDropdowns.length === 0) {
+      const containers = await this.page.$$('.pmts-add-credit-card-component-container .a-button-dropdown');
+      if (containers.length > 0) {
+        targetDropdowns = containers;
+        targetFrame = this.page.mainFrame();
+      } else {
+        const dropdowns = await this.page.$$('.a-button-dropdown');
+        for (const dd of dropdowns) {
+          const prompt = await dd.$('.a-dropdown-prompt');
+          if (prompt) {
+            const text = await this.page.evaluate((el: Element) => el.textContent?.trim() || "", prompt);
+            if (/^\d{1,2}$/.test(text) || /^\d{4}$/.test(text)) {
+              targetDropdowns.push(dd);
+            }
+          }
+        }
+        targetFrame = this.page.mainFrame();
+      }
     }
 
-    // Click the dropdown trigger using Puppeteer's native click
+    console.log(`[expiryDropdown] Found ${targetDropdowns.length} expiry dropdowns, clicking index ${dropdownIndex}`);
+
+    if (!targetDropdowns[dropdownIndex] || !targetFrame) {
+      throw new Error(`Expiry dropdown index ${dropdownIndex} not found (found ${targetDropdowns.length} dropdowns)`);
+    }
+
     await targetDropdowns[dropdownIndex].click();
     await sleep(300);
 
     // Wait for the dropdown popup to appear
+    const frameUrl = targetFrame.url().substring(0, 80);
     await waitWithRetry(
       this.page,
       async () => {
-        await this.page.waitForSelector(".a-popover-wrapper .a-dropdown-item", {
-          visible: true,
-          timeout: 5000,
-        });
+        // Check both main page and the target frame
+        const mainItems = await this.page.$$(".a-popover-wrapper .a-dropdown-item");
+        if (mainItems.length > 0) { targetFrame = this.page.mainFrame(); return; }
+        for (const frame of allFrames) {
+          try {
+            const items = await frame.$$(".a-popover-wrapper .a-dropdown-item");
+            if (items.length > 0) { targetFrame = frame; return; }
+          } catch { /* skip */ }
+        }
+        throw new Error("Dropdown items not visible");
       },
       { label: `Expiry dropdown ${value}`, timeoutMs: 5000, maxRetries: 3, isPaymentPage: this.isPaymentPage }
     );
     await sleep(100);
 
-    // Click the matching option using Puppeteer's native click
-    const items = await this.page.$$(".a-popover-wrapper .a-dropdown-item");
+    // Click the matching option
     let clicked = false;
+    const framesToCheck = [targetFrame, ...allFrames.filter(f => f !== targetFrame)];
 
-    for (const item of items) {
-      const text = await this.page.evaluate(
-        (el: Element) => el.textContent?.trim() || "",
-        item
-      );
-      if (text === value) {
-        await item.click();
-        clicked = true;
-        console.log(`Selected expiry value: ${value}`);
-        break;
-      }
+    for (const frame of framesToCheck) {
+      try {
+        const items = await frame.$$(".a-popover-wrapper .a-dropdown-item");
+        for (const item of items) {
+          const text = await frame.evaluate((el: Element) => el.textContent?.trim() || "", item);
+          if (text === value) {
+            await item.click();
+            clicked = true;
+            console.log(`[expiryDropdown] Selected ${value}`);
+            break;
+          }
+        }
+        if (clicked) break;
+      } catch { /* skip */ }
     }
 
     if (!clicked) {
-      // Log what options are available
-      const available = await this.page.evaluate(() => {
-        const els = document.querySelectorAll(".a-popover-wrapper .a-dropdown-item");
-        return Array.from(els).map(el => el.textContent?.trim() || "");
-      });
-      console.log(`Available options: ${JSON.stringify(available)}`);
+      // Log available options
+      const available: string[] = [];
+      for (const frame of framesToCheck) {
+        try {
+          const items = await frame.$$(".a-popover-wrapper .a-dropdown-item");
+          for (const item of items) {
+            const text = await frame.evaluate((el: Element) => el.textContent?.trim() || "", item);
+            available.push(text);
+          }
+        } catch { /* skip */ }
+      }
+      console.log(`[expiryDropdown] Available options: ${JSON.stringify(available)}`);
       throw new Error(`Could not find expiry dropdown option: ${value}`);
     }
 
@@ -681,15 +1004,26 @@ export class CardPayment extends BasePayment {
 
     // Second try: CVV field inside an iframe
     const frames = this.page.frames();
+    const cvvSelectors = [
+      ".card-cvv",
+      "input[type='tel'][maxlength='4']",
+      "input[type='tel'][maxlength='3']",
+      'input[id^="pp-"][type="tel"]',
+      "input[name*='cvv']",
+      "input[name*='CVV']",
+      "input[autocomplete*='cc-csc']",
+    ];
     for (const frame of frames) {
       try {
-        const cvvField = await frame.$(".card-cvv, input[type='tel'][maxlength='4']");
-        if (cvvField) {
-          await cvvField.click();
-          await sleep(100);
-          await cvvField.type(cvv, { delay: 50 });
-          console.log("Entered CVV in iframe");
-          return;
+        for (const sel of cvvSelectors) {
+          const cvvField = await frame.$(sel);
+          if (cvvField) {
+            await cvvField.click();
+            await sleep(100);
+            await cvvField.type(cvv, { delay: 50 });
+            console.log(`[amazonEnterCVV] Entered CVV in frame (selector: ${sel})`);
+            return;
+          }
         }
       } catch {
         // Frame not accessible, skip
@@ -703,8 +1037,12 @@ export class CardPayment extends BasePayment {
         // Check all frames again
         const allFrames = this.page.frames();
         for (const f of allFrames) {
-          const field = await f.$(".card-cvv, input[type='tel'][maxlength='4']");
-          if (field) return;
+          for (const sel of cvvSelectors) {
+            try {
+              const field = await f.$(sel);
+              if (field) return;
+            } catch { /* skip */ }
+          }
         }
         throw new Error("CVV field not found in any frame");
       },
@@ -715,17 +1053,32 @@ export class CardPayment extends BasePayment {
     const retryFrames = this.page.frames();
     for (const frame of retryFrames) {
       try {
-        const cvvField = await frame.$(".card-cvv, input[type='tel'][maxlength='4']");
-        if (cvvField) {
-          await cvvField.click();
-          await sleep(100);
-          await cvvField.type(cvv, { delay: 50 });
-          console.log("Entered CVV in iframe (after retry)");
-          return;
+        for (const sel of cvvSelectors) {
+          const cvvField = await frame.$(sel);
+          if (cvvField) {
+            await cvvField.click();
+            await sleep(100);
+            await cvvField.type(cvv, { delay: 50 });
+            console.log(`[amazonEnterCVV] Entered CVV in frame after retry (selector: ${sel})`);
+            return;
+          }
         }
       } catch {
         // Skip
       }
+    }
+
+    // Log all inputs in all frames for debugging
+    for (let i = 0; i < retryFrames.length; i++) {
+      try {
+        const inputs = await retryFrames[i].evaluate(() => {
+          return Array.from(document.querySelectorAll("input")).slice(0, 10).map(el => ({
+            type: el.type, name: el.name, id: el.id,
+            maxLength: el.maxLength, autocomplete: el.autocomplete,
+          }));
+        });
+        console.log(`[amazonEnterCVV] Inputs in frame ${i}: ${JSON.stringify(inputs)}`);
+      } catch { /* skip */ }
     }
 
     throw new Error("Could not find CVV field on Amazon payment page");

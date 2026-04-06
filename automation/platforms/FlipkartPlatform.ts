@@ -494,7 +494,9 @@ export class FlipkartPlatform extends BasePlatform {
       async () => {
         await this.page.waitForFunction(
           () => {
-            // Check for SVG cart icon
+            // Check for SVG cart icon (by clipPath id)
+            if (document.querySelector('clipPath[id*="AddToCart"]')) return true;
+            // Check for SVG cart icon (by path d)
             const allPaths = document.querySelectorAll("path");
             for (const p of allPaths) {
               if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) return true;
@@ -517,61 +519,11 @@ export class FlipkartPlatform extends BasePlatform {
     );
 
     // Step 1: Find the button coordinates — try all known patterns
+    // Priority: SVG cart icon (most specific) → text-based → gradient (least specific)
     const btnCoords = await this.page.evaluate(() => {
       const logs: string[] = [];
 
-      // --- Pattern 1: Text-based "Add to Cart" / "Add to Bag" ---
-      const labels = document.querySelectorAll("div.css-146c3p1");
-      for (const label of labels) {
-        const text = label.textContent?.trim().toLowerCase();
-        if (text === "add to cart" || text === "add to bag") {
-          logs.push(`Found text button: "${label.textContent?.trim()}"`);
-          // Walk up to the outermost pressable container (usually has role or cursor style)
-          let best: HTMLElement = label as HTMLElement;
-          let el: HTMLElement | null = label as HTMLElement;
-          while (el && el !== document.body) {
-            const style = el.getAttribute("style") || "";
-            if (style.includes("cursor") || el.getAttribute("role") === "button") {
-              best = el;
-            }
-            // Stop at the bottom bar container (typically very wide)
-            if (el.getBoundingClientRect().width > 300) break;
-            el = el.parentElement;
-          }
-          best.scrollIntoView({ block: "center" });
-          const rect = best.getBoundingClientRect();
-          logs.push(`Text button at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "text", logs };
-        }
-      }
-
-      // --- Pattern 2: White gradient button (border-radius: 12px) ---
-      const gradientContainers = document.querySelectorAll('div.css-g5y9jx[style*="border-radius: 12px"]');
-      for (const gc of gradientContainers) {
-        // Check it has a white gradient child
-        const gradChild = gc.querySelector('div[style*="linear-gradient"]');
-        if (gradChild) {
-          logs.push("Found white gradient button (border-radius: 12px)");
-          // The pressable container is a parent of this overlay
-          let pressable: HTMLElement = gc.parentElement || gc as HTMLElement;
-          // Walk up to find the container with cursor/role
-          let el: HTMLElement | null = gc as HTMLElement;
-          while (el && el !== document.body) {
-            const style = el.getAttribute("style") || "";
-            if (style.includes("cursor") || el.getAttribute("role") === "button") {
-              pressable = el;
-            }
-            if (el.getBoundingClientRect().width > 300) break;
-            el = el.parentElement;
-          }
-          pressable.scrollIntoView({ block: "center" });
-          const rect = pressable.getBoundingClientRect();
-          logs.push(`Gradient button at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "gradient", logs };
-        }
-      }
-
-      // --- Pattern 3: SVG cart icon (by AddToCart clipPath id) ---
+      // --- Pattern 1: SVG cart icon (by AddToCart clipPath id) — most reliable ---
       const addToCartClip = document.querySelector('clipPath[id*="AddToCart"]');
       if (addToCartClip) {
         logs.push("Found SVG with AddToCart clipPath id");
@@ -596,7 +548,7 @@ export class FlipkartPlatform extends BasePlatform {
         return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "svg-clip", logs };
       }
 
-      // --- Pattern 4: SVG cart icon (by path d attribute) ---
+      // --- Pattern 2: SVG cart icon (by path d attribute) ---
       const allPaths = document.querySelectorAll("path");
       for (const p of allPaths) {
         if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) {
@@ -619,6 +571,57 @@ export class FlipkartPlatform extends BasePlatform {
           const rect = best.getBoundingClientRect();
           logs.push(`SVG path button at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
           return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "svg", logs };
+        }
+      }
+
+      // --- Pattern 3: Text-based "Add to Cart" / "Add to Bag" ---
+      const labels = document.querySelectorAll("div.css-146c3p1");
+      for (const label of labels) {
+        const text = label.textContent?.trim().toLowerCase();
+        if (text === "add to cart" || text === "add to bag") {
+          logs.push(`Found text button: "${label.textContent?.trim()}"`);
+          // Walk up to the outermost pressable container (usually has role or cursor style)
+          let best: HTMLElement = label as HTMLElement;
+          let el: HTMLElement | null = label as HTMLElement;
+          while (el && el !== document.body) {
+            const style = el.getAttribute("style") || "";
+            if (style.includes("cursor") || el.getAttribute("role") === "button") {
+              best = el;
+            }
+            // Stop at the bottom bar container (typically very wide)
+            if (el.getBoundingClientRect().width > 300) break;
+            el = el.parentElement;
+          }
+          best.scrollIntoView({ block: "center" });
+          const rect = best.getBoundingClientRect();
+          logs.push(`Text button at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "text", logs };
+        }
+      }
+
+      // --- Pattern 4: White gradient button (border-radius: 12px) — least specific, last resort ---
+      const gradientContainers = document.querySelectorAll('div.css-g5y9jx[style*="border-radius: 12px"]');
+      for (const gc of gradientContainers) {
+        // Check it has a white gradient child
+        const gradChild = gc.querySelector('div[style*="linear-gradient"]');
+        if (gradChild) {
+          logs.push("Found white gradient button (border-radius: 12px)");
+          // The pressable container is a parent of this overlay
+          let pressable: HTMLElement = gc.parentElement || gc as HTMLElement;
+          // Walk up to find the container with cursor/role
+          let el: HTMLElement | null = gc as HTMLElement;
+          while (el && el !== document.body) {
+            const style = el.getAttribute("style") || "";
+            if (style.includes("cursor") || el.getAttribute("role") === "button") {
+              pressable = el;
+            }
+            if (el.getBoundingClientRect().width > 300) break;
+            el = el.parentElement;
+          }
+          pressable.scrollIntoView({ block: "center" });
+          const rect = pressable.getBoundingClientRect();
+          logs.push(`Gradient button at (${rect.x.toFixed(0)}, ${rect.y.toFixed(0)}) ${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`);
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "gradient", logs };
         }
       }
 
@@ -720,94 +723,59 @@ export class FlipkartPlatform extends BasePlatform {
       const fiberResult = await this.page.evaluate(() => {
         if (typeof (globalThis as any).__name === "undefined") (globalThis as any).__name = (fn: any) => fn;
 
-        // Inline fiber handler search for a given start element
-        // Returns a string result or null
-        let handlerResult: string | null = null;
+        // Helper: walk up from element, find React fiber handler, invoke it
+        const invokeHandler = (startEl: HTMLElement): string | null => {
+          let el: HTMLElement | null = startEl;
+          while (el && el !== document.body) {
+            const fiberKey = Object.keys(el).find(k => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
+            if (fiberKey) {
+              let fiber = (el as any)[fiberKey];
+              let depth = 0;
+              while (fiber && depth < 30) {
+                const props = fiber.memoizedProps || fiber.pendingProps;
+                if (props) {
+                  const h = props.onPress || props.onClick || props.onPressIn;
+                  if (typeof h === "function") {
+                    try { h({ nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {} }); return "handler invoked"; } catch {}
+                  }
+                }
+                fiber = fiber.return;
+                depth++;
+              }
+            }
+            el = el.parentElement;
+          }
+          return null;
+        };
+
+        // Try SVG first (most specific to Add to Cart)
+        const allPaths = document.querySelectorAll("path");
+        for (const p of allPaths) {
+          if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) {
+            const result = invokeHandler(p as unknown as HTMLElement);
+            if (result) return "svg " + result;
+          }
+        }
 
         // Try text button
         const labels = document.querySelectorAll("div.css-146c3p1, div, span");
         for (const label of labels) {
           const text = label.textContent?.trim().toLowerCase();
           if (text === "add to cart" || text === "add to bag") {
-            let el: HTMLElement | null = label as HTMLElement;
-            while (el && el !== document.body) {
-              const fiberKey = Object.keys(el).find(k => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
-              if (fiberKey) {
-                let fiber = (el as any)[fiberKey];
-                let depth = 0;
-                while (fiber && depth < 30) {
-                  const props = fiber.memoizedProps || fiber.pendingProps;
-                  if (props) {
-                    const h = props.onPress || props.onClick || props.onPressIn;
-                    if (typeof h === "function") {
-                      try { h({ nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {} }); handlerResult = "text handler invoked"; } catch {}
-                    }
-                  }
-                  if (handlerResult) break;
-                  fiber = fiber.return;
-                  depth++;
-                }
-              }
-              if (handlerResult) break;
-              el = el.parentElement;
-            }
-            if (handlerResult) return handlerResult;
+            const result = invokeHandler(label as HTMLElement);
+            if (result) return "text " + result;
           }
         }
 
-        // Try gradient button
+        // Try gradient button (least specific — last resort)
         const gradientContainers = document.querySelectorAll('div[style*="border-radius"]');
         for (const gc of gradientContainers) {
           if (gc.querySelector('div[style*="linear-gradient"]')) {
-            let el: HTMLElement | null = gc as HTMLElement;
-            while (el && el !== document.body) {
-              const fiberKey = Object.keys(el).find(k => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
-              if (fiberKey) {
-                let fiber = (el as any)[fiberKey];
-                let depth = 0;
-                while (fiber && depth < 30) {
-                  const props = fiber.memoizedProps || fiber.pendingProps;
-                  if (props) {
-                    const h = props.onPress || props.onClick || props.onPressIn;
-                    if (typeof h === "function") {
-                      try { h({ nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {} }); return "gradient handler invoked"; } catch {}
-                    }
-                  }
-                  fiber = fiber.return;
-                  depth++;
-                }
-              }
-              el = el.parentElement;
-            }
+            const result = invokeHandler(gc as HTMLElement);
+            if (result) return "gradient " + result;
           }
         }
 
-        // Try SVG
-        const allPaths = document.querySelectorAll("path");
-        for (const p of allPaths) {
-          if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) {
-            let el: HTMLElement | null = p as unknown as HTMLElement;
-            while (el && el !== document.body) {
-              const fiberKey = Object.keys(el).find(k => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
-              if (fiberKey) {
-                let fiber = (el as any)[fiberKey];
-                let depth = 0;
-                while (fiber && depth < 30) {
-                  const props = fiber.memoizedProps || fiber.pendingProps;
-                  if (props) {
-                    const h = props.onPress || props.onClick || props.onPressIn;
-                    if (typeof h === "function") {
-                      try { h({ nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {} }); return "svg handler invoked"; } catch {}
-                    }
-                  }
-                  fiber = fiber.return;
-                  depth++;
-                }
-              }
-              el = el.parentElement;
-            }
-          }
-        }
         return "no handler found";
       });
       console.log(`React fiber fallback: ${fiberResult}`);
@@ -1582,52 +1550,101 @@ export class FlipkartPlatform extends BasePlatform {
     address: AddressDetails,
     expectedQty: number
   ): Promise<void> {
-    console.log(`Verifying order summary page...`);
+    const MAX_RETRIES = 3;
 
-    // Wait for any pending navigation to finish (Place Order / Buy Now triggers navigation)
-    try {
-      await this.page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
-    } catch { /* already navigated or no navigation pending */ }
+    for (let retry = 0; retry < MAX_RETRIES; retry++) {
+      console.log(`Verifying order summary page${retry > 0 ? ` (retry ${retry}/${MAX_RETRIES - 1})` : ""}...`);
 
-    // Wait for the page to be fully loaded (document.body must exist and have content)
-    let pageReady = false;
-    for (let i = 0; i < 40; i++) {
+      // Track which steps completed so retries resume from the failure point
+      let quantityDone = false;
+      let addressDone = false;
+      let gstDone = false;
+
       try {
-        const ready = await this.page.evaluate(() =>
-          document.body !== null && (document.body?.innerText || "").length > 100
-        );
-        if (ready) { pageReady = true; break; }
-      } catch { /* page still loading / context destroyed */ }
-      await sleep(500);
+        // Wait for any pending navigation to finish (Place Order / Buy Now triggers navigation)
+        try {
+          await this.page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
+        } catch { /* already navigated or no navigation pending */ }
+
+        // Wait for the page to be fully loaded (document.body must exist and have content)
+        let pageReady = false;
+        for (let i = 0; i < 40; i++) {
+          try {
+            const ready = await this.page.evaluate(() =>
+              document.body !== null && (document.body?.innerText || "").length > 100
+            );
+            if (ready) { pageReady = true; break; }
+          } catch { /* page still loading / context destroyed */ }
+          await sleep(500);
+        }
+
+        if (!pageReady) {
+          console.log("WARNING: Page did not fully load within 20s, attempting verification anyway");
+        }
+
+        await this.ensurePageValid();
+        const pageUrl = this.page.url();
+        console.log(`Order summary page URL: ${pageUrl}`);
+
+        // Step 1: Verify quantity on order summary
+        await this.verifyQuantityOnOrderSummary(expectedQty);
+        quantityDone = true;
+
+        // Step 2: Verify delivery address
+        await this.verifyDeliveryAddressOnSummary(address);
+        addressDone = true;
+
+        // Wait for address change to settle before verifying GST
+        console.log("Waiting for address to settle...");
+        await sleep(2000);
+        await this.ensurePageValid();
+        await sleep(500);
+
+        // Step 3: Verify GST invoice checkbox
+        await this.verifyGstCheckboxOnSummary(address);
+        gstDone = true;
+
+        // Step 4: Click Continue to proceed to checkout page
+        await this.clickContinueToCheckout();
+
+        console.log("Order summary verification complete");
+        return; // success — exit retry loop
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const completedSteps = [
+          quantityDone ? "quantity" : null,
+          addressDone ? "address" : null,
+          gstDone ? "GST" : null,
+        ].filter(Boolean).join(", ");
+        const failedStep = !quantityDone ? "quantity" : !addressDone ? "address" : !gstDone ? "GST" : "Continue";
+
+        console.log(`Order summary verification failed at step "${failedStep}" (completed: ${completedSteps || "none"}): ${errMsg}`);
+
+        if (retry < MAX_RETRIES - 1) {
+          console.log(`Refreshing page and retrying from "${failedStep}" step...`);
+          // Refresh the order summary page to get a clean state for the failed step
+          try {
+            await this.page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+          } catch { /* reload may timeout but page might still load */ }
+          await sleep(2000);
+
+          // Wait for page body to be ready after refresh
+          for (let i = 0; i < 20; i++) {
+            try {
+              const ready = await this.page.evaluate(() =>
+                document.body !== null && (document.body?.innerText || "").length > 100
+              );
+              if (ready) break;
+            } catch { /* context still loading */ }
+            await sleep(500);
+          }
+          await sleep(500);
+        } else {
+          // Final retry exhausted — re-throw
+          throw new Error(`Order summary verification failed after ${MAX_RETRIES} attempts at step "${failedStep}": ${errMsg}`);
+        }
+      }
     }
-
-    if (!pageReady) {
-      console.log("WARNING: Page did not fully load within 20s, attempting verification anyway");
-    }
-
-    await this.ensurePageValid();
-    const pageUrl = this.page.url();
-    console.log(`Order summary page URL: ${pageUrl}`);
-
-    // Step 1: Verify quantity on order summary
-    await this.verifyQuantityOnOrderSummary(expectedQty);
-
-    // Step 2: Verify delivery address
-    await this.verifyDeliveryAddressOnSummary(address);
-
-    // Wait for address change to settle before verifying GST
-    console.log("Waiting for address to settle...");
-    await sleep(2000);
-    await this.ensurePageValid();
-    await sleep(500);
-
-    // Step 3: Verify GST invoice checkbox
-    await this.verifyGstCheckboxOnSummary(address);
-
-    // Step 4: Click Continue to proceed to checkout page
-    await this.clickContinueToCheckout();
-
-    console.log("Order summary verification complete");
   }
 
   /**
