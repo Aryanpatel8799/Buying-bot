@@ -9,6 +9,9 @@ import { RTGSPayment } from "../payments/RTGSPayment";
 import { InstaDdrService } from "../services/InstaDdrService";
 import { sleep, sendMessage } from "./helpers";
 import type { JobConfig, ProductItem, CardDetails } from "../../src/types";
+import type { OrderDetails } from "../platforms/BasePlatform";
+import * as fs from "fs";
+import * as path from "path";
 
 interface InventoryCode {
   codeIndex: number;
@@ -35,8 +38,16 @@ export class BatchOrchestrator {
     private payment: BasePayment,
     private config: JobConfig
   ) {
-    // Determine if this is a multi-URL job
-    this.isMultiUrl = config.products && config.products.length > 1;
+    // Determine if this job should use cart flow:
+    // - Multiple product URLs (any platform), OR
+    // - Amazon with quantity > 1 for any product
+    const hasMultipleUrls = config.products && config.products.length > 1;
+    const isAmazon = platform instanceof AmazonPlatform;
+    const amazonMultiQty = isAmazon && (
+      config.products?.some(p => p.quantity > 1) ||
+      config.perOrderQuantity > 1
+    );
+    this.isMultiUrl = !!(hasMultipleUrls || amazonMultiQty);
 
     // Store cards for rotation
     if (config.cards && config.cards.length > 0) {
@@ -109,29 +120,10 @@ export class BatchOrchestrator {
       this.config.totalQuantity / this.config.perOrderQuantity
     );
 
-    const isRTGS = this.config.paymentMethod === "rtgs";
-
-    // For RTGS: ALWAYS use the multi-tab flow (new tab after each Place Order click).
-    // maxConcurrentTabs controls how many tabs to open per batch.
-    // Default: if user didn't set it, use totalIterations (one new tab per iteration).
-    let maxConcurrentTabs = this.config.maxConcurrentTabs ?? 1;
-    if (isRTGS) {
-      if (maxConcurrentTabs <= 1) {
-        // User didn't explicitly set tabs — default to totalIterations
-        maxConcurrentTabs = totalIterations;
-      }
-      // Ensure totalIterations >= maxConcurrentTabs
-      if (totalIterations < maxConcurrentTabs) {
-        totalIterations = maxConcurrentTabs;
-      }
-    }
-
     sendMessage({
       type: "log",
       level: "info",
-      message: isRTGS
-        ? `Starting RTGS flow: ${totalIterations} iterations, ${maxConcurrentTabs} tabs per batch (new tab after each Place Order)`
-        : this.isMultiUrl
+      message: this.isMultiUrl
         ? `Starting multi-URL batch: ${totalIterations} iterations, ${this.config.products.length} products`
         : `Starting batch: ${totalIterations} iterations (${this.config.totalQuantity} total qty, ${this.config.perOrderQuantity} per order)`,
     });
@@ -147,11 +139,6 @@ export class BatchOrchestrator {
         const msg = err instanceof Error ? err.message : String(err);
         sendMessage({ type: "log", level: "warn", message: `Logout at job start failed (continuing): ${msg}` });
       }
-    }
-
-    if (isRTGS) {
-      await this.runRTGSBatched(totalIterations, maxConcurrentTabs);
-      return;
     }
 
     let completed = 0;
@@ -291,6 +278,28 @@ export class BatchOrchestrator {
 
         if (success) {
           completed++;
+
+          // Extract order details and append to CSV
+          try {
+            const orderDetails = await this.platform.extractOrderDetails();
+            // Fill in data from config
+            const loginEmail = this.accounts?.[i % this.accounts.length] ||
+              this.instaDdrAccounts?.[i % this.instaDdrAccounts.length]?.email || "";
+            const totalQty = this.config.products?.reduce((sum, p) => sum + p.quantity, 0) ?? this.config.perOrderQuantity;
+            const pinCode = this.config.address?.checkoutPincode || this.config.address?.pincode || "";
+            const gstName = this.config.address?.companyName || "";
+
+            orderDetails.quantity = totalQty;
+            orderDetails.pinCode = pinCode;
+            if (orderDetails.amount && totalQty > 0) {
+              orderDetails.perPc = String(Math.round(Number(orderDetails.amount) / totalQty));
+            }
+
+            this.appendOrderToCsv(orderDetails, loginEmail, gstName);
+          } catch (csvErr) {
+            console.log(`CSV export warning: ${csvErr instanceof Error ? csvErr.message : csvErr}`);
+          }
+
           sendMessage({
             type: "progress",
             iteration: i + 1,
@@ -556,19 +565,21 @@ export class BatchOrchestrator {
           }
 
           try {
-            const productUrl = this.getProductUrlForIteration(iterNum);
+            // Use first product URL as initial platform URL — addAllProductsAndCheckout
+            // handles per-product URL switching via setProductUrl for multi-URL
+            const initialUrl = this.config.products?.[0]?.url ?? this.config.productUrl;
 
             // Create fresh platform + payment instances for this attempt
             const tabPlatform =
               this.platform instanceof FlipkartPlatform
-                ? new FlipkartPlatform(tabPage, productUrl)
-                : new AmazonPlatform(tabPage, productUrl);
+                ? new FlipkartPlatform(tabPage, initialUrl)
+                : new AmazonPlatform(tabPage, initialUrl);
             const tabPayment = this.createPaymentForTab(tabPage);
 
             sendMessage({
               type: "log",
               level: "info",
-              message: `Tab ${tabIndex + 1}: running full RTGS flow for product: ${productUrl}${attempt > 0 ? ` [attempt ${attempt + 1}]` : ""}`,
+              message: `Tab ${tabIndex + 1}: running full RTGS flow (${this.config.products?.length ?? 1} product(s))${attempt > 0 ? ` [attempt ${attempt + 1}]` : ""}`,
             });
 
             // Run the FULL purchase flow on this tab:
@@ -815,19 +826,6 @@ export class BatchOrchestrator {
   }
 
   /**
-   * Returns the product URL for a given iteration number.
-   * Multi-URL: cycles through the products array (one per iteration).
-   * Single-URL: returns the configured productUrl.
-   */
-  private getProductUrlForIteration(iterationNum: number): string {
-    if (this.config.products && this.config.products.length > 0) {
-      const index = (iterationNum - 1) % this.config.products.length;
-      return this.config.products[index].url;
-    }
-    return this.config.productUrl;
-  }
-
-  /**
    * Creates a fresh payment instance for a given tab page.
    */
   private createPaymentForTab(tabPage: Page): BasePayment {
@@ -844,108 +842,20 @@ export class BatchOrchestrator {
   }
 
   /**
-   * Runs the purchase flow for a single RTGS tab iteration:
-   * navigate → add to cart → set quantity → go to cart → place order → verify order summary → select RTGS.
-   * Does NOT wait for bank auth — that's handled by the caller in runRTGSBatched.
+   * Shared cart flow used by BOTH Card and RTGS multi-URL iterations.
+   * Adds all products to cart → goes to cart → sets quantities → places order →
+   * waits for navigation → verifies address/GST → clicks Continue to reach payment page.
+   *
+   * After this method returns, the page is on the payment page ready for payment selection.
    */
-  private async runRTGSTabIteration(
-    tabPage: Page,
-    tabPlatform: BasePlatform,
-    tabPayment: BasePayment,
+  private async addAllProductsAndCheckout(
+    page: Page,
+    platform: BasePlatform,
     iterationNum: number
   ): Promise<void> {
-    const qty =
-      this.config.products?.length === 1
-        ? this.config.products[0].quantity
-        : this.config.perOrderQuantity;
-
-    // Navigate to product
-    await tabPlatform.navigateToProduct();
-
-    // Add to cart
-    await tabPlatform.addToCart();
-
-    // Set quantity (platform-dependent)
-    if (tabPlatform.quantityBeforeBuy) {
-      await tabPlatform.setQuantity(qty);
-    }
-
-    // Go to cart
-    await tabPlatform.goToCart();
-
-    // Set quantity in cart (Flipkart does qty in cart, Amazon already set it)
-    if (!tabPlatform.quantityBeforeBuy && this.config.products?.length === 1) {
-      await tabPlatform.setCartItemQuantity(0, qty);
-    } else if (!tabPlatform.quantityBeforeBuy && this.config.products && this.config.products.length > 1) {
-      for (let p = 0; p < this.config.products.length; p++) {
-        await tabPlatform.setCartItemQuantity(p, this.config.products[p].quantity);
-      }
-    }
-
-    // Place order from cart — triggers navigation to order summary / checkout
-    await tabPlatform.placeOrder();
-
-    // Wait for the page to stabilize after the navigation
-    try {
-      await tabPage.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 8000 }).catch(() => {});
-    } catch { /* already navigated */ }
-    await sleep(500);
-
-    // Verify order summary (address + GST) — only if page is on a verifiable URL
-    if (this.config.address && tabPlatform instanceof FlipkartPlatform) {
-      try {
-        const currentUrl = tabPage.url();
-        // Only attempt verification if we're on order summary or checkout page
-        if (currentUrl.includes("/vieworder") || currentUrl.includes("/checkout") || currentUrl.includes("/viewcheckout") || currentUrl.includes("flipkart.com")) {
-          await tabPlatform.verifyAddressOnOrderSummary(this.config.address, qty);
-        } else {
-          sendMessage({
-            type: "log",
-            level: "info",
-            message: `Skipping order summary verification — page already at: ${currentUrl}`,
-            iteration: iterationNum,
-          });
-        }
-      } catch (err) {
-        const warnMsg = err instanceof Error ? err.message : String(err);
-        // Don't warn for expected navigation errors — these are normal on fast pages
-        if (warnMsg.includes("context") || warnMsg.includes("destroyed") || warnMsg.includes("navigation")) {
-          sendMessage({
-            type: "log",
-            level: "info",
-            message: `Order summary verification skipped — page navigated away (this is normal)`,
-            iteration: iterationNum,
-          });
-        } else {
-          sendMessage({
-            type: "log",
-            level: "warn",
-            message: `Order summary verification issue (continuing): ${warnMsg}`,
-            iteration: iterationNum,
-          });
-        }
-      }
-    }
-
-    // Select RTGS payment method on this tab
-    await tabPayment.selectPaymentMethod();
-
-    // fillDetails is a no-op for RTGS.
-    // confirmPayment is NOT called here — the orchestrator calls it after runRTGSTabIteration
-    // so it can properly handle the poll URL detection and move to the next tab.
-    await tabPayment.fillDetails(this.config.paymentDetails);
-  }
-
-  /**
-   * Multi-URL flow:
-   * Amazon:   navigate → set quantity on product page → add to cart → repeat → go to cart → proceed to checkout → payment
-   * Flipkart: navigate → add to cart → repeat → go to cart → set quantities in cart → place order → payment
-   */
-  private async runMultiUrlIteration(iterationNum: number): Promise<void> {
     const products = this.config.products;
-    const setQtyBeforeCart = this.platform.quantityBeforeBuy; // Amazon = true, Flipkart = false
 
-    // Step 1: For each product — navigate, (optionally set qty), add to cart
+    // Step 1: For each product — navigate, add to cart
     for (let p = 0; p < products.length; p++) {
       const product = products[p];
       sendMessage({
@@ -956,24 +866,13 @@ export class BatchOrchestrator {
       });
 
       // Set the current product URL on the platform
-      this.platform.setProductUrl(product.url);
+      platform.setProductUrl(product.url);
 
       // Navigate to this product
-      await this.platform.navigateToProduct();
+      await platform.navigateToProduct();
 
-      // Amazon: set quantity on product page BEFORE adding to cart
-      if (setQtyBeforeCart && product.quantity > 1) {
-        sendMessage({
-          type: "log",
-          level: "info",
-          message: `Setting quantity to ${product.quantity} on product page...`,
-          iteration: iterationNum,
-        });
-        await this.platform.setQuantity(product.quantity);
-      }
-
-      // Add to cart
-      await this.platform.addToCart();
+      // Add to cart (quantity will be set on the cart page for all platforms)
+      await platform.addToCart();
 
       sendMessage({
         type: "log",
@@ -990,42 +889,39 @@ export class BatchOrchestrator {
       message: "All products added. Opening cart...",
       iteration: iterationNum,
     });
-    await this.platform.goToCart();
+    await platform.goToCart();
 
-    // Step 3: Flipkart — set quantity for each product in the cart page
-    // (Amazon already set quantity on product page, skip this)
-    if (!setQtyBeforeCart) {
-      for (let p = 0; p < products.length; p++) {
-        const product = products[p];
-        if (product.quantity > 1) {
-          sendMessage({
-            type: "log",
-            level: "info",
-            message: `Setting quantity for item ${p + 1} to ${product.quantity}...`,
-            iteration: iterationNum,
-          });
-          await this.platform.setCartItemQuantity(p, product.quantity);
-        }
+    // Step 3: Set quantity for each product in the cart page
+    for (let p = 0; p < products.length; p++) {
+      const product = products[p];
+      if (product.quantity > 1) {
+        sendMessage({
+          type: "log",
+          level: "info",
+          message: `Setting quantity for item ${p + 1} to ${product.quantity}...`,
+          iteration: iterationNum,
+        });
+        await platform.setCartItemQuantity(p, product.quantity);
       }
     }
 
     // Step 4: Place order / proceed to checkout from cart
-    await this.platform.placeOrder();
+    await platform.placeOrder();
 
     // Wait for navigation to order summary / checkout page after Place Order
     // Place Order triggers a page navigation — must wait for it to complete
     // before attempting any DOM operations
-    if (this.platform instanceof FlipkartPlatform) {
+    if (platform instanceof FlipkartPlatform) {
       sendMessage({ type: "log", level: "info", message: "Waiting for order summary page after Place Order...", iteration: iterationNum });
       try {
-        await this.page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+        await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
       } catch { /* already navigated */ }
       await sleep(1000);
 
       // Wait for page body to be ready
       for (let i = 0; i < 20; i++) {
         try {
-          const ready = await this.page.evaluate(() =>
+          const ready = await page.evaluate(() =>
             document.body !== null && (document.body?.innerText || "").length > 100
           );
           if (ready) break;
@@ -1038,10 +934,10 @@ export class BatchOrchestrator {
     // Step 5: Verify order summary page (Flipkart only) — handles address, GST, then Continue to checkout.
     // verifyAddressOnOrderSummary() clicks Continue which navigates to the payment page.
     // DO NOT call proceedToCheckout() here — it would reload /viewcheckout and destroy the payment page.
-    if (this.config.address && this.platform instanceof FlipkartPlatform) {
+    if (this.config.address && platform instanceof FlipkartPlatform) {
       try {
         const totalQty = this.config.products?.reduce((sum, p) => sum + p.quantity, 0) ?? this.config.perOrderQuantity;
-        await this.platform.verifyAddressOnOrderSummary(this.config.address, totalQty);
+        await platform.verifyAddressOnOrderSummary(this.config.address, totalQty);
       } catch (err) {
         const warnMsg = err instanceof Error ? err.message : String(err);
         sendMessage({
@@ -1059,17 +955,17 @@ export class BatchOrchestrator {
         iteration: iterationNum,
       });
       // Still need to click Continue on order summary to get to payment page
-      if (this.platform instanceof FlipkartPlatform) {
+      if (platform instanceof FlipkartPlatform) {
         for (let i = 0; i < 20; i++) {
           try {
-            const bodyLen = await this.page.evaluate(() => document.body.innerText.length);
+            const bodyLen = await page.evaluate(() => document.body.innerText.length);
             if (bodyLen > 100) break;
           } catch { /* ignore */ }
           await sleep(500);
         }
         await sleep(500);
         try {
-          const clicked = await this.page.evaluate(() => {
+          const clicked = await page.evaluate(() => {
             const allDivs = Array.from(document.querySelectorAll("div"));
             for (const d of allDivs) {
               const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
@@ -1089,10 +985,10 @@ export class BatchOrchestrator {
             return false;
           });
           if (clicked) {
-            console.log("Continue clicked on multi-URL order summary");
+            console.log("Continue clicked on order summary");
             for (let i = 0; i < 30; i++) {
               await sleep(500);
-              const url = this.page.url();
+              const url = page.url();
               if (!url.includes("/viewcheckout")) break;
             }
           }
@@ -1100,13 +996,42 @@ export class BatchOrchestrator {
       }
     }
 
-    // At this point we're on the payment page. proceedToCheckout() is NOT called —
-    // verifyAddressOnOrderSummary() already handled the navigation via the Continue button.
-    // The URL is now the payment page, NOT /viewcheckout.
-    // verifyAddressOnCheckout() is skipped because address + GST were already verified
-    // on the order summary page (verifyAddressOnOrderSummary).
+    // At this point we're on the payment page, ready for payment selection.
+  }
 
-    // Step 6: Payment flow with retry
+  /**
+   * Runs the purchase flow for a single RTGS tab iteration:
+   * Uses the shared cart flow (same as Card), then selects RTGS payment.
+   * Does NOT wait for bank auth — that's handled by the caller in runRTGSBatched.
+   */
+  private async runRTGSTabIteration(
+    tabPage: Page,
+    tabPlatform: BasePlatform,
+    tabPayment: BasePayment,
+    iterationNum: number
+  ): Promise<void> {
+    // Use the EXACT same cart flow as Card (add all products, go to cart, place order, verify address)
+    await this.addAllProductsAndCheckout(tabPage, tabPlatform, iterationNum);
+
+    // Select RTGS payment method on this tab
+    await tabPayment.selectPaymentMethod();
+
+    // fillDetails is a no-op for RTGS.
+    // confirmPayment is NOT called here — the orchestrator calls it after runRTGSTabIteration
+    // so it can properly handle the poll URL detection and move to the next tab.
+    await tabPayment.fillDetails(this.config.paymentDetails);
+  }
+
+  /**
+   * Multi-URL flow:
+   * Amazon:   navigate → set quantity on product page → add to cart → repeat → go to cart → proceed to checkout → payment
+   * Flipkart: navigate → add to cart → repeat → go to cart → set quantities in cart → place order → payment
+   */
+  private async runMultiUrlIteration(iterationNum: number): Promise<void> {
+    // Shared cart flow (same code used by RTGS)
+    await this.addAllProductsAndCheckout(this.page, this.platform, iterationNum);
+
+    // Payment flow with retry (Card/GiftCard)
     await this.runPaymentFlow(iterationNum);
 
     sendMessage({
@@ -1543,5 +1468,51 @@ export class BatchOrchestrator {
       const msg = err instanceof Error ? err.message : String(err);
       console.log(`[Inventory] Failed to update code status: ${msg}`);
     }
+  }
+
+  /**
+   * Append order details to a date-named CSV file in order-reports/.
+   * CSV columns: PLATFORM ID, MODEL, COLOUR, QTY, PIN CODE, AMOUNT, PER PC, ORDER ID, ORDER DATE, GST NAME
+   */
+  private appendOrderToCsv(order: OrderDetails, accountEmail: string, gstName: string): void {
+    const reportsDir = path.resolve("order-reports");
+    if (!fs.existsSync(reportsDir)) {
+      fs.mkdirSync(reportsDir, { recursive: true });
+    }
+
+    // File named by today's date: 2026-04-09.csv
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const csvPath = path.join(reportsDir, `${today}.csv`);
+
+    const headers = "PLATFORM ID\tMODEL\tCOLOUR\tQTY\tPIN CODE\tAMOUNT\tPER PC\tORDER ID\tORDER DATE\tGST NAME";
+
+    // Create file with headers if it doesn't exist
+    if (!fs.existsSync(csvPath)) {
+      fs.writeFileSync(csvPath, headers + "\n", "utf-8");
+      console.log(`[CSV] Created ${csvPath}`);
+    }
+
+    // Build row
+    const row = [
+      accountEmail,
+      order.model,
+      order.colour,
+      String(order.quantity),
+      order.pinCode,
+      order.amount,
+      order.perPc,
+      order.orderId,
+      order.orderDate,
+      gstName,
+    ].map(v => v.replace(/\t/g, " ")).join("\t");
+
+    fs.appendFileSync(csvPath, row + "\n", "utf-8");
+    console.log(`[CSV] Appended order ${order.orderId || "(no ID)"} to ${csvPath}`);
+
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: `Order logged to CSV: ${csvPath} (Order ID: ${order.orderId || "N/A"})`,
+    });
   }
 }

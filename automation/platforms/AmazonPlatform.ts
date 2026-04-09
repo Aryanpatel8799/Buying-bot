@@ -1,5 +1,5 @@
 import { Page } from "puppeteer-core";
-import { BasePlatform } from "./BasePlatform";
+import { BasePlatform, OrderDetails } from "./BasePlatform";
 import {
   sleep,
   navigateWithRetry,
@@ -239,38 +239,89 @@ export class AmazonPlatform extends BasePlatform {
 
   async addToCart(): Promise<void> {
     console.log("Clicking Add to Cart...");
-    await waitWithRetry(
-      this.page,
-      async () => {
-        await this.page.waitForSelector("#add-to-cart-button", {
-          visible: true,
-          timeout: 10000,
-        });
-      },
-      { label: "Add to Cart button", timeoutMs: 10000, maxRetries: 5 }
-    );
 
-    await this.page.click("#add-to-cart-button");
+    // Wait for the Add to Cart button to appear
+    // Amazon's input#add-to-cart-button is an <input type="submit"> that may have 0 dimensions
+    // (the visible part is the parent <span> wrapper), so don't check offsetWidth/offsetHeight.
+    let btnHandle: import("puppeteer-core").ElementHandle | null = null;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      btnHandle = await this.page.$('#add-to-cart-button') ||
+                  await this.page.$('input[name="submit.add-to-cart"]');
+      if (btnHandle) {
+        console.log("Found Add to Cart button");
+        break;
+      }
+      if (attempt % 5 === 4) {
+        console.log(`Still looking for Add to Cart button (attempt ${attempt + 1}/20)...`);
+      }
+      await sleep(500);
+    }
+
+    if (!btnHandle) {
+      throw new Error("Add to Cart button not found after 10s");
+    }
+
+    // Click using evaluate to trigger the form submission directly
+    await this.page.evaluate(() => {
+      const btn = document.querySelector('#add-to-cart-button') as HTMLElement ||
+                  document.querySelector('input[name="submit.add-to-cart"]') as HTMLElement;
+      if (btn) btn.click();
+    });
     console.log("Clicked Add to Cart");
     await sleep(DELAYS.long);
 
-    // Wait for confirmation — Amazon may show "Added to Cart" overlay or redirect
-    await this.page.waitForFunction(
-      () => {
-        const text = document.body.innerText.toLowerCase();
-        return (
-          text.includes("added to cart") ||
-          text.includes("subtotal") ||
-          text.includes("cart subtotal") ||
-          text.includes("proceed to checkout") ||
-          text.includes("go to cart")
-        );
-      },
-      { timeout: 10000 }
-    ).catch(() => {
-      console.log("Add to Cart confirmation not detected, continuing...");
-    });
-    await sleep(DELAYS.medium);
+    // Amazon may show a protection/warranty popup ("No Thanks" button).
+    // Keep checking for it — it may appear with a delay.
+    let dismissed = false;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        const found = await this.page.evaluate(() => {
+          // Try the specific "No Thanks" / "No Coverage" button
+          const noThanksBtn = document.querySelector('input[aria-labelledby="attachSiNoCoverage-announce"]') as HTMLElement;
+          if (noThanksBtn) { noThanksBtn.click(); return "attachSiNoCoverage"; }
+          // Try by button text
+          const spans = document.querySelectorAll('span.a-button-text');
+          for (const span of spans) {
+            const text = (span.textContent || "").trim().toLowerCase();
+            if (text === "no thanks" || text === "no, thanks" || text.includes("no coverage") || text.includes("skip")) {
+              const wrapper = span.closest("span.a-button") as HTMLElement | null;
+              if (wrapper) { wrapper.click(); return text; }
+              (span as HTMLElement).click();
+              return text;
+            }
+          }
+          return null;
+        });
+        if (found) {
+          console.log(`Dismissed popup via "${found}" button`);
+          dismissed = true;
+          break;
+        }
+      } catch { /* skip */ }
+
+      // Also check if we already passed the popup (page redirected to "Added to Cart" page)
+      try {
+        const alreadyAdded = await this.page.evaluate(() => {
+          const text = document.body.innerText.toLowerCase();
+          return text.includes("added to cart") || text.includes("cart subtotal");
+        });
+        if (alreadyAdded) {
+          console.log("Product already added to cart (no popup appeared)");
+          dismissed = true;
+          break;
+        }
+      } catch { /* skip */ }
+
+      await sleep(500);
+    }
+
+    // After dismissing "No Thanks", Amazon redirects to a confirmation page.
+    // Wait briefly for the redirect to complete, then we're done — the orchestrator
+    // will navigate to the next product URL or to the cart.
+    if (dismissed) {
+      await sleep(DELAYS.long);
+      console.log("Add to Cart complete — ready for next step");
+    }
   }
 
   async goToCart(): Promise<void> {
@@ -302,28 +353,62 @@ export class AmazonPlatform extends BasePlatform {
     if (qty <= 1) return;
     console.log(`Setting cart item ${itemIndex + 1} quantity to ${qty}...`);
 
-    // Amazon cart has quantity dropdowns for each item
-    // Each item's quantity select has a name like "quantity.C..."
-    const set = await this.page.evaluate((idx: number, targetQty: number) => {
-      // Find all quantity selects in the cart
-      const selects = document.querySelectorAll<HTMLSelectElement>(
-        'select[name^="quantity"]'
-      );
-      if (idx < selects.length) {
-        const sel = selects[idx];
-        sel.value = String(targetQty);
-        sel.dispatchEvent(new Event("change", { bubbles: true }));
-        return true;
-      }
-      return false;
-    }, itemIndex, qty);
-
-    if (set) {
-      console.log(`Set cart item ${itemIndex + 1} quantity to ${qty}`);
-      await sleep(DELAYS.long);
-    } else {
-      console.log(`Warning: Quantity select for cart item ${itemIndex + 1} not found`);
+    // Amazon cart uses a stepper control (- / value / + buttons) for each item.
+    // Find the stepper containers and click the increment button repeatedly.
+    const steppers = await this.page.$$('.a-stepper-inner-container');
+    if (itemIndex >= steppers.length) {
+      console.log(`Warning: Stepper for cart item ${itemIndex + 1} not found (found ${steppers.length} steppers)`);
+      return;
     }
+
+    const stepper = steppers[itemIndex];
+
+    // Read current quantity
+    const currentQty = await stepper.$eval(
+      'span[data-a-selector="inner-value"]',
+      (el: Element) => parseInt((el as HTMLElement).textContent || "1", 10)
+    ).catch(() => 1);
+    console.log(`Cart item ${itemIndex + 1} current quantity: ${currentQty}`);
+
+    const clicksNeeded = qty - currentQty;
+    if (clicksNeeded <= 0) {
+      console.log(`Quantity already ${currentQty}, no change needed`);
+      return;
+    }
+
+    // Click the increment button (clicksNeeded) times
+    const incrementBtn = await stepper.$('button[data-a-selector="increment"]');
+    if (!incrementBtn) {
+      console.log(`Warning: Increment button not found for cart item ${itemIndex + 1}`);
+      return;
+    }
+
+    for (let i = 0; i < clicksNeeded; i++) {
+      await incrementBtn.click();
+      console.log(`Clicked increment for item ${itemIndex + 1} (${i + 1}/${clicksNeeded})`);
+      // Wait for the spinner to appear and disappear after each click
+      await sleep(500);
+      await this.page.waitForFunction(
+        (idx: number) => {
+          const containers = document.querySelectorAll('.a-stepper-inner-container');
+          if (idx >= containers.length) return true;
+          const spinner = containers[idx].querySelector('span.a-spinner');
+          // Spinner is hidden when its parent has display:none or the spinner isn't visible
+          return !spinner || spinner.closest('[style*="display: none"]') !== null ||
+            (spinner as HTMLElement).offsetWidth === 0;
+        },
+        { timeout: 10000 },
+        itemIndex
+      ).catch(() => {});
+      await sleep(500);
+    }
+
+    // Verify final quantity
+    const finalQty = await stepper.$eval(
+      'span[data-a-selector="inner-value"]',
+      (el: Element) => parseInt((el as HTMLElement).textContent || "0", 10)
+    ).catch(() => 0);
+    console.log(`Cart item ${itemIndex + 1} quantity now: ${finalQty} (target: ${qty})`);
   }
 
   async placeOrder(): Promise<void> {
@@ -432,6 +517,70 @@ export class AmazonPlatform extends BasePlatform {
       return result.confirmed;
     } catch {
       return false;
+    }
+  }
+
+  async extractOrderDetails(): Promise<OrderDetails> {
+    console.log("[extractOrderDetails] Extracting order details from Amazon confirmation page...");
+    try {
+      const details = await this.page.evaluate(() => {
+        const body = document.body?.innerText || "";
+        const allText = body.replace(/\s+/g, " ");
+
+        // Extract Order ID — Amazon uses "Order #XXX-XXXXXXX-XXXXXXX" or "order number"
+        let orderId = "";
+        const orderIdMatch = allText.match(/(?:Order\s*#?\s*|order\s*number\s*:?\s*)([\d\-]+)/i);
+        if (orderIdMatch) orderId = orderIdMatch[1];
+
+        // Extract product model/name
+        let model = "";
+        const productEls = document.querySelectorAll(".a-text-bold, .a-size-medium, h5, .a-text-normal");
+        for (const el of productEls) {
+          const text = (el.textContent || "").trim();
+          if (text.length > 20 && !text.toLowerCase().includes("order") &&
+              !text.toLowerCase().includes("thank") && !text.toLowerCase().includes("deliver")) {
+            model = text;
+            break;
+          }
+        }
+
+        // Extract colour
+        let colour = "";
+        const colourMatch = allText.match(/(?:colou?r|shade)[:\s]*([A-Za-z\s]+?)(?:,|\.|;|\s{2}|\n|$)/i);
+        if (colourMatch) colour = colourMatch[1].trim();
+
+        // Extract amount/price
+        let amount = "";
+        const priceMatch = allText.match(/(?:₹|Rs\.?|Grand Total[:\s]*₹?)\s*([\d,]+)/);
+        if (priceMatch) amount = priceMatch[1].replace(/,/g, "");
+
+        return { orderId, model, colour, amount };
+      });
+
+      const result: OrderDetails = {
+        orderId: details.orderId,
+        model: details.model,
+        colour: details.colour,
+        quantity: 0,
+        pinCode: "",
+        amount: details.amount,
+        perPc: "",
+        orderDate: new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short" }),
+      };
+      console.log(`[extractOrderDetails] Extracted: orderId=${result.orderId}, model=${result.model.slice(0, 50)}, amount=${result.amount}`);
+      return result;
+    } catch (err) {
+      console.log(`[extractOrderDetails] Failed to extract: ${err instanceof Error ? err.message : err}`);
+      return {
+        orderId: "",
+        model: "",
+        colour: "",
+        quantity: 0,
+        pinCode: "",
+        amount: "",
+        perPc: "",
+        orderDate: new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short" }),
+      };
     }
   }
 

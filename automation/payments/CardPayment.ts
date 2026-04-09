@@ -1,7 +1,6 @@
 import { Page } from "puppeteer-core";
 import { BasePayment } from "./BasePayment";
 import {
-  clearAndType,
   sleep,
   waitAndClick,
   waitWithRetry,
@@ -840,12 +839,41 @@ export class CardPayment extends BasePayment {
         } catch { /* skip */ }
       }
     }
-    await sleep(100);
+    // ── Step 7+8: Wait for CVV section and enter CVV ──
+    // Fast poll — do NOT use waitWithRetry here because isPaymentPage triggers a 2-min sleep
+    console.log("Waiting for CVV section to appear...");
+    let cvvSectionReady = false;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      try {
+        cvvSectionReady = await this.page.evaluate(() => {
+          const selectedCard = document.querySelector(".pmts-credit-card-row.pmts-selected");
+          if (!selectedCard) return false;
+          const text = (selectedCard as HTMLElement).innerText || "";
+          return text.includes("Enter CVV") || text.includes("CVV");
+        });
+      } catch { /* skip */ }
 
-    // ── Step 7: Enter CVV ──
-    console.log("Entering CVV...");
+      // Also check if CVV iframe input is already accessible in any frame
+      if (!cvvSectionReady) {
+        for (const frame of this.page.frames()) {
+          try {
+            const input = await frame.$('input.card-cvv, input#field[type="tel"]');
+            if (input) { cvvSectionReady = true; break; }
+          } catch { /* skip */ }
+        }
+      }
+
+      if (cvvSectionReady) break;
+      if (attempt % 10 === 9) {
+        console.log(`[CVV section] Still waiting (attempt ${attempt + 1}/30)...`);
+      }
+      await sleep(500);
+    }
+    if (!cvvSectionReady) {
+      throw new Error("CVV section not found after 15s");
+    }
+    console.log("CVV section ready, entering CVV...");
     await this.amazonEnterCVV(details.cvv);
-    await sleep(100);
   }
 
   /**
@@ -992,145 +1020,212 @@ export class CardPayment extends BasePayment {
   }
 
   /**
-   * Enter CVV on Amazon — may be in an iframe.
+   * Enter CVV on Amazon.
+   * The CVV field (input#field.card-cvv) lives inside Amazon's secure iframe
+   * which Puppeteer cannot access the DOM of directly.
+   * Instead: click the iframe element to focus the input, then use page.keyboard to type.
    */
   private async amazonEnterCVV(cvv: string): Promise<void> {
-    // First try: CVV field directly on the page
-    const directField = await this.page.$(".card-cvv, #addCreditCardVerificationNumber");
-    if (directField) {
-      await clearAndType(this.page, ".card-cvv", cvv, "CVV");
+    console.log("[amazonEnterCVV] Looking for CVV input across all frames...");
+
+    // Primary approach: scan all frames for the CVV input directly (fast)
+    let cvvInput: import("puppeteer-core").ElementHandle | null = null;
+    let cvvFrame: import("puppeteer-core").Frame | null = null;
+    const cvvSelectors = ['input.card-cvv', 'input#field[type="tel"]'];
+
+    for (let attempt = 0; attempt < 20; attempt++) {
+      for (const frame of this.page.frames()) {
+        for (const sel of cvvSelectors) {
+          try {
+            const input = await frame.$(sel);
+            if (input) {
+              cvvInput = input;
+              cvvFrame = frame;
+              console.log(`[amazonEnterCVV] Found CVV input with "${sel}" in frame: ${frame.url().substring(0, 80)}`);
+              break;
+            }
+          } catch { /* skip inaccessible frame */ }
+        }
+        if (cvvInput) break;
+      }
+      if (cvvInput) break;
+      if (attempt % 5 === 4) {
+        console.log(`[amazonEnterCVV] Still looking for CVV input (attempt ${attempt + 1}/20)...`);
+      }
+      await sleep(250);
+    }
+
+    if (cvvInput && cvvFrame) {
+      // Type directly into the CVV input inside the frame
+      await cvvInput.click({ clickCount: 3 }); // select any existing value
+      await sleep(50);
+      await cvvInput.type(cvv, { delay: 50 });
+      console.log("[amazonEnterCVV] ✅ Typed CVV directly into iframe input");
+
+      // Verify
+      try {
+        const val = await cvvFrame.evaluate(() => {
+          const input = document.querySelector('input.card-cvv, input#field') as HTMLInputElement;
+          return input?.value?.length ?? 0;
+        });
+        console.log(`[amazonEnterCVV] ✅ Verified: CVV field has ${val} characters`);
+      } catch { /* cross-origin, trust the typing */ }
       return;
     }
 
-    // Second try: CVV field inside an iframe
-    const frames = this.page.frames();
-    const cvvSelectors = [
-      ".card-cvv",
-      "input[type='tel'][maxlength='4']",
-      "input[type='tel'][maxlength='3']",
-      'input[id^="pp-"][type="tel"]',
-      "input[name*='cvv']",
-      "input[name*='CVV']",
-      "input[autocomplete*='cc-csc']",
+    // Fallback: find iframe element on the page and use keyboard
+    console.log("[amazonEnterCVV] CVV input not found in frames, falling back to iframe click + keyboard...");
+    const iframeSelectors = [
+      '.pmts-credit-card-verification iframe',
+      'span[id^="secureFieldsCVV"] iframe',
+      'iframe[name*="addCreditCardVerificationNumber"]',
+      'iframe[name*="CreditCardVerificationNumber"]',
     ];
-    for (const frame of frames) {
-      try {
-        for (const sel of cvvSelectors) {
-          const cvvField = await frame.$(sel);
-          if (cvvField) {
-            await cvvField.click();
-            await sleep(100);
-            await cvvField.type(cvv, { delay: 50 });
-            console.log(`[amazonEnterCVV] Entered CVV in frame (selector: ${sel})`);
-            return;
-          }
-        }
-      } catch {
-        // Frame not accessible, skip
-      }
-    }
 
-    // Third try: wait for the field to appear (it may load after Continue)
-    await waitWithRetry(
-      this.page,
-      async () => {
-        // Check all frames again
-        const allFrames = this.page.frames();
-        for (const f of allFrames) {
-          for (const sel of cvvSelectors) {
-            try {
-              const field = await f.$(sel);
-              if (field) return;
-            } catch { /* skip */ }
-          }
-        }
-        throw new Error("CVV field not found in any frame");
-      },
-      { label: "CVV field", timeoutMs: 10000, maxRetries: 5, isPaymentPage: this.isPaymentPage }
-    );
-
-    // Retry after wait
-    const retryFrames = this.page.frames();
-    for (const frame of retryFrames) {
+    let iframeHandle: import("puppeteer-core").ElementHandle | null = null;
+    for (const sel of iframeSelectors) {
       try {
-        for (const sel of cvvSelectors) {
-          const cvvField = await frame.$(sel);
-          if (cvvField) {
-            await cvvField.click();
-            await sleep(100);
-            await cvvField.type(cvv, { delay: 50 });
-            console.log(`[amazonEnterCVV] Entered CVV in frame after retry (selector: ${sel})`);
-            return;
-          }
-        }
-      } catch {
-        // Skip
-      }
-    }
-
-    // Log all inputs in all frames for debugging
-    for (let i = 0; i < retryFrames.length; i++) {
-      try {
-        const inputs = await retryFrames[i].evaluate(() => {
-          return Array.from(document.querySelectorAll("input")).slice(0, 10).map(el => ({
-            type: el.type, name: el.name, id: el.id,
-            maxLength: el.maxLength, autocomplete: el.autocomplete,
-          }));
-        });
-        console.log(`[amazonEnterCVV] Inputs in frame ${i}: ${JSON.stringify(inputs)}`);
+        iframeHandle = await this.page.$(sel);
+        if (iframeHandle) break;
       } catch { /* skip */ }
     }
 
-    throw new Error("Could not find CVV field on Amazon payment page");
+    if (!iframeHandle) {
+      throw new Error("CVV iframe not found on Amazon payment page");
+    }
+
+    const box = await iframeHandle.boundingBox();
+    if (box) {
+      await this.page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    } else {
+      await iframeHandle.click();
+    }
+    await sleep(150);
+    await this.page.keyboard.type(cvv, { delay: 50 });
+    console.log("[amazonEnterCVV] ✅ Typed CVV via keyboard fallback");
   }
 
   private async amazonConfirmPayment(): Promise<void> {
+    // Helper: click an Amazon button via evaluate (avoids coordinate issues with zero-dimension inputs)
+    const clickAmazonBtn = async (selector: string, label: string, maxAttempts = 20): Promise<boolean> => {
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          const clicked = await this.page.evaluate((sel: string) => {
+            const btn = document.querySelector(sel) as HTMLElement | null;
+            if (btn) { btn.click(); return true; }
+            return false;
+          }, selector);
+          if (clicked) {
+            console.log(`Clicked "${label}"`);
+            return true;
+          }
+        } catch { /* skip */ }
+        await sleep(500);
+      }
+      console.log(`"${label}" button not found after ${maxAttempts * 0.5}s`);
+      return false;
+    };
+
+    // ── Step 1: Click "Use this payment method" ──
     console.log('Clicking "Use this payment method"...');
-
-    // Wait for the button to be enabled and click it
-    await waitWithRetry(
-      this.page,
-      async () => {
-        await this.page.waitForFunction(
-          () => {
-            const btn = document.querySelector(
-              '[data-testid="secondary-continue-button"], ' +
-                'input[aria-labelledby="checkout-secondary-continue-button-id-announce"]'
-            ) as HTMLInputElement;
-            return btn && !btn.disabled;
-          },
-          { timeout: 15000 }
-        );
-      },
-      { label: "Use this payment method button", timeoutMs: 15000, maxRetries: 5, isPaymentPage: this.isPaymentPage }
+    const step1 = await clickAmazonBtn(
+      'input[aria-labelledby="checkout-secondary-continue-button-id-announce"]',
+      "Use this payment method"
     );
+    if (!step1) throw new Error("Use this payment method button not found");
+    await sleep(2000);
 
-    await this.page.evaluate(() => {
-      const btn = document.querySelector(
-        '[data-testid="secondary-continue-button"], ' +
-          'input[aria-labelledby="checkout-secondary-continue-button-id-announce"]'
-      ) as HTMLElement;
-      if (btn) btn.click();
-    });
+    // ── Step 2: Click "Continue without saving" in the card save popup ──
+    console.log('Clicking "Continue without saving"...');
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        const clicked = await this.page.evaluate(() => {
+          // Find the span that contains "Continue without saving" text
+          const spans = document.querySelectorAll('span.a-button-text');
+          for (const span of spans) {
+            if ((span.textContent || "").trim() === "Continue without saving") {
+              // Click the parent span.a-button wrapper
+              const wrapper = span.closest("span.a-button") as HTMLElement | null;
+              if (wrapper) { wrapper.click(); return true; }
+              (span as HTMLElement).click();
+              return true;
+            }
+          }
+          return false;
+        });
+        if (clicked) {
+          console.log('Clicked "Continue without saving"');
+          break;
+        }
+      } catch { /* skip */ }
+      await sleep(500);
+    }
+    await sleep(2000);
 
-    console.log("Clicked Use this payment method");
-    await sleep(500);
+    // ── Step 3: Click "Use this address" / billing address continue ──
+    console.log('Clicking "Use this address"...');
+    await clickAmazonBtn(
+      'input[data-csa-c-slot-id="checkout-secondary-continue-billingaddressselect"]',
+      "Use this address",
+      10
+    );
+    await sleep(2000);
 
-    // Amazon may show a "Place your order" final step
-    try {
-      await this.page.waitForSelector(
-        '#submitOrderButtonId input, input[name="placeYourOrder1"]',
-        { visible: true, timeout: 10000 }
-      );
+    // ── Step 4: Click "Place your order" / "Pay with debit card" ──
+    console.log("Clicking Place your order...");
+    let placed = false;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const btnHandle = await this.page.$('input#placeOrder');
+      if (!btnHandle) {
+        await sleep(500);
+        continue;
+      }
+      console.log(`[PlaceOrder] Found input#placeOrder (attempt ${attempt + 1})`);
+
+      // Scroll the button's parent into view
       await this.page.evaluate(() => {
-        const placeOrder = document.querySelector(
-          '#submitOrderButtonId input, input[name="placeYourOrder1"]'
-        ) as HTMLElement;
-        if (placeOrder) placeOrder.click();
+        const el = document.querySelector('#bottomSubmitOrderButtonId') ||
+                   document.querySelector('#submitOrderButtonId') ||
+                   document.getElementById('placeOrder');
+        el?.scrollIntoView({ block: "center" });
       });
-      console.log("Clicked Place your order");
-    } catch {
-      console.log("No separate Place Order step found, payment may already be submitted");
+      await sleep(500);
+
+      // Method 1: Focus the input and press Enter — generates a trusted form submission
+      try {
+        await btnHandle.focus();
+        await sleep(100);
+        await this.page.keyboard.press('Enter');
+        console.log('[PlaceOrder] Pressed Enter on focused input#placeOrder');
+        placed = true;
+        break;
+      } catch (e) {
+        console.log(`[PlaceOrder] Enter key failed: ${e instanceof Error ? e.message : e}`);
+      }
+
+      // Method 2: requestSubmit with the button as submitter — trusted form submission
+      try {
+        const submitted = await this.page.evaluate(() => {
+          const input = document.getElementById('placeOrder') as HTMLInputElement;
+          if (input?.form) {
+            input.form.requestSubmit(input);
+            return true;
+          }
+          return false;
+        });
+        if (submitted) {
+          console.log('[PlaceOrder] Used form.requestSubmit()');
+          placed = true;
+          break;
+        }
+      } catch (e) {
+        console.log(`[PlaceOrder] requestSubmit failed: ${e instanceof Error ? e.message : e}`);
+      }
+
+      await sleep(500);
+    }
+    if (!placed) {
+      console.log("Place Order button not found after all attempts");
     }
   }
 }

@@ -1,5 +1,5 @@
 import { Page } from "puppeteer-core";
-import { BasePlatform, AddressDetails, InstaDdrLoginOptions } from "./BasePlatform";
+import { BasePlatform, AddressDetails, InstaDdrLoginOptions, OrderDetails } from "./BasePlatform";
 import {
   sleep,
   clearAndType,
@@ -785,27 +785,25 @@ export class FlipkartPlatform extends BasePlatform {
   }
 
   async goToCart(): Promise<void> {
-    // Click the cart icon in the header: <a class="SXucWY" href="/viewcart...">
-    console.log("Navigating to cart...");
-    await waitWithRetry(
-      this.page,
-      async () => {
-        await this.page.waitForSelector('a[href*="/viewcart"]', {
-          visible: true,
-          timeout: 10000,
-        });
-      },
-      { label: "Cart link", timeoutMs: 10000, maxRetries: 5 }
-    );
-    await this.page.evaluate(() => {
-      const cartLink = document.querySelector('a[href*="/viewcart"]') as HTMLElement;
-      if (cartLink) {
-        cartLink.scrollIntoView({ block: "center" });
-        cartLink.click();
-      }
+    console.log("Navigating to Flipkart cart...");
+    await this.page.goto("https://www.flipkart.com/viewcart", {
+      waitUntil: "domcontentloaded",
+      timeout: 15000,
     });
-    console.log("Clicked Cart");
     await sleep(DELAYS.long);
+
+    // Wait for cart page to load
+    await this.page.waitForFunction(
+      () => {
+        const text = document.body.innerText.toLowerCase();
+        return text.includes("shopping cart") || text.includes("my cart") ||
+               text.includes("place order") || text.includes("price details");
+      },
+      { timeout: 10000 }
+    ).catch(() => {
+      console.log("Cart page text not detected, continuing...");
+    });
+    console.log("Cart page loaded");
   }
 
   async setCartItemQuantity(itemIndex: number, qty: number): Promise<void> {
@@ -876,12 +874,24 @@ export class FlipkartPlatform extends BasePlatform {
       await sleep(DELAYS.short);
 
       // Step 3: Enter quantity in the input
-      await clearAndType(
-        this.page,
-        'input[placeholder="Quantity"]',
-        qty.toString(),
-        "Cart Quantity input"
-      );
+      // Do NOT use clearAndType here — clearing to empty triggers Flipkart's
+      // React handler which interprets qty="" as removal and deletes the item.
+      // Instead, set the value directly via JS without an intermediate empty state.
+      const qtySelector = 'input[placeholder="Quantity"]';
+      await this.page.waitForSelector(qtySelector, { visible: true, timeout: 5000 });
+      await this.page.evaluate((sel: string, val: string) => {
+        const el = document.querySelector(sel) as HTMLInputElement;
+        if (el) {
+          el.focus();
+          // Use native setter to trigger React's internal state update
+          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, "value"
+          )?.set;
+          nativeInputValueSetter?.call(el, val);
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      }, qtySelector, qty.toString());
       await sleep(DELAYS.short);
 
       // Step 4: Click "APPLY"
@@ -939,50 +949,43 @@ export class FlipkartPlatform extends BasePlatform {
   async placeOrder(): Promise<void> {
     // Click "Place order" button: div.css-146c3p1 with text "Place order" inside a yellow bg container
     console.log("Waiting for Place Order button...");
-    await waitWithRetry(
-      this.page,
-      async () => {
-        await this.page.waitForFunction(
-          () => {
-            const labels = document.querySelectorAll("div.css-146c3p1");
-            for (const label of labels) {
-              const text = label.textContent?.trim().toLowerCase();
-              if (text === "place order") return true;
-            }
-            return false;
-          },
-          { timeout: 10000 }
-        );
-      },
-      { label: "Place Order button", timeoutMs: 10000, maxRetries: 5, isPaymentPage: this.isPaymentPage }
-    );
 
-    const placeBox = await this.page.evaluate(() => {
-      const labels = document.querySelectorAll("div.css-146c3p1");
-      for (const label of labels) {
-        const text = label.textContent?.trim().toLowerCase();
-        if (text && text.includes("place order")) {
-          // Walk up to the yellow container (div.css-g5y9jx with background-color)
-          let el: HTMLElement | null = label as HTMLElement;
-          while (el) {
-            const style = el.getAttribute("style") || "";
-            if (el.classList.contains("css-g5y9jx") && style.includes("background-color")) {
-              el.scrollIntoView({ block: "center" });
-              const rect = el.getBoundingClientRect();
-              return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    // Find the "Place order" button — div.css-146c3p1 with text "Place order"
+    // inside the yellow container div.css-g5y9jx
+    let placeBox: { x: number; y: number } | null = null;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      placeBox = await this.page.evaluate(() => {
+        const labels = document.querySelectorAll("div.css-146c3p1");
+        for (const label of labels) {
+          const text = label.textContent?.trim().toLowerCase();
+          if (text && (text === "place order" || text === "place order ")) {
+            // Walk up to the yellow container (div.css-g5y9jx with background-color)
+            let el: HTMLElement | null = label as HTMLElement;
+            while (el) {
+              const style = el.getAttribute("style") || "";
+              if (el.classList.contains("css-g5y9jx") && style.includes("background-color")) {
+                el.scrollIntoView({ block: "center" });
+                const rect = el.getBoundingClientRect();
+                return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+              }
+              el = el.parentElement;
             }
-            el = el.parentElement;
+            // Fallback: use the text label itself
+            (label as HTMLElement).scrollIntoView({ block: "center" });
+            const rect = label.getBoundingClientRect();
+            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
           }
-          // Fallback: use the text label
-          (label as HTMLElement).scrollIntoView({ block: "center" });
-          const rect = label.getBoundingClientRect();
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
         }
+        return null;
+      });
+      if (placeBox) break;
+      if (attempt % 5 === 4) {
+        console.log(`Still looking for Place Order button (attempt ${attempt + 1}/20)...`);
       }
-      return null;
-    });
+      await sleep(500);
+    }
 
-    if (!placeBox) throw new Error("Place Order button not found");
+    if (!placeBox) throw new Error("Place Order button not found after 10s");
     await sleep(300);
     await this.page.touchscreen.tap(placeBox.x, placeBox.y);
     console.log(`Tapped Place Order at (${placeBox.x.toFixed(0)}, ${placeBox.y.toFixed(0)})`);
@@ -1036,6 +1039,71 @@ export class FlipkartPlatform extends BasePlatform {
       return result.confirmed;
     } catch {
       return false;
+    }
+  }
+
+  async extractOrderDetails(): Promise<OrderDetails> {
+    console.log("[extractOrderDetails] Extracting order details from Flipkart confirmation page...");
+    try {
+      const details = await this.page.evaluate(() => {
+        const body = document.body?.innerText || "";
+        const allText = body.replace(/\s+/g, " ");
+
+        // Extract Order ID (OD followed by digits)
+        let orderId = "";
+        const orderIdMatch = allText.match(/OD\d{10,}/);
+        if (orderIdMatch) orderId = orderIdMatch[0];
+
+        // Extract product model/name — look for the product title on confirmation page
+        let model = "";
+        const titleEls = document.querySelectorAll("div.css-146c3p1, span.css-146c3p1");
+        for (const el of titleEls) {
+          const text = (el.textContent || "").trim();
+          // Product names are usually long (>20 chars) and contain brand keywords
+          if (text.length > 20 && !text.startsWith("OD") && !text.toLowerCase().includes("order") &&
+              !text.toLowerCase().includes("place") && !text.toLowerCase().includes("deliver")) {
+            model = text;
+            break;
+          }
+        }
+
+        // Extract colour — look for common colour keywords in the product details
+        let colour = "";
+        const colourMatch = allText.match(/(?:colou?r|shade)[:\s]*([A-Za-z\s]+?)(?:,|\.|;|\s{2}|\n|$)/i);
+        if (colourMatch) colour = colourMatch[1].trim();
+
+        // Extract amount/price — look for ₹ or Rs followed by numbers
+        let amount = "";
+        const priceMatch = allText.match(/(?:₹|Rs\.?)\s*([\d,]+)/);
+        if (priceMatch) amount = priceMatch[1].replace(/,/g, "");
+
+        return { orderId, model, colour, amount };
+      });
+
+      const result: OrderDetails = {
+        orderId: details.orderId,
+        model: details.model,
+        colour: details.colour,
+        quantity: 0,
+        pinCode: "",
+        amount: details.amount,
+        perPc: "",
+        orderDate: new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short" }),
+      };
+      console.log(`[extractOrderDetails] Extracted: orderId=${result.orderId}, model=${result.model.slice(0, 50)}, amount=${result.amount}`);
+      return result;
+    } catch (err) {
+      console.log(`[extractOrderDetails] Failed to extract: ${err instanceof Error ? err.message : err}`);
+      return {
+        orderId: "",
+        model: "",
+        colour: "",
+        quantity: 0,
+        pinCode: "",
+        amount: "",
+        perPc: "",
+        orderDate: new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short" }),
+      };
     }
   }
 
@@ -1969,9 +2037,11 @@ export class FlipkartPlatform extends BasePlatform {
     const matchScore = this.scoreAddressMatch(currentText, address);
     const hasPincode = (currentText || "").includes(effectivePincode);
     const hasCity = (currentText || "").toLowerCase().includes(address.city.trim().toLowerCase());
-    console.log(`Address match score: ${matchScore}/6, pincode=${hasPincode}, city=${hasCity}`);
+    const hasName = (currentText || "").toLowerCase().includes((address.companyName || address.name || "").trim().toLowerCase());
+    console.log(`Address match score: ${matchScore}/6, pincode=${hasPincode}, city=${hasCity}, name=${hasName}`);
 
-    if (matchScore >= 3 || (hasPincode && hasCity)) {
+    // Accept if any 2 of: pincode, city, name match — the address is already correct
+    if (matchScore >= 2 || (hasPincode && hasCity) || (hasCity && hasName) || (hasPincode && hasName)) {
       console.log("Delivery address matches on order summary — no change needed");
       return;
     }
@@ -2007,110 +2077,12 @@ export class FlipkartPlatform extends BasePlatform {
 
     await sleep(300);
 
-    // Try to select the address from the existing list
+    // Try to select the address from the existing saved list — never add a new one
     const found = await this.selectAddressFromList(address);
     if (found) {
       console.log("Selected address from existing list on order summary");
-      // Wait for modal to close
-      let modalClosed = false;
-      for (let i = 0; i < 8 && !modalClosed; i++) {
-        await sleep(300);
-        try {
-          const stillOpen = await this.page.evaluate(() => {
-            const body = document.body?.innerText || "";
-            return (
-              body.includes("Select Delivery Address") ||
-              body.includes("Edit Address") ||
-              body.includes("ADD A NEW ADDRESS")
-            );
-          });
-          if (!stillOpen) {
-            modalClosed = true;
-            console.log(`Address modal closed after ~${(i + 1) * 1000}ms`);
-          }
-        } catch (err) {
-          const msg = (err as Error).message;
-          if (msg.includes("detached") || msg.includes("Frame")) {
-            modalClosed = true;
-            console.log("Frame detached — modal likely closed");
-          }
-        }
-      }
-      await sleep(300);
-      return;
-    }
-
-    // Address not in list — add new address in a new tab
-    console.log("Address not in list on order summary — adding new address in new tab...");
-
-    const browser = this.page.browser();
-    const newTab = await browser.newPage();
-    await newTab.goto("https://www.flipkart.com/account/addresses", {
-      waitUntil: "networkidle2",
-      timeout: 20000,
-    });
-    console.log("Opened addresses page in new tab");
-    await sleep(500);
-
-    // Click ADD A NEW ADDRESS
-    await this.clickAddNewAddressButton(newTab);
-    await sleep(500);
-
-    // Wait for form
-    try {
-      await newTab.waitForFunction(
-        () => !!document.querySelector('input[name="name"]'),
-        { timeout: 10000 }
-      );
-    } catch {
-      console.log("WARNING: Address form fields did not appear in new tab");
-    }
-    await sleep(300);
-
-    // Fill form using existing helper
-    await this.fillAddressForm(newTab, address);
-
-    // Click Save
-    await this.clickSaveButton(newTab);
-
-    // Wait for save
-    let saved = false;
-    for (let i = 0; i < 8 && !saved; i++) {
-      await sleep(300);
-      try {
-        const nameInput = await newTab.$('input[name="name"]');
-        if (!nameInput) {
-          saved = true;
-          console.log(`Address saved (${(i + 1) * 1000}ms)`);
-        }
-      } catch (err) {
-        const msg = (err as Error).message;
-        if (msg.includes("detached") || msg.includes("Frame")) {
-          saved = true;
-          console.log("Frame detached — save likely succeeded");
-        }
-      }
-    }
-
-    // Close new tab and return to order summary
-    await newTab.close();
-    console.log("Closed new tab, returning to order summary");
-
-    // Refresh order summary page
-    await this.page.goto(this.page.url(), { waitUntil: "networkidle2", timeout: 20000 });
-    await sleep(500);
-    console.log("Refreshed order summary page");
-
-    // Click Change again and select the newly added address
-    console.log("Clicking Change to select newly added address...");
-    await this.clickAddressChangeButton();
-    await sleep(500);
-
-    const selected = await this.selectAddressFromList(address);
-    if (selected) {
-      console.log("Selected newly added address on order summary");
     } else {
-      console.log("WARNING: Could not auto-select newly added address");
+      console.log("WARNING: Could not find matching address in saved list — continuing with current address");
     }
 
     // Wait for modal to close
@@ -2120,11 +2092,15 @@ export class FlipkartPlatform extends BasePlatform {
       try {
         const stillOpen = await this.page.evaluate(() => {
           const body = document.body?.innerText || "";
-          return body.includes("Select Delivery Address") || body.includes("Edit Address") || body.includes("ADD A NEW ADDRESS");
+          return (
+            body.includes("Select Delivery Address") ||
+            body.includes("Edit Address") ||
+            body.includes("ADD A NEW ADDRESS")
+          );
         });
         if (!stillOpen) {
           modalClosed = true;
-          console.log(`Modal closed after ~${(i + 1) * 1000}ms`);
+          console.log(`Address modal closed after ~${(i + 1) * 1000}ms`);
         }
       } catch (err) {
         const msg = (err as Error).message;
@@ -2803,127 +2779,10 @@ export class FlipkartPlatform extends BasePlatform {
       }, address);
 
       if (stillWrong) {
-        console.log("Address not correctly set — will add new address");
+        console.log("WARNING: Address not correctly set — continuing with current address");
       } else {
         console.log("Address appears correct after refresh — proceeding");
-        return;
       }
-    }
-
-    console.log("Address not found in list — will add new address");
-
-    // ----------------------------------------------------------------
-    // Step 3: Add new address
-    // ----------------------------------------------------------------
-    // Open new tab to add address
-    const browser = this.page.browser();
-    const newTab = await browser.newPage();
-    console.log("Opening /account/addresses in new tab...");
-    await newTab.goto("https://www.flipkart.com/account/addresses", {
-      waitUntil: "networkidle2",
-      timeout: 20000,
-    });
-
-    // Wait for the page to fully load — handle detached frame errors
-    try {
-      await newTab.waitForFunction(
-        () => (document.body?.innerText || "").length > 100,
-        { timeout: 15000 }
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("detached") || msg.includes("Frame")) {
-        console.log("[AddAddress] Frame detached during page load, retrying...");
-        await sleep(500);
-      }
-    }
-    await sleep(500);
-
-    // Click ADD A NEW ADDRESS
-    console.log("Clicking ADD A NEW ADDRESS...");
-    await this.clickAddNewAddressButton(newTab);
-    await sleep(500);
-
-    // Wait for the form to appear
-    try {
-      await newTab.waitForFunction(
-        () => {
-          const nameInput = document.querySelector('input[name="name"]');
-          return nameInput !== null;
-        },
-        { timeout: 10000 }
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("detached") || msg.includes("Frame")) {
-        console.log("[AddAddress] Frame detached waiting for form, retrying...");
-        await sleep(500);
-      }
-    }
-    await sleep(300);
-
-    // Fill form
-    console.log("Filling address form...");
-    await this.fillAddressForm(newTab, address);
-
-    // Click Save
-    console.log("Clicking Save...");
-    await this.clickSaveButton(newTab);
-
-    // Wait for save to process — watch for navigation or confirmation
-    let saved = false;
-    for (let i = 0; i < 8 && !saved; i++) {
-      await sleep(300);
-      try {
-        const pageState = await newTab.evaluate(() => {
-          const body = document.body?.innerText || "";
-          return {
-            text: body.replace(/\s+/g, " ").trim().slice(0, 200),
-            url: window.location.href,
-          };
-        });
-        // Check if we're no longer on the add-address form
-        const nameInput = await newTab.$('input[name="name"]');
-        if (!nameInput) {
-          console.log(`[AddAddress] Form closed after ${(i + 1) * 1000}ms — save appears successful`);
-          saved = true;
-        } else {
-          console.log(`[AddAddress] Still on form (${(i + 1) * 1000}ms): ${pageState.text.slice(0, 100)}`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes("detached") || msg.includes("Frame")) {
-          console.log(`[AddAddress] Frame detached while waiting for save (attempt ${i + 1}/8)`);
-          saved = true; // Assume save happened
-        }
-      }
-    }
-
-    if (!saved) {
-      console.log("[AddAddress] WARNING: Could not confirm save, proceeding anyway");
-    }
-
-    await newTab.close();
-    console.log("Closed new tab, returning to checkout");
-
-    // Go back to checkout
-    await this.page.goto("https://www.flipkart.com/viewcheckout", {
-      waitUntil: "networkidle2",
-      timeout: 20000,
-    });
-    await sleep(500);
-
-    // Click Change again and select the newly added address
-    console.log("Clicking Change on checkout to select newly added address...");
-    await this.clickAddressChangeButton();
-    await sleep(500);
-
-    const selected = await this.selectAddressFromList(address);
-    if (selected) {
-      console.log("Selected newly added address");
-      await sleep(500);
-    } else {
-      console.log("WARNING: Could not auto-select newly added address");
     }
   }
 

@@ -107,4 +107,29 @@ export abstract class BasePlatform {
   async verifyAddressOnCheckout(_address?: AddressDetails): Promise<void> {
     // Default: no-op for platforms that don't support this
   }
+
+  /** Extract order details from the confirmation page after a successful order */
+  async extractOrderDetails(): Promise<OrderDetails> {
+    return {
+      orderId: "",
+      model: "",
+      colour: "",
+      quantity: 0,
+      pinCode: "",
+      amount: "",
+      perPc: "",
+      orderDate: new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short" }),
+    };
+  }
+}
+
+export interface OrderDetails {
+  orderId: string;
+  model: string;
+  colour: string;
+  quantity: number;
+  pinCode: string;
+  amount: string;
+  perPc: string;
+  orderDate: string;
 }

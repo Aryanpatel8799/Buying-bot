@@ -54,7 +54,7 @@ export class RTGSPayment extends BasePayment {
         };
       });
 
-      if (!rtgsButton) await sleep(500);
+      if (!rtgsButton) await sleep(300);
     }
 
     if (!rtgsButton) {
@@ -72,8 +72,8 @@ export class RTGSPayment extends BasePayment {
     await this.page.mouse.click(rtgsButton.x, rtgsButton.y);
     console.log("[RTGS] RTGS button clicked with real mouse");
 
-    // Wait for page to respond — Flipkart may open bank portal or show RTGS confirmation
-    await sleep(3000);
+    // Brief wait for page to respond after RTGS selection
+    await sleep(1000);
 
     // Detect if a new popup tab opened for the bank portal
     const browser = this.page.browser();
@@ -109,8 +109,8 @@ export class RTGSPayment extends BasePayment {
 
     console.log("[RTGS] confirmPayment: looking for Place Order button...");
 
-    // Wait for the page to render after RTGS selection
-    await sleep(1500);
+    // Brief wait for the page to render after RTGS selection
+    await sleep(500);
 
     // Wait up to 10s for the button to appear
     for (let attempt = 0; attempt < 20; attempt++) {
@@ -184,10 +184,10 @@ export class RTGSPayment extends BasePayment {
           return true;
         }
 
-        // Wait up to 3s for the page to navigate away (URL change = click worked)
+        // Wait up to 2s for the page to navigate away (URL change = click worked)
         const startUrl = this.page.url();
         for (let w = 0; w < 6; w++) {
-          await sleep(500);
+          await sleep(300);
           try {
             const currentUrl = this.page.url();
             if (currentUrl !== startUrl || currentUrl.includes("/payments/rtgs/poll")) {
@@ -233,7 +233,7 @@ export class RTGSPayment extends BasePayment {
 
         if (jsResult) {
           // Check if navigation happened
-          await sleep(1000);
+          await sleep(500);
           try {
             const afterUrl = this.page.url();
             if (afterUrl.includes("/payments/rtgs/poll") || afterUrl !== startUrl) {
