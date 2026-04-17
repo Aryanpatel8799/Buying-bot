@@ -77,10 +77,12 @@ export async function POST(req: NextRequest) {
 
     const configB64 = Buffer.from(JSON.stringify(config)).toString("base64");
 
-    const child = spawn("npx", ["tsx", "automation/features/addressRunner.ts", configB64], {
+    const isWindows = process.platform === "win32";
+    const child = spawn(isWindows ? "npx.cmd" : "npx", ["tsx", "automation/features/addressRunner.ts", configB64], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: process.cwd(),
       detached: true,
+      shell: isWindows,
     });
 
     const logs: string[] = [];
