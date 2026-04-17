@@ -6,7 +6,7 @@ import GiftCardHistory from "@/lib/db/models/GiftCardHistory";
 import { getProfileDir } from "@/lib/platform/chromePaths";
 import { encrypt } from "@/lib/encryption";
 import { checkRateLimit, rateLimitResponse } from "@/lib/rateLimit";
-import { spawn } from "child_process";
+import { spawnTsx } from "@/lib/jobs/spawnTsx";
 import { z } from "zod";
 
 const giftCardSchema = z.object({
@@ -113,12 +113,8 @@ export async function POST(req: NextRequest) {
     const configB64 = Buffer.from(JSON.stringify(config)).toString("base64");
 
     // Spawn the gift card runner
-    const isWindows = process.platform === "win32";
-    const child = spawn(isWindows ? "npx.cmd" : "npx", ["tsx", "automation/features/giftCardRunner.ts", configB64], {
+    const child = spawnTsx("automation/features/giftCardRunner.ts", [configB64], {
       stdio: ["pipe", "pipe", "pipe"],
-      cwd: process.cwd(),
-      detached: true,
-      shell: isWindows,
     });
 
     // Collect output
