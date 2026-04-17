@@ -30,6 +30,19 @@ interface CardStatus {
   status: "added" | "not added";
 }
 
+interface SavedAccount {
+  _id: string;
+  label: string;
+  maskedEmail: string;
+}
+
+interface InstaDdrGroup {
+  _id: string;
+  label: string;
+  platform: string;
+  totalAccounts: number;
+}
+
 export default function GiftCardsPage() {
   const { status } = useSession();
   const router = useRouter();
@@ -45,6 +58,16 @@ export default function GiftCardsPage() {
 
   // Platform selector
   const [platform, setPlatform] = useState<"flipkart" | "amazon">("flipkart");
+
+  // Flipkart account login (single-select; optional)
+  const [savedAccounts, setSavedAccounts] = useState<SavedAccount[]>([]);
+  const [useAccountLogin, setUseAccountLogin] = useState(false);
+  const [selectedAccountId, setSelectedAccountId] = useState("");
+
+  // InstaDDR auto-OTP (single-select; optional, requires account login)
+  const [instaDdrGroups, setInstaDdrGroups] = useState<InstaDdrGroup[]>([]);
+  const [useInstaDdr, setUseInstaDdr] = useState(false);
+  const [selectedInstaDdrGroupId, setSelectedInstaDdrGroupId] = useState("");
 
   // Manual entry
   const [cardNumber, setCardNumber] = useState("");
@@ -65,8 +88,20 @@ export default function GiftCardsPage() {
     if (status === "authenticated") {
       fetchProfiles();
       fetchHistory();
+      fetchSavedAccounts();
+      fetchInstaDdrGroups();
     }
   }, [status, router]);
+
+  async function fetchSavedAccounts() {
+    const res = await fetch("/api/accounts");
+    if (res.ok) setSavedAccounts(await res.json());
+  }
+
+  async function fetchInstaDdrGroups() {
+    const res = await fetch("/api/instaddr");
+    if (res.ok) setInstaDdrGroups(await res.json());
+  }
 
   async function fetchProfiles() {
     const res = await fetch("/api/profiles");
@@ -228,6 +263,19 @@ export default function GiftCardsPage() {
       return;
     }
 
+    if (useAccountLogin && !selectedAccountId) {
+      setError("Select a Flipkart account or turn off account login");
+      return;
+    }
+    if (useInstaDdr && !selectedInstaDdrGroupId) {
+      setError("Select an InstaDDR group or turn off auto-OTP");
+      return;
+    }
+    if (useInstaDdr && !useAccountLogin) {
+      setError("InstaDDR auto-OTP requires account login — enable account login first");
+      return;
+    }
+
     setLoading(true);
     setError("");
     setSuccess("");
@@ -240,6 +288,10 @@ export default function GiftCardsPage() {
         body: JSON.stringify({
           chromeProfileId,
           platform,
+          ...(useAccountLogin && selectedAccountId ? { accountId: selectedAccountId } : {}),
+          ...(useAccountLogin && useInstaDdr && selectedInstaDdrGroupId
+            ? { instaDdrAccountId: selectedInstaDdrGroupId }
+            : {}),
           giftCards: giftCards.map((gc) => ({
             cardNumber: gc.cardNumber,
             pin: gc.pin,
@@ -439,9 +491,129 @@ export default function GiftCardsPage() {
               ))}
             </select>
             <p className="text-xs text-gray-500 mt-1">
-              Must be logged into {platform === "flipkart" ? "Flipkart" : "Amazon"}
+              {platform === "flipkart"
+                ? useAccountLogin
+                  ? "The bot will log into the chosen account before adding cards"
+                  : "Must already be logged into Flipkart, or enable account login below"
+                : "Must be logged into Amazon"}
             </p>
           </div>
+
+          {/* Flipkart account login (single-select) */}
+          {platform === "flipkart" && (
+            <div className="mb-6 p-5 bg-gray-900 rounded-xl border border-gray-800">
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-200">Account Login</h3>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    Log into a specific Flipkart account before adding cards
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !useAccountLogin;
+                    setUseAccountLogin(next);
+                    if (!next) {
+                      setSelectedAccountId("");
+                      setUseInstaDdr(false);
+                      setSelectedInstaDdrGroupId("");
+                    }
+                  }}
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                    useAccountLogin ? "bg-blue-600" : "bg-gray-700"
+                  }`}
+                  aria-label="Toggle account login"
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      useAccountLogin ? "translate-x-6" : "translate-x-1"
+                    }`}
+                  />
+                </button>
+              </div>
+
+              {useAccountLogin && (
+                <>
+                  {savedAccounts.length === 0 ? (
+                    <div className="text-sm text-gray-400 p-3 bg-gray-800 rounded-lg border border-gray-700">
+                      No saved Flipkart accounts.{" "}
+                      <a href="/dashboard/accounts" className="text-blue-400 hover:text-blue-300">
+                        Add one first →
+                      </a>
+                    </div>
+                  ) : (
+                    <select
+                      value={selectedAccountId}
+                      onChange={(e) => setSelectedAccountId(e.target.value)}
+                      className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-xl text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+                    >
+                      <option value="">— Select an account —</option>
+                      {savedAccounts.map((a) => (
+                        <option key={a._id} value={a._id}>
+                          {a.label} ({a.maskedEmail})
+                        </option>
+                      ))}
+                    </select>
+                  )}
+
+                  {/* InstaDDR auto-OTP — only shown when account login is on */}
+                  <div className="mt-4 pt-4 border-t border-gray-800">
+                    <div className="flex items-center justify-between mb-3">
+                      <div>
+                        <h4 className="text-sm font-semibold text-gray-200">InstaDDR Auto-OTP</h4>
+                        <p className="text-xs text-gray-500 mt-0.5">
+                          Automatically fetch the Flipkart OTP from InstaDDR
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const next = !useInstaDdr;
+                          setUseInstaDdr(next);
+                          if (!next) setSelectedInstaDdrGroupId("");
+                        }}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                          useInstaDdr ? "bg-blue-600" : "bg-gray-700"
+                        }`}
+                        aria-label="Toggle InstaDDR"
+                      >
+                        <span
+                          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                            useInstaDdr ? "translate-x-6" : "translate-x-1"
+                          }`}
+                        />
+                      </button>
+                    </div>
+
+                    {useInstaDdr && (
+                      instaDdrGroups.length === 0 ? (
+                        <div className="text-sm text-gray-400 p-3 bg-gray-800 rounded-lg border border-gray-700">
+                          No InstaDDR groups.{" "}
+                          <a href="/dashboard/instaddr" className="text-blue-400 hover:text-blue-300">
+                            Add one first →
+                          </a>
+                        </div>
+                      ) : (
+                        <select
+                          value={selectedInstaDdrGroupId}
+                          onChange={(e) => setSelectedInstaDdrGroupId(e.target.value)}
+                          className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-xl text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+                        >
+                          <option value="">— Select an InstaDDR group —</option>
+                          {instaDdrGroups.map((g) => (
+                            <option key={g._id} value={g._id}>
+                              {g.label} ({g.totalAccounts} account{g.totalAccounts !== 1 ? "s" : ""})
+                            </option>
+                          ))}
+                        </select>
+                      )
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
 
           {/* Manual Entry */}
           <div className="mb-6 p-5 bg-gray-900 rounded-xl border border-gray-800">

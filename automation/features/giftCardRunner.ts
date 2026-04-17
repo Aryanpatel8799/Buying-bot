@@ -13,6 +13,9 @@
 
 import { BrowserManager } from "../core/BrowserManager";
 import { sendMessage, sleep, navigateWithRetry, waitWithRetry, clearAndType, withTimeout } from "../core/helpers";
+import { FlipkartPlatform } from "../platforms/FlipkartPlatform";
+import { InstaDdrService } from "../services/InstaDdrService";
+import type { Browser } from "puppeteer-core";
 
 // ── Register a shadow-piercing query handler for Amazon's web components ──
 import * as puppeteerCore from "puppeteer-core";
@@ -51,6 +54,12 @@ interface GiftCardEntry {
   pin: string;
 }
 
+interface InstaDdrAccountConfig {
+  instaDdrId: string;
+  instaDdrPassword: string;
+  email: string;
+}
+
 interface GiftCardConfig {
   chromeProfileDir: string;
   platform: "flipkart" | "amazon";
@@ -58,6 +67,10 @@ interface GiftCardConfig {
   batchSize?: number;
   maxRetries?: number;
   cardTimeoutMs?: number;
+  /** Optional Flipkart account email — when provided, runner logs in before adding cards */
+  account?: string;
+  /** Optional InstaDDR accounts for auto-OTP fetch during login */
+  instaDdrAccounts?: InstaDdrAccountConfig[];
 }
 
 // ─── Flipkart Gift Card Flow ────────────────────────────────────────────────
@@ -584,9 +597,53 @@ async function main() {
   }
 
   const browserManager = new BrowserManager();
+  let instaDdrService: InstaDdrService | null = null;
 
   try {
     const { page } = await browserManager.launch(config.chromeProfileDir);
+
+    // ── Optional Flipkart account login (mirrors BatchOrchestrator login block) ──
+    if (config.account && platform === "flipkart") {
+      const flipkartPlatform = new FlipkartPlatform(page, "https://www.flipkart.com");
+
+      // Pick the InstaDDR account whose email matches the chosen account, else
+      // fall back to the first one in the group.
+      const instaDdrAccount = config.instaDdrAccounts && config.instaDdrAccounts.length > 0
+        ? config.instaDdrAccounts.find((a) => a.email.toLowerCase() === config.account!.toLowerCase())
+          ?? config.instaDdrAccounts[0]
+        : undefined;
+
+      if (instaDdrAccount) {
+        sendMessage({ type: "log", level: "info", message: "Creating isolated InstaDDR browser context..." });
+        const browser = page.browser() as Browser;
+        const instaDdrContext = await browser.createBrowserContext();
+        const instaDdrPage = await instaDdrContext.newPage();
+        instaDdrService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
+      }
+
+      const maskedEmail = `${config.account.substring(0, 3)}***`;
+      sendMessage({
+        type: "log",
+        level: "info",
+        message: `Logging in to Flipkart as ${maskedEmail}` +
+          (instaDdrService ? " (InstaDDR auto-OTP)" : " (manual OTP — enter in browser)"),
+      });
+
+      const instaOptions = instaDdrService && instaDdrAccount
+        ? { instaDdrService, instaDdrAccount }
+        : undefined;
+
+      await flipkartPlatform.loginWithEmail(config.account, instaOptions);
+
+      if (!instaOptions) {
+        // No InstaDDR — wait for manual OTP entry in the browser
+        sendMessage({ type: "log", level: "info", message: `Waiting for manual OTP entry (up to 5 min)...` });
+        const ok = await flipkartPlatform.waitForLoginCompletion(300000);
+        if (!ok) throw new Error(`Login timed out for ${maskedEmail}`);
+      }
+
+      sendMessage({ type: "log", level: "info", message: `Login successful — proceeding with gift card additions` });
+    }
 
     let added = 0;
     let failed = 0;
@@ -651,6 +708,13 @@ async function main() {
     sendMessage({ type: "log", level: "error", message: `Gift Card Runner fatal error: ${errMsg}` });
     process.exit(1);
   } finally {
+    if (instaDdrService) {
+      try {
+        await instaDdrService.close();
+      } catch {
+        /* ignore */
+      }
+    }
     await browserManager.close();
   }
 }
