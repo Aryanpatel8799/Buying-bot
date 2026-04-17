@@ -198,9 +198,13 @@ export class JobExecutor extends EventEmitter {
 
     // Spawn the runner as a child process using tsx
     // Using spawn instead of fork to avoid Next.js bundler resolving the path
-    this.process = spawn("npx", ["tsx", "automation/runner.ts", configB64], {
+    // On Windows, `npx` is `npx.cmd` — Node's spawn can't execute .cmd files
+    // without shell: true, so jobs would fail silently with ENOENT.
+    const isWindows = process.platform === "win32";
+    this.process = spawn(isWindows ? "npx.cmd" : "npx", ["tsx", "automation/runner.ts", configB64], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: process.cwd(),
+      shell: isWindows,
     });
 
     // Update job status
