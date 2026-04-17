@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from "child_process";
+import { ChildProcess } from "child_process";
 import { EventEmitter } from "events";
 import dbConnect from "@/lib/db/connect";
 import Job from "@/lib/db/models/Job";
@@ -10,6 +10,7 @@ import InstaDdrAccount from "@/lib/db/models/InstaDdrAccount";
 import { decrypt } from "@/lib/encryption";
 import { getProfileDir } from "@/lib/platform/chromePaths";
 import { removeExecutor } from "./jobRegistry";
+import { spawnTsx } from "./spawnTsx";
 import type { RunnerMessage, JobConfig } from "@/types";
 
 export class JobExecutor extends EventEmitter {
@@ -196,15 +197,8 @@ export class JobExecutor extends EventEmitter {
 
     const configB64 = Buffer.from(JSON.stringify(config)).toString("base64");
 
-    // Spawn the runner as a child process using tsx
-    // Using spawn instead of fork to avoid Next.js bundler resolving the path
-    // On Windows, `npx` is `npx.cmd` — Node's spawn can't execute .cmd files
-    // without shell: true, so jobs would fail silently with ENOENT.
-    const isWindows = process.platform === "win32";
-    this.process = spawn(isWindows ? "npx.cmd" : "npx", ["tsx", "automation/runner.ts", configB64], {
+    this.process = spawnTsx("automation/runner.ts", [configB64], {
       stdio: ["pipe", "pipe", "pipe"],
-      cwd: process.cwd(),
-      shell: isWindows,
     });
 
     // Update job status

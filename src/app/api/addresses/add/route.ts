@@ -5,7 +5,7 @@ import ChromeProfile from "@/lib/db/models/ChromeProfile";
 import SavedAddress from "@/lib/db/models/SavedAddress";
 import { getProfileDir } from "@/lib/platform/chromePaths";
 import { checkRateLimit, rateLimitResponse } from "@/lib/rateLimit";
-import { spawn } from "child_process";
+import { spawnTsx } from "@/lib/jobs/spawnTsx";
 import { z } from "zod";
 
 const addressAddSchema = z.object({
@@ -77,12 +77,8 @@ export async function POST(req: NextRequest) {
 
     const configB64 = Buffer.from(JSON.stringify(config)).toString("base64");
 
-    const isWindows = process.platform === "win32";
-    const child = spawn(isWindows ? "npx.cmd" : "npx", ["tsx", "automation/features/addressRunner.ts", configB64], {
+    const child = spawnTsx("automation/features/addressRunner.ts", [configB64], {
       stdio: ["pipe", "pipe", "pipe"],
-      cwd: process.cwd(),
-      detached: true,
-      shell: isWindows,
     });
 
     const logs: string[] = [];
