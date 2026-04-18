@@ -28,7 +28,8 @@ const giftCardSchema = z.object({
           .default(""),
       })
     )
-    .min(1, "At least one gift card is required"),
+    .min(1, "At least one gift card is required")
+    .max(5000, "Maximum 5000 gift cards per submission"),
 });
 
 // POST /api/giftcards/add — launch gift card adder automation
@@ -40,8 +41,8 @@ export async function POST(req: NextRequest) {
 
   const userId = (session.user as { id: string }).id;
 
-  // Rate limit: 5 requests per minute
-  if (!checkRateLimit(`giftcards-add:${userId}`, 5, 5 / 60)) {
+  // Rate limit: 20 requests per minute (each can carry up to 5000 cards)
+  if (!checkRateLimit(`giftcards-add:${userId}`, 20, 20 / 60)) {
     return rateLimitResponse();
   }
 
@@ -163,6 +164,11 @@ export async function POST(req: NextRequest) {
       platform: data.platform,
       giftCards: toAdd,
       historyIds: historyEntries.map((h) => h._id.toString()),
+      // Tuned for large batches (up to 5000 cards): reload page less often,
+      // retry more aggressively, allow slower Flipkart responses.
+      batchSize: 100,
+      maxRetries: 3,
+      cardTimeoutMs: 45000,
       ...(accountEmail ? { account: accountEmail } : {}),
       ...(instaDdrAccounts && instaDdrAccounts.length > 0 ? { instaDdrAccounts } : {}),
     };
@@ -228,11 +234,12 @@ export async function POST(req: NextRequest) {
       failed: number;
       logs: string[];
     }>((resolve) => {
-      // Timeout: 5 min base + 3s per card. Login flow (with manual OTP up to
-      // ~5 min) adds significant time, so bump base when an account login is
-      // required.
+      // Timeout sized for large batches (up to 5000 cards):
+      //   base 10 min + 10s per card + 10 min headroom + login buffer.
+      // A 5000-card run = 10min + ~14h + 10min ≈ 14.3h — will stay open as
+      // long as the Nginx proxy_read_timeout allows (see nginx conf).
       const loginBufferMs = accountEmail ? 360000 : 0;
-      const timeoutMs = Math.max(300000, toAdd.length * 3000 + 60000 + loginBufferMs);
+      const timeoutMs = Math.max(600000, toAdd.length * 10000 + 600000 + loginBufferMs);
       const timeout = setTimeout(() => {
         child.kill("SIGKILL");
         resolve({
