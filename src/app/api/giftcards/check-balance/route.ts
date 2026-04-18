@@ -2,9 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { getAuthSession } from "@/lib/auth/getSession";
 import dbConnect from "@/lib/db/connect";
 import ChromeProfile from "@/lib/db/models/ChromeProfile";
+import GiftCardJob from "@/lib/db/models/GiftCardJob";
 import { getProfileDir } from "@/lib/platform/chromePaths";
 import { checkRateLimit, rateLimitResponse } from "@/lib/rateLimit";
 import { spawnTsx } from "@/lib/jobs/spawnTsx";
+import { cleanupStaleJobs } from "@/lib/jobs/startupCleanup";
 import { z } from "zod";
 
 const checkBalanceSchema = z.object({
@@ -29,7 +31,7 @@ const checkBalanceSchema = z.object({
     .max(5000, "Maximum 5000 gift cards per submission"),
 });
 
-// POST /api/giftcards/check-balance — launch gift card balance checker
+// POST /api/giftcards/check-balance — queues a verify job, returns jobId.
 export async function POST(req: NextRequest) {
   const session = await getAuthSession();
   if (!session?.user) {
@@ -48,6 +50,7 @@ export async function POST(req: NextRequest) {
     const data = checkBalanceSchema.parse(body);
 
     await dbConnect();
+    await cleanupStaleJobs();
 
     const profile = await ChromeProfile.findOne({
       _id: data.chromeProfileId,
@@ -62,7 +65,17 @@ export async function POST(req: NextRequest) {
 
     const chromeProfileDir = getProfileDir(profile.directoryName);
 
+    // Create the GiftCardJob tracking record
+    const job = await GiftCardJob.create({
+      userId,
+      kind: "verify",
+      platform: "flipkart",
+      status: "pending",
+      total: data.giftCards.length,
+    });
+
     const config = {
+      jobId: String(job._id),
       chromeProfileDir,
       phoneNumber: data.phoneNumber,
       giftCards: data.giftCards,
@@ -71,82 +84,32 @@ export async function POST(req: NextRequest) {
     const configB64 = Buffer.from(JSON.stringify(config)).toString("base64");
 
     const child = spawnTsx("automation/features/giftCardBalanceChecker.ts", [configB64], {
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: "ignore",
+      detached: true,
     });
-
-    const logs: string[] = [];
-    let completed = 0;
-    let failed = 0;
-    const balanceResults: { cardNumber: string; pin: string; balance: string; status: string }[] = [];
-    let otpRequired = false;
-    let loggedIn = false;
-
-    child.stdout?.on("data", (chunk: Buffer) => {
-      const lines = chunk.toString().split("\n").filter(Boolean);
-      for (const line of lines) {
-        try {
-          const msg = JSON.parse(line);
-          if (msg.type === "log") {
-            logs.push(`[${msg.level.toUpperCase()}] ${msg.message}`);
-          } else if (msg.type === "otp_required") {
-            otpRequired = true;
-          } else if (msg.type === "logged_in") {
-            loggedIn = true;
-          } else if (msg.type === "balance_result") {
-            balanceResults.push({
-              cardNumber: msg.cardNumber,
-              pin: msg.pin,
-              balance: msg.balance,
-              status: msg.status,
-            });
-          } else if (msg.type === "done") {
-            completed = msg.completed;
-            failed = msg.failed;
+    child.on("error", async (err) => {
+      console.error(`[GiftCardJob ${job._id}] failed to spawn balance checker:`, err);
+      try {
+        await GiftCardJob.updateOne(
+          { _id: job._id },
+          {
+            status: "failed",
+            errorMessage: `Failed to start runner: ${err.message}`,
+            completedAt: new Date(),
           }
-        } catch {
-          logs.push(line);
-        }
-      }
+        );
+      } catch { /* ignore */ }
     });
+    child.unref();
 
-    child.stderr?.on("data", (chunk: Buffer) => {
-      console.error("[BalanceChecker stderr]", chunk.toString());
-    });
-
-    const result = await new Promise<{
-      completed: number;
-      failed: number;
-      logs: string[];
-      balanceResults: typeof balanceResults;
-    }>((resolve) => {
-      // Timeout sized for large batches (up to 5000 cards):
-      //   base 10 min + 20s per card + 10 min headroom (includes OTP wait).
-      // A 5000-card run ≈ 10min + 27.7h + 10min ≈ 28h. Relies on the Nginx
-      // proxy_read_timeout being set high enough (see nginx conf).
-      const timeoutMs = Math.max(600000, data.giftCards.length * 20000 + 600000);
-      const timeout = setTimeout(() => {
-        child.kill("SIGKILL");
-        resolve({
-          completed,
-          failed,
-          logs: [...logs, `[ERROR] Process timed out (${Math.round(timeoutMs / 1000)}s)`],
-          balanceResults,
-        });
-      }, timeoutMs);
-
-      child.on("exit", () => {
-        clearTimeout(timeout);
-        resolve({ completed, failed, logs, balanceResults });
-      });
-    });
+    await GiftCardJob.updateOne(
+      { _id: job._id },
+      { pid: child.pid ?? null, startedAt: new Date() }
+    );
 
     return NextResponse.json({
       success: true,
-      completed: result.completed,
-      failed: result.failed,
-      total: data.giftCards.length,
-      logs: result.logs,
-      balanceResults: result.balanceResults,
+      jobId: String(job._id),
     });
   } catch (error) {
     if (error instanceof z.ZodError) {

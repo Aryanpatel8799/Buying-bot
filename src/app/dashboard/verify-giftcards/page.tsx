@@ -42,10 +42,23 @@ export default function VerifyGiftCardsPage() {
   const [csvErrors, setCsvErrors] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // SSE stream handle (for async job progress)
+  const eventSourceRef = useRef<EventSource | null>(null);
+
   useEffect(() => {
     if (status === "unauthenticated") router.push("/login");
     if (status === "authenticated") fetchProfiles();
   }, [status, router]);
+
+  // Close the stream when the component unmounts
+  useEffect(() => {
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+  }, []);
 
   async function fetchProfiles() {
     const res = await fetch("/api/profiles");
@@ -214,37 +227,71 @@ export default function VerifyGiftCardsPage() {
 
       const data = await res.json();
 
-      if (!res.ok) {
-        setError(data.error || "Failed to check balances");
+      if (!res.ok || !data.jobId) {
+        setError(data.error || "Failed to queue balance check");
         setLoading(false);
         return;
       }
 
-      setLogs(data.logs || []);
-
-      // Update per-card balances
-      if (data.balanceResults && data.balanceResults.length > 0) {
-        const resultMap = new Map<string, { balance: string; status: "success" | "error" }>();
-        for (const br of data.balanceResults) {
-          resultMap.set(br.cardNumber, { balance: br.balance, status: br.status });
-        }
-        setGiftCards((prev) =>
-          prev.map((gc) => {
-            const result = resultMap.get(gc.cardNumber);
-            return result ? { ...gc, balance: result.balance, status: result.status } : gc;
-          })
-        );
-      }
-
-      const parts = [];
-      if (data.completed > 0) parts.push(`${data.completed} checked`);
-      if (data.failed > 0) parts.push(`${data.failed} failed`);
-      setSuccess(`Done! ${parts.join(", ")} out of ${data.total} total.`);
+      subscribeToJob(data.jobId);
     } catch {
       setError("Something went wrong");
-    } finally {
       setLoading(false);
     }
+  }
+
+  function subscribeToJob(jobId: string) {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    const es = new EventSource(`/api/giftcards/jobs/${jobId}/stream`);
+    eventSourceRef.current = es;
+
+    es.addEventListener("log", (ev) => {
+      try {
+        const l = JSON.parse((ev as MessageEvent).data);
+        setLogs((prev) => [...prev, `[${(l.level || "info").toUpperCase()}] ${l.message}`]);
+      } catch { /* ignore */ }
+    });
+
+    es.addEventListener("card_status", (ev) => {
+      try {
+        const c = JSON.parse((ev as MessageEvent).data) as {
+          cardNumber: string; balance?: string; status: "success" | "error";
+        };
+        setGiftCards((prev) =>
+          prev.map((gc) =>
+            gc.cardNumber === c.cardNumber
+              ? { ...gc, balance: c.balance ?? gc.balance, status: c.status }
+              : gc
+          )
+        );
+      } catch { /* ignore */ }
+    });
+
+    es.addEventListener("done", (ev) => {
+      try {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          status: string; total: number; completed: number; failed: number; errorMessage?: string;
+        };
+        const parts: string[] = [];
+        if (d.completed > 0) parts.push(`${d.completed} checked`);
+        if (d.failed > 0) parts.push(`${d.failed} failed`);
+        if (d.status === "failed") {
+          setError(d.errorMessage || "Job failed");
+        } else {
+          setSuccess(`Done! ${parts.join(", ") || "no cards"} out of ${d.total} total.`);
+        }
+      } catch { /* ignore */ }
+      es.close();
+      eventSourceRef.current = null;
+      setLoading(false);
+    });
+
+    es.onerror = () => {
+      setLogs((prev) => [...prev, "[WARN] Stream connection interrupted — reconnecting..."]);
+    };
   }
 
   function downloadResultCSV() {

@@ -173,11 +173,32 @@ export async function clearAndType(
   console.log(`Entered "${displayValue}" into ${label || selector}`);
 }
 
+type MessageListener = (msg: object) => void;
+const listeners: MessageListener[] = [];
+
+/**
+ * Register a side-channel listener for sendMessage() calls. Used by runners
+ * that also need to persist messages to a database (see giftCardJobReporter).
+ * Returns an unsubscribe fn.
+ */
+export function onSendMessage(listener: MessageListener): () => void {
+  listeners.push(listener);
+  return () => {
+    const i = listeners.indexOf(listener);
+    if (i >= 0) listeners.splice(i, 1);
+  };
+}
+
 export function sendMessage(msg: object): void {
   try {
     process.stdout.write(JSON.stringify(msg) + "\n");
   } catch {
     // Pipe closed — process is terminating
+  }
+  for (const l of listeners) {
+    try {
+      l(msg);
+    } catch { /* swallow — listener errors must never break the runner */ }
   }
 }
 

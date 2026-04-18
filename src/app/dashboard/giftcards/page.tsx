@@ -57,6 +57,7 @@ export default function GiftCardsPage() {
   const [logs, setLogs] = useState<string[]>([]);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [historyLoading, setHistoryLoading] = useState(true);
+  const eventSourceRef = useRef<EventSource | null>(null);
 
   // Platform selector
   const [platform, setPlatform] = useState<"flipkart" | "amazon">("flipkart");
@@ -322,40 +323,84 @@ export default function GiftCardsPage() {
 
       const data = await res.json();
 
-      if (!res.ok) {
-        setError(data.error || "Failed to add gift cards");
+      if (!res.ok || !data.jobId) {
+        setError(data.error || "Failed to queue gift card job");
         setLoading(false);
         return;
       }
 
-      setLogs(data.logs || []);
-
-      // Update per-card statuses in the queue
-      if (data.cardStatuses && data.cardStatuses.length > 0) {
-        const statusMap = new Map<string, "added" | "not added">();
-        for (const cs of data.cardStatuses as CardStatus[]) {
-          statusMap.set(cs.cardNumber, cs.status);
-        }
-        setGiftCards((prev) =>
-          prev.map((gc) => ({
-            ...gc,
-            status: statusMap.get(gc.cardNumber) || gc.status || "",
-          }))
-        );
-      }
-
-      const parts = [];
-      if (data.completed > 0) parts.push(`${data.completed} added`);
-      if (data.failed > 0) parts.push(`${data.failed} failed`);
-      if (data.skipped > 0) parts.push(`${data.skipped} skipped (already added)`);
-      setSuccess(`Done! ${parts.join(", ")} out of ${data.total} total.`);
-      fetchHistory();
+      subscribeToJob(data.jobId);
     } catch {
       setError("Something went wrong");
-    } finally {
       setLoading(false);
     }
   }
+
+  function subscribeToJob(jobId: string) {
+    // Close any previous stream
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+
+    const es = new EventSource(`/api/giftcards/jobs/${jobId}/stream`);
+    eventSourceRef.current = es;
+
+    es.addEventListener("log", (ev) => {
+      try {
+        const l = JSON.parse((ev as MessageEvent).data);
+        setLogs((prev) => [...prev, `[${(l.level || "info").toUpperCase()}] ${l.message}`]);
+      } catch { /* ignore malformed */ }
+    });
+
+    es.addEventListener("card_status", (ev) => {
+      try {
+        const c = JSON.parse((ev as MessageEvent).data) as { cardNumber: string; status: "added" | "not added" };
+        setGiftCards((prev) =>
+          prev.map((gc) =>
+            gc.cardNumber === c.cardNumber ? { ...gc, status: c.status } : gc
+          )
+        );
+      } catch { /* ignore */ }
+    });
+
+    es.addEventListener("done", (ev) => {
+      try {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          status: string; total: number; completed: number; failed: number; skipped: number; errorMessage?: string;
+        };
+        const parts: string[] = [];
+        if (d.completed > 0) parts.push(`${d.completed} added`);
+        if (d.failed > 0) parts.push(`${d.failed} failed`);
+        if (d.skipped > 0) parts.push(`${d.skipped} skipped (already added)`);
+        if (d.status === "failed") {
+          setError(d.errorMessage || "Job failed");
+        } else {
+          setSuccess(`Done! ${parts.join(", ") || "no cards"} out of ${d.total} total.`);
+        }
+        fetchHistory();
+      } catch { /* ignore */ }
+      es.close();
+      eventSourceRef.current = null;
+      setLoading(false);
+    });
+
+    es.onerror = () => {
+      // Browser will auto-reconnect; surface a non-fatal notice. If it fails
+      // permanently and the job is truly gone, the GET endpoint will tell us.
+      setLogs((prev) => [...prev, "[WARN] Stream connection interrupted — reconnecting..."]);
+    };
+  }
+
+  // Clean up the stream on unmount
+  useEffect(() => {
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+  }, []);
 
   function downloadCSV() {
     // Generate CSV from current queue with status column

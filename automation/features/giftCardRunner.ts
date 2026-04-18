@@ -12,9 +12,10 @@
  */
 
 import { BrowserManager } from "../core/BrowserManager";
-import { sendMessage, sleep, navigateWithRetry, waitWithRetry, clearAndType, withTimeout } from "../core/helpers";
+import { sendMessage, sleep, navigateWithRetry, waitWithRetry, clearAndType, withTimeout, onSendMessage } from "../core/helpers";
 import { FlipkartPlatform } from "../platforms/FlipkartPlatform";
 import { InstaDdrService } from "../services/InstaDdrService";
+import { GiftCardJobReporter } from "./giftCardJobReporter";
 import type { Browser } from "puppeteer-core";
 
 // ── Register a shadow-piercing query handler for Amazon's web components ──
@@ -61,6 +62,8 @@ interface InstaDdrAccountConfig {
 }
 
 interface GiftCardConfig {
+  /** When present, runner writes progress to the GiftCardJob record in DB */
+  jobId?: string;
   chromeProfileDir: string;
   platform: "flipkart" | "amazon";
   giftCards: GiftCardEntry[];
@@ -586,6 +589,30 @@ async function main() {
   const cardTimeoutMs = config.cardTimeoutMs ?? 30000;
   const batchSize = config.batchSize ?? 50;
 
+  // ── DB reporter setup (only when invoked with a jobId) ──────────────────
+  let reporter: GiftCardJobReporter | null = null;
+  let unsubscribeReporter: (() => void) | null = null;
+  if (config.jobId && process.env.MONGODB_URI) {
+    reporter = new GiftCardJobReporter(config.jobId);
+    try {
+      await reporter.connect(process.env.MONGODB_URI);
+      await reporter.markRunning();
+      reporter.start();
+      unsubscribeReporter = onSendMessage((msg) => {
+        const m = msg as { type?: string; level?: string; message?: string; cardNumber?: string; status?: string };
+        if (m.type === "log" && m.level && m.message) {
+          const level = (m.level === "warn" || m.level === "error" ? m.level : "info") as "info" | "warn" | "error";
+          reporter!.log(level, m.message);
+        } else if (m.type === "card_status" && m.cardNumber && m.status) {
+          reporter!.cardResult({ cardNumber: m.cardNumber, status: m.status as "added" | "not added" });
+        }
+      });
+    } catch (err) {
+      console.error(`[giftCardRunner] reporter init failed: ${(err as Error).message} — continuing without DB updates`);
+      reporter = null;
+    }
+  }
+
   sendMessage({
     type: "log",
     level: "info",
@@ -598,6 +625,7 @@ async function main() {
 
   const browserManager = new BrowserManager();
   let instaDdrService: InstaDdrService | null = null;
+  let runnerErrored: string | null = null;
 
   try {
     const { page } = await browserManager.launch(config.chromeProfileDir);
@@ -702,11 +730,10 @@ async function main() {
     }
 
     sendMessage({ type: "done", completed: added, failed });
-    process.exit(0);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
+    runnerErrored = errMsg;
     sendMessage({ type: "log", level: "error", message: `Gift Card Runner fatal error: ${errMsg}` });
-    process.exit(1);
   } finally {
     if (instaDdrService) {
       try {
@@ -716,6 +743,22 @@ async function main() {
       }
     }
     await browserManager.close();
+
+    // Finalize DB record (if we have a reporter) — even if the runner errored
+    if (reporter) {
+      try {
+        await reporter.finalize(
+          runnerErrored ? "failed" : "completed",
+          runnerErrored,
+        );
+      } catch (err) {
+        console.error(`[giftCardRunner] reporter finalize failed:`, err);
+      }
+      if (unsubscribeReporter) unsubscribeReporter();
+      await reporter.disconnect();
+    }
+
+    process.exit(runnerErrored ? 1 : 0);
   }
 }
 

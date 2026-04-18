@@ -18,7 +18,8 @@
  */
 
 import { BrowserManager } from "../core/BrowserManager";
-import { sendMessage, sleep } from "../core/helpers";
+import { sendMessage, sleep, onSendMessage } from "../core/helpers";
+import { GiftCardJobReporter } from "./giftCardJobReporter";
 import fs from "fs";
 
 interface GiftCardEntry {
@@ -27,6 +28,8 @@ interface GiftCardEntry {
 }
 
 interface BalanceCheckerConfig {
+  /** When present, checker writes progress to the GiftCardJob record in DB */
+  jobId?: string;
   chromeProfileDir: string;
   phoneNumber: string;
   giftCards: GiftCardEntry[];
@@ -56,7 +59,40 @@ async function main() {
     fs.mkdirSync("error-screenshots", { recursive: true });
   }
 
+  // ── DB reporter setup (only when invoked with a jobId) ──────────────────
+  let reporter: GiftCardJobReporter | null = null;
+  let unsubscribeReporter: (() => void) | null = null;
+  if (config.jobId && process.env.MONGODB_URI) {
+    reporter = new GiftCardJobReporter(config.jobId);
+    try {
+      await reporter.connect(process.env.MONGODB_URI);
+      await reporter.markRunning();
+      reporter.start();
+      unsubscribeReporter = onSendMessage((msg) => {
+        const m = msg as {
+          type?: string; level?: string; message?: string;
+          cardNumber?: string; pin?: string; balance?: string; status?: string;
+        };
+        if (m.type === "log" && m.level && m.message) {
+          const level = (m.level === "warn" || m.level === "error" ? m.level : "info") as "info" | "warn" | "error";
+          reporter!.log(level, m.message);
+        } else if (m.type === "balance_result" && m.cardNumber) {
+          reporter!.cardResult({
+            cardNumber: m.cardNumber,
+            pin: m.pin,
+            balance: m.balance,
+            status: (m.status === "success" ? "success" : "error"),
+          });
+        }
+      });
+    } catch (err) {
+      console.error(`[balanceChecker] reporter init failed: ${(err as Error).message} — continuing without DB updates`);
+      reporter = null;
+    }
+  }
+
   const browserManager = new BrowserManager();
+  let runnerErrored: string | null = null;
 
   try {
     const { page } = await browserManager.launch(config.chromeProfileDir);
@@ -268,14 +304,28 @@ async function main() {
     }
 
     sendMessage({ type: "done", completed, failed });
-    process.exit(0);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
+    runnerErrored = errMsg;
     sendMessage({ type: "log", level: "error", message: `Balance Checker fatal error: ${errMsg}` });
     sendMessage({ type: "done", completed: 0, failed: config.giftCards.length });
-    process.exit(1);
   } finally {
     await browserManager.close();
+
+    if (reporter) {
+      try {
+        await reporter.finalize(
+          runnerErrored ? "failed" : "completed",
+          runnerErrored,
+        );
+      } catch (err) {
+        console.error(`[balanceChecker] reporter finalize failed:`, err);
+      }
+      if (unsubscribeReporter) unsubscribeReporter();
+      await reporter.disconnect();
+    }
+
+    process.exit(runnerErrored ? 1 : 0);
   }
 }
 
