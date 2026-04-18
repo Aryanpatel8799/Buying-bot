@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, Fragment } from "react";
 import { useSession } from "next-auth/react";
 import { useRouter } from "next/navigation";
 
@@ -15,6 +15,26 @@ interface GiftCardEntry {
   pin: string;
   balance?: string;
   status?: "success" | "error" | "";
+}
+
+interface JobSummary {
+  jobId: string;
+  kind: "verify" | "add";
+  platform: string;
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  total: number;
+  completed: number;
+  failed: number;
+  skipped: number;
+  errorMessage: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+}
+
+interface JobDetail extends JobSummary {
+  cardStatuses: { cardNumber: string; pin?: string; balance?: string; status: string; error?: string }[];
+  logs: { level: string; message: string; at: string }[];
 }
 
 const MAX_CARDS_PER_SUBMIT = 5000;
@@ -44,10 +64,23 @@ export default function VerifyGiftCardsPage() {
 
   // SSE stream handle (for async job progress)
   const eventSourceRef = useRef<EventSource | null>(null);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [resumedNotice, setResumedNotice] = useState<string | null>(null);
+
+  // Tabs + history
+  const [activeTab, setActiveTab] = useState<"verify" | "history">("verify");
+  const [history, setHistory] = useState<JobSummary[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [expandedJobId, setExpandedJobId] = useState<string | null>(null);
+  const [expandedJob, setExpandedJob] = useState<JobDetail | null>(null);
+  const [expandedLoading, setExpandedLoading] = useState(false);
 
   useEffect(() => {
     if (status === "unauthenticated") router.push("/login");
-    if (status === "authenticated") fetchProfiles();
+    if (status === "authenticated") {
+      fetchProfiles();
+      bootstrapFromJobHistory();
+    }
   }, [status, router]);
 
   // Close the stream when the component unmounts
@@ -59,6 +92,77 @@ export default function VerifyGiftCardsPage() {
       }
     };
   }, []);
+
+  // On mount: load history; if a verify job is still pending/running, attach
+  // its SSE stream and pre-populate the queue from its current cardStatuses.
+  async function bootstrapFromJobHistory() {
+    setHistoryLoading(true);
+    try {
+      const res = await fetch("/api/giftcards/jobs?kind=verify&limit=50");
+      if (!res.ok) return;
+      const list = (await res.json()) as JobSummary[];
+      setHistory(list);
+
+      const live = list.find((j) => j.status === "pending" || j.status === "running");
+      if (live) {
+        // Fetch the full job to populate the queue with current per-card state
+        const detailRes = await fetch(`/api/giftcards/jobs/${live.jobId}`);
+        if (detailRes.ok) {
+          const detail = (await detailRes.json()) as JobDetail;
+          setGiftCards(
+            detail.cardStatuses.map((c) => ({
+              cardNumber: c.cardNumber,
+              pin: c.pin || "",
+              balance: c.balance || "",
+              status: c.status === "success" ? "success" : c.status === "error" ? "error" : "",
+            }))
+          );
+          setLogs(detail.logs.map((l) => `[${l.level.toUpperCase()}] ${l.message}`));
+          setLoading(true);
+          setActiveJobId(live.jobId);
+          setResumedNotice(`Reconnected to a verify job already in progress (started ${formatRel(live.startedAt || live.createdAt)})`);
+          subscribeToJob(live.jobId);
+        }
+      }
+    } catch { /* ignore — history fetch is best-effort */ }
+    finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  async function refreshHistory() {
+    try {
+      const res = await fetch("/api/giftcards/jobs?kind=verify&limit=50");
+      if (res.ok) setHistory(await res.json());
+    } catch { /* ignore */ }
+  }
+
+  async function loadJobDetail(jobId: string) {
+    if (expandedJobId === jobId) {
+      // Toggle off
+      setExpandedJobId(null);
+      setExpandedJob(null);
+      return;
+    }
+    setExpandedJobId(jobId);
+    setExpandedJob(null);
+    setExpandedLoading(true);
+    try {
+      const res = await fetch(`/api/giftcards/jobs/${jobId}`);
+      if (res.ok) setExpandedJob(await res.json());
+    } finally {
+      setExpandedLoading(false);
+    }
+  }
+
+  function formatRel(iso: string | null | undefined): string {
+    if (!iso) return "just now";
+    const ms = Date.now() - new Date(iso).getTime();
+    if (ms < 60_000) return `${Math.round(ms / 1000)}s ago`;
+    if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m ago`;
+    if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h ago`;
+    return `${Math.round(ms / 86_400_000)}d ago`;
+  }
 
   async function fetchProfiles() {
     const res = await fetch("/api/profiles");
@@ -233,7 +337,10 @@ export default function VerifyGiftCardsPage() {
         return;
       }
 
+      setActiveJobId(data.jobId);
+      setResumedNotice(null);
       subscribeToJob(data.jobId);
+      refreshHistory();
     } catch {
       setError("Something went wrong");
       setLoading(false);
@@ -287,6 +394,9 @@ export default function VerifyGiftCardsPage() {
       es.close();
       eventSourceRef.current = null;
       setLoading(false);
+      setActiveJobId(null);
+      setResumedNotice(null);
+      refreshHistory();
     });
 
     es.onerror = () => {
@@ -321,6 +431,43 @@ export default function VerifyGiftCardsPage() {
         </p>
       </div>
 
+      {/* Tabs */}
+      <div className="flex gap-1 mb-6 bg-gray-900 rounded-xl p-1 border border-gray-800 w-fit">
+        <button
+          onClick={() => setActiveTab("verify")}
+          className={`px-5 py-2 rounded-lg text-sm font-medium transition-all ${
+            activeTab === "verify"
+              ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+              : "text-gray-400 hover:text-white hover:bg-gray-800"
+          }`}
+        >
+          Verify
+        </button>
+        <button
+          onClick={() => { setActiveTab("history"); refreshHistory(); }}
+          className={`px-5 py-2 rounded-lg text-sm font-medium transition-all ${
+            activeTab === "history"
+              ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+              : "text-gray-400 hover:text-white hover:bg-gray-800"
+          }`}
+        >
+          History
+          {history.length > 0 && (
+            <span className="ml-2 text-xs bg-gray-700 px-2 py-0.5 rounded-full">
+              {history.length}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {/* Resume banner */}
+      {resumedNotice && (
+        <div className="mb-4 p-3 bg-blue-500/10 border border-blue-500/20 rounded-xl text-blue-300 text-sm flex items-start gap-2">
+          <span className="shrink-0 mt-0.5">↻</span>
+          <span>{resumedNotice}</span>
+        </div>
+      )}
+
       {/* Alerts */}
       {error && (
         <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-sm flex items-start gap-2">
@@ -335,6 +482,8 @@ export default function VerifyGiftCardsPage() {
         </div>
       )}
 
+      {activeTab === "verify" ? (
+        <>
       {/* Chrome Profile + Phone Number */}
       <div className="grid grid-cols-2 gap-4 mb-6">
         <div>
@@ -595,6 +744,129 @@ export default function VerifyGiftCardsPage() {
               </p>
             ))}
           </div>
+        </div>
+      )}
+        </>
+      ) : (
+        /* ── History tab ──────────────────────────────────────────────── */
+        <div>
+          {historyLoading ? (
+            <div className="text-center py-12 text-gray-500">Loading history...</div>
+          ) : history.length === 0 ? (
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-12 text-center">
+              <p className="text-gray-500">No previous balance checks yet.</p>
+            </div>
+          ) : (
+            <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-gray-800">
+                    <th className="text-left px-4 py-3 text-gray-500 font-medium text-xs uppercase tracking-wider">When</th>
+                    <th className="text-left px-4 py-3 text-gray-500 font-medium text-xs uppercase tracking-wider">Status</th>
+                    <th className="text-left px-4 py-3 text-gray-500 font-medium text-xs uppercase tracking-wider">Cards</th>
+                    <th className="text-left px-4 py-3 text-gray-500 font-medium text-xs uppercase tracking-wider">Result</th>
+                    <th className="px-4 py-3"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map((j) => {
+                    const isLive = j.status === "running" || j.status === "pending";
+                    const isExpanded = expandedJobId === j.jobId;
+                    return (
+                      <Fragment key={j.jobId}>
+                        <tr className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors">
+                          <td className="px-4 py-3 text-xs text-gray-400">
+                            {new Date(j.createdAt).toLocaleString()}
+                            <div className="text-[10px] text-gray-600">{formatRel(j.createdAt)}</div>
+                          </td>
+                          <td className="px-4 py-3">
+                            <span className={`px-2.5 py-1 rounded-lg text-xs font-medium ${
+                              j.status === "completed" ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" :
+                              j.status === "failed" || j.status === "cancelled" ? "bg-red-500/10 text-red-400 border border-red-500/20" :
+                              "bg-yellow-500/10 text-yellow-400 border border-yellow-500/20"
+                            }`}>
+                              {isLive ? `${j.status} ●` : j.status}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-gray-300">{j.total}</td>
+                          <td className="px-4 py-3 text-xs text-gray-400">
+                            {j.completed > 0 && <span className="text-emerald-400">{j.completed} ok</span>}
+                            {j.failed > 0 && <span className="ml-2 text-red-400">{j.failed} fail</span>}
+                            {j.errorMessage && <div className="text-red-400 mt-1 truncate max-w-xs">{j.errorMessage}</div>}
+                          </td>
+                          <td className="px-4 py-3 text-right">
+                            <button
+                              onClick={() => loadJobDetail(j.jobId)}
+                              className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                            >
+                              {isExpanded ? "Hide" : "Show details"}
+                            </button>
+                          </td>
+                        </tr>
+                        {isExpanded && (
+                          <tr className="bg-gray-950">
+                            <td colSpan={5} className="px-4 py-4">
+                              {expandedLoading || !expandedJob ? (
+                                <p className="text-xs text-gray-500">Loading…</p>
+                              ) : (
+                                <div className="space-y-4">
+                                  <div>
+                                    <h4 className="text-xs uppercase tracking-wider text-gray-500 mb-2">Cards ({expandedJob.cardStatuses.length})</h4>
+                                    <div className="bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
+                                      <table className="w-full text-xs">
+                                        <thead>
+                                          <tr className="border-b border-gray-800">
+                                            <th className="text-left px-3 py-2 text-gray-500 font-medium">Card Number</th>
+                                            <th className="text-left px-3 py-2 text-gray-500 font-medium">Balance</th>
+                                            <th className="text-left px-3 py-2 text-gray-500 font-medium">Status</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {expandedJob.cardStatuses.map((c, idx) => (
+                                            <tr key={idx} className="border-b border-gray-800/50">
+                                              <td className="px-3 py-1.5 font-mono text-gray-300">{c.cardNumber}</td>
+                                              <td className="px-3 py-1.5 text-gray-300">{c.balance || "—"}</td>
+                                              <td className="px-3 py-1.5">
+                                                <span className={
+                                                  c.status === "success" ? "text-emerald-400" :
+                                                  c.status === "error" ? "text-red-400" :
+                                                  "text-gray-500"
+                                                }>
+                                                  {c.status}
+                                                </span>
+                                              </td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  </div>
+                                  <div>
+                                    <h4 className="text-xs uppercase tracking-wider text-gray-500 mb-2">Logs ({expandedJob.logs.length})</h4>
+                                    <div className="bg-gray-900 border border-gray-800 rounded-lg p-3 max-h-64 overflow-y-auto font-mono text-[11px]">
+                                      {expandedJob.logs.map((l, i) => (
+                                        <p key={i} className={
+                                          l.level === "error" ? "text-red-400" :
+                                          l.level === "warn" ? "text-yellow-400" :
+                                          "text-gray-400"
+                                        }>
+                                          [{l.level.toUpperCase()}] {l.message}
+                                        </p>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
     </div>
