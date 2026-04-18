@@ -37,6 +37,8 @@ export interface IGiftCardJob extends Document {
   errorMessage?: string | null;
   startedAt?: Date | null;
   completedAt?: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 const CardStatusSchema = new Schema<GiftCardJobCardStatus>(
