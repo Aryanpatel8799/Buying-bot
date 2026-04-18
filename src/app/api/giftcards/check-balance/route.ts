@@ -25,7 +25,8 @@ const checkBalanceSchema = z.object({
           .min(1, "PIN is required"),
       })
     )
-    .min(1, "At least one gift card is required"),
+    .min(1, "At least one gift card is required")
+    .max(5000, "Maximum 5000 gift cards per submission"),
 });
 
 // POST /api/giftcards/check-balance — launch gift card balance checker
@@ -37,7 +38,8 @@ export async function POST(req: NextRequest) {
 
   const userId = (session.user as { id: string }).id;
 
-  if (!checkRateLimit(`giftcards-balance:${userId}`, 5, 5 / 60)) {
+  // Rate limit: 20 requests per minute (each can carry up to 5000 cards)
+  if (!checkRateLimit(`giftcards-balance:${userId}`, 20, 20 / 60)) {
     return rateLimitResponse();
   }
 
@@ -117,8 +119,11 @@ export async function POST(req: NextRequest) {
       logs: string[];
       balanceResults: typeof balanceResults;
     }>((resolve) => {
-      // Timeout: 3 min base + 15s per card + 120s for OTP wait
-      const timeoutMs = Math.max(300000, data.giftCards.length * 15000 + 180000);
+      // Timeout sized for large batches (up to 5000 cards):
+      //   base 10 min + 20s per card + 10 min headroom (includes OTP wait).
+      // A 5000-card run ≈ 10min + 27.7h + 10min ≈ 28h. Relies on the Nginx
+      // proxy_read_timeout being set high enough (see nginx conf).
+      const timeoutMs = Math.max(600000, data.giftCards.length * 20000 + 600000);
       const timeout = setTimeout(() => {
         child.kill("SIGKILL");
         resolve({

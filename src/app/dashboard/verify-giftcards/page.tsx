@@ -17,6 +17,8 @@ interface GiftCardEntry {
   status?: "success" | "error" | "";
 }
 
+const MAX_CARDS_PER_SUBMIT = 5000;
+
 export default function VerifyGiftCardsPage() {
   const { status } = useSession();
   const router = useRouter();
@@ -67,6 +69,10 @@ export default function VerifyGiftCardsPage() {
 
     if (giftCards.some((gc) => gc.cardNumber === cleanNum)) {
       setError("This card is already in the queue");
+      return;
+    }
+    if (giftCards.length >= MAX_CARDS_PER_SUBMIT) {
+      setError(`Queue is full (${MAX_CARDS_PER_SUBMIT.toLocaleString()} max per submission)`);
       return;
     }
 
@@ -131,9 +137,15 @@ export default function VerifyGiftCardsPage() {
       if (entries.length > 0) {
         const existing = new Set(giftCards.map((gc) => gc.cardNumber));
         const newEntries = entries.filter((e) => !existing.has(e.cardNumber));
-        setGiftCards((prev) => [...prev, ...newEntries]);
+        const roomLeft = Math.max(0, MAX_CARDS_PER_SUBMIT - giftCards.length);
+        const accepted = newEntries.slice(0, roomLeft);
+        const capped = newEntries.length - accepted.length;
+        setGiftCards((prev) => [...prev, ...accepted]);
         const skippedCount = entries.length - newEntries.length;
-        setSuccess(`Loaded ${newEntries.length} gift cards from file${skippedCount > 0 ? ` (${skippedCount} duplicates skipped)` : ""}`);
+        const parts = [`Loaded ${accepted.length} gift cards from file`];
+        if (skippedCount > 0) parts.push(`${skippedCount} duplicates skipped`);
+        if (capped > 0) parts.push(`${capped} over the ${MAX_CARDS_PER_SUBMIT.toLocaleString()} per-submission cap`);
+        setSuccess(parts.join(" · "));
       }
     };
     reader.readAsText(file);
@@ -146,9 +158,14 @@ export default function VerifyGiftCardsPage() {
     if (entries.length > 0) {
       const existing = new Set(giftCards.map((gc) => gc.cardNumber));
       const newEntries = entries.filter((e) => !existing.has(e.cardNumber));
-      setGiftCards((prev) => [...prev, ...newEntries]);
+      const roomLeft = Math.max(0, MAX_CARDS_PER_SUBMIT - giftCards.length);
+      const accepted = newEntries.slice(0, roomLeft);
+      const capped = newEntries.length - accepted.length;
+      setGiftCards((prev) => [...prev, ...accepted]);
       setCsvText("");
-      setSuccess(`Added ${newEntries.length} gift cards`);
+      const parts = [`Added ${accepted.length} gift cards`];
+      if (capped > 0) parts.push(`${capped} over the ${MAX_CARDS_PER_SUBMIT.toLocaleString()} per-submission cap`);
+      setSuccess(parts.join(" · "));
       setError("");
     } else if (errors.length === 0) {
       setError("No valid entries found. Format: cardNumber,pin (one per line)");
@@ -158,6 +175,10 @@ export default function VerifyGiftCardsPage() {
   async function startChecking() {
     if (giftCards.length === 0) {
       setError("Add at least one gift card first");
+      return;
+    }
+    if (giftCards.length > MAX_CARDS_PER_SUBMIT) {
+      setError(`Maximum ${MAX_CARDS_PER_SUBMIT.toLocaleString()} cards per submission — remove some from the queue`);
       return;
     }
     if (!chromeProfileId) {
