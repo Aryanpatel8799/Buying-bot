@@ -33,7 +33,15 @@ export async function POST(
       headless: false,
       executablePath: getChromePath(),
       userDataDir: profileDir,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--start-maximized"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--start-maximized",
+        // Hide automation signals so Google / Amazon / Flipkart don't block
+        // the "Sign in with Google" flow on this profile.
+        "--disable-blink-features=AutomationControlled",
+      ],
+      ignoreDefaultArgs: ["--enable-automation"],
       defaultViewport: null,
     });
 

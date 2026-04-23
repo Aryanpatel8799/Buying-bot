@@ -71,7 +71,16 @@ export async function POST(
       headless: false,
       executablePath: getChromePath(),
       userDataDir: profileDir,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--start-maximized"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--start-maximized",
+        // Google Accounts rejects Chrome if it detects automation flags.
+        // Suppress the two telltales: the default "--enable-automation" (stripped
+        // via ignoreDefaultArgs below) and the navigator.webdriver property.
+        "--disable-blink-features=AutomationControlled",
+      ],
+      ignoreDefaultArgs: ["--enable-automation"],
       defaultViewport: null,
     });
     const page = await browser.newPage();

@@ -30,7 +30,14 @@ const MATCH_TIMEOUT_MS = 25000;
 const POLL_INTERVAL_MS = 2000;
 
 export class GmailOtpService implements InstaDdrServiceLike {
-  constructor(private page: Page) {}
+  constructor(private page: Page) {
+    // Hide navigator.webdriver before any navigation so Google Accounts can't
+    // detect automation via the JS flag. The Chrome flags set in
+    // BrowserManager suppress most signals; this one belongs to the page.
+    this.page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+    }).catch(() => { /* ignore */ });
+  }
 
   // No-ops — login is persisted in the Chrome profile's cookies.
   async login(_id: string, _password: string): Promise<void> { /* no-op */ }
