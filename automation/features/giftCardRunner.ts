@@ -650,7 +650,13 @@ async function main() {
         if (config.gmailAddress) {
           sendMessage({ type: "log", level: "info", message: `Opening Gmail tab for OTP (${config.gmailAddress})` });
           const gmailPage = await browser.newPage();
-          otpService = new GmailOtpService(gmailPage);
+          const svc = new GmailOtpService(gmailPage);
+          // Warm up the inbox in parallel with Flipkart login — Gmail is
+          // ready by the time Flipkart sends the OTP email.
+          svc.init().catch((err) => {
+            sendMessage({ type: "log", level: "warn", message: `[Gmail] warm-up issue: ${(err as Error).message}` });
+          });
+          otpService = svc;
         } else {
           sendMessage({ type: "log", level: "info", message: "Creating isolated InstaDDR browser context..." });
           const instaDdrContext = await browser.createBrowserContext();
