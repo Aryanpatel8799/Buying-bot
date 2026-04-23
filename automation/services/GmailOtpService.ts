@@ -16,20 +16,31 @@ import type { InstaDdrServiceLike } from "../platforms/BasePlatform";
  *    FlipkartPlatform.loginWithEmail() / BatchOrchestrator / giftCardRunner
  *    with zero call-site changes beyond choosing which service to instantiate.
  *
- * OTP matching strategy (per the feature plan — "try address match, fall
- * back to newest"):
- *   1. Gmail search for Flipkart sender AND the target InstaDDR address
- *      anywhere in the mail, within the last hour. If a match exists, use
- *      the newest such result.
- *   2. Otherwise, Gmail search for Flipkart sender only (newest wins).
- *   3. If both strategies return no 6-digit code within the timeout, throw.
+ * Search flow (drives the actual Gmail UI; the URL-hash-search trick was
+ * unreliable):
+ *   1. Navigate to the inbox.
+ *   2. Type into the "Search mail" input (selector: input[name="q"][aria-label="Search mail"]).
+ *   3. Read the autocomplete suggestion subjects — Flipkart's OTP subject is
+ *      "Flipkart Account - 161794 is your verification code", so the OTP is
+ *      right there without opening the email.
+ *   4. If autocomplete didn't yield a code, press Enter to commit the search
+ *      and read subjects/bodies of the result rows.
+ *
+ * OTP matching strategy ("try address-specific, fall back to newest"):
+ *   - First search:  from:flipkart "<target-instaddr-email>" newer_than:1h
+ *   - Fallback:      from:flipkart newer_than:1h
  */
 
 const GMAIL_BASE = "https://mail.google.com";
-const MATCH_TIMEOUT_MS = 25000;
-const POLL_INTERVAL_MS = 2000;
+const INBOX_URL = `${GMAIL_BASE}/mail/u/0/?tab=rm&ogbl#inbox`;
+const SEARCH_INPUT_SELECTOR = 'input[name="q"][aria-label="Search mail"]';
+
+const SETTLE_AFTER_TYPE_MS = 1800;
+const SETTLE_AFTER_ENTER_MS = 3500;
 
 export class GmailOtpService implements InstaDdrServiceLike {
+  private inboxLoaded = false;
+
   constructor(private page: Page) {
     // Hide navigator.webdriver before any navigation so Google Accounts can't
     // detect automation via the JS flag. The Chrome flags set in
@@ -57,7 +68,9 @@ export class GmailOtpService implements InstaDdrServiceLike {
     const { email } = credentials;
     console.log(`[Gmail] Fetching OTP for: ${email.substring(0, 4)}***`);
 
-    // Strategy 1: search for Flipkart + target InstaDDR address, last 1h.
+    await this.ensureInbox();
+
+    // Strategy 1: Flipkart sender + the specific InstaDDR address, last 1h.
     const specificQuery = `from:flipkart "${email}" newer_than:1h`;
     let otp = await this.searchAndExtract(specificQuery);
     if (otp) {
@@ -76,75 +89,144 @@ export class GmailOtpService implements InstaDdrServiceLike {
     throw new Error(`No Flipkart OTP found in Gmail for ${email.substring(0, 4)}***`);
   }
 
-  /** Run a Gmail search query, wait until a 6-digit code appears on the page, return it. */
-  private async searchAndExtract(query: string): Promise<string | null> {
-    const url = `${GMAIL_BASE}/mail/u/0/#search/${encodeURIComponent(query)}`;
-    try {
-      await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
-    } catch (err) {
-      console.warn(`[Gmail] navigate failed (${(err as Error).message})`);
-      return null;
-    }
-    await sleep(2500);
+  /** Navigate to the inbox once, wait for the search input to appear. */
+  private async ensureInbox(): Promise<void> {
+    if (this.inboxLoaded && this.page.url().startsWith(GMAIL_BASE)) return;
 
-    // Are we signed out? Gmail will redirect to accounts.google.com.
+    try {
+      await this.page.goto(INBOX_URL, { waitUntil: "domcontentloaded", timeout: 25000 });
+    } catch (err) {
+      throw new Error(`[Gmail] Couldn't open Gmail inbox: ${(err as Error).message}`);
+    }
+
     if (this.page.url().includes("accounts.google.com")) {
       throw new Error("Gmail profile is not signed in — reconnect it from the Profiles page.");
     }
 
-    const deadline = Date.now() + MATCH_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      const otp = await this.extractOtpFromDom();
-      if (otp) return otp;
-
-      // Open the newest thread if we haven't already — Gmail's search page
-      // shows subject + preview; opening the thread gives us the body.
-      await this.openFirstResult();
-      await sleep(POLL_INTERVAL_MS);
-    }
-
-    return null;
-  }
-
-  /** Click the first thread row in the current search result so we can read
-   *  the body. Safe to call multiple times. */
-  private async openFirstResult(): Promise<void> {
+    // Gmail's search input renders after the chrome of the app loads.
     try {
-      await this.page.evaluate(() => {
-        // Gmail uses role="row" inside the thread list; the clickable area is
-        // the first span with the subject. Fall back to clicking the row itself.
-        const firstRow = document.querySelector('tr[role="row"]') as HTMLElement | null;
-        if (firstRow) {
-          const subject = firstRow.querySelector('span[role="link"], [data-thread-id]') as HTMLElement | null;
-          (subject ?? firstRow).click();
-        }
-      });
-    } catch { /* ignore */ }
+      await this.page.waitForSelector(SEARCH_INPUT_SELECTOR, { timeout: 20000, visible: true });
+    } catch {
+      throw new Error("Gmail loaded but the search input didn't appear (UI may have changed).");
+    }
+    this.inboxLoaded = true;
   }
 
-  /** Look for a "Flipkart ... verification ... 6-digit" pattern anywhere on
-   *  the currently-rendered page (search results preview or open thread). */
-  private async extractOtpFromDom(): Promise<string | null> {
+  /**
+   * Type the query into Gmail's search input, then try to read the OTP from
+   * the autocomplete suggestions; if not found, press Enter and read it from
+   * the search-results page.
+   */
+  private async searchAndExtract(query: string): Promise<string | null> {
+    // Focus and clear the search box, then type the query.
+    try {
+      await this.page.click(SEARCH_INPUT_SELECTOR, { clickCount: 3 });
+      await this.page.keyboard.press("Backspace");
+    } catch {
+      // Input may not be available yet — try ensuring inbox once more.
+      await this.ensureInbox();
+      await this.page.click(SEARCH_INPUT_SELECTOR, { clickCount: 3 }).catch(() => { /* ignore */ });
+      await this.page.keyboard.press("Backspace").catch(() => { /* ignore */ });
+    }
+    await this.page.type(SEARCH_INPUT_SELECTOR, query, { delay: 25 });
+    await sleep(SETTLE_AFTER_TYPE_MS);
+
+    // Try the autocomplete dropdown first — for Flipkart the OTP is in the subject.
+    let otp = await this.extractOtpFromAutocomplete();
+    if (otp) return otp;
+
+    // Otherwise commit the search and look at the results page.
+    await this.page.keyboard.press("Enter");
+    await sleep(SETTLE_AFTER_ENTER_MS);
+    otp = await this.extractOtpFromResults();
+    return otp;
+  }
+
+  /**
+   * Read OTP from Gmail's search-suggestion dropdown. Each suggestion has:
+   *   - <div class="asor_b asor_f"> with the subject (or the same text in `title=`)
+   *   - aria-label on the parent `[aria-label^="Open mail"]` containing subject + sender + date
+   * Flipkart OTP subjects typically contain the 6-digit code itself.
+   */
+  private async extractOtpFromAutocomplete(): Promise<string | null> {
     try {
       return await this.page.evaluate(() => {
-        const text = (document.body?.innerText || "")
-          .replace(/\s+/g, " ")
-          .toLowerCase();
+        const candidates: string[] = [];
 
-        // Only look at text that mentions flipkart + verification to avoid
-        // grabbing random 6-digit numbers (tracking codes, PINs from other emails).
-        if (!text.includes("flipkart") || !text.includes("verification")) {
-          return null;
+        // Subject-only nodes (most reliable for OTP-in-subject)
+        document.querySelectorAll<HTMLElement>(".asor_b.asor_f").forEach((el) => {
+          const text = (el.getAttribute("title") || el.textContent || "").trim();
+          if (text) candidates.push(text);
+        });
+
+        // Whole-row aria-labels (fallback in case subject text doesn't include the OTP)
+        document.querySelectorAll<HTMLElement>('[aria-label^="Open mail"]').forEach((el) => {
+          const text = el.getAttribute("aria-label") || "";
+          if (text) candidates.push(text);
+        });
+
+        for (const text of candidates) {
+          const lower = text.toLowerCase();
+          if (lower.includes("flipkart") && (lower.includes("verification") || lower.includes("otp"))) {
+            const m = text.match(/\b(\d{6})\b/);
+            if (m) return m[1];
+          }
         }
-
-        // Search original (cased) body text for the 6-digit group so we can
-        // show it in logs; regex is the same either way.
-        const raw = document.body?.innerText || "";
-        const match = raw.match(/\b(\d{6})\b/);
-        return match ? match[1] : null;
+        return null;
       });
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Read OTP from the actual search-results listing or an opened thread. Tries
+   * the visible thread rows' subject text first; if that fails, opens the
+   * first row and scans the body.
+   */
+  private async extractOtpFromResults(): Promise<string | null> {
+    // 1) Look at row subjects in the result list.
+    const fromRows = await this.page.evaluate(() => {
+      // Gmail subjects in the list are inside `span[data-thread-id] span` or
+      // `tr[role="row"] span[role="link"]`. Be permissive.
+      const rows = document.querySelectorAll<HTMLElement>('tr[role="row"]');
+      for (const row of rows) {
+        const text = (row.textContent || "").replace(/\s+/g, " ");
+        const lower = text.toLowerCase();
+        if (lower.includes("flipkart") && (lower.includes("verification") || lower.includes("otp"))) {
+          const m = text.match(/\b(\d{6})\b/);
+          if (m) return m[1];
+        }
+      }
+      return null;
+    }).catch(() => null);
+
+    if (fromRows) return fromRows;
+
+    // 2) Click the first matching row, then scan the open thread.
+    const opened = await this.page.evaluate(() => {
+      const rows = document.querySelectorAll<HTMLElement>('tr[role="row"]');
+      for (const row of rows) {
+        const lower = (row.textContent || "").toLowerCase();
+        if (lower.includes("flipkart")) {
+          (row.querySelector('span[role="link"], [data-thread-id]') as HTMLElement | null ?? row).click();
+          return true;
+        }
+      }
+      return false;
+    }).catch(() => false);
+
+    if (!opened) return null;
+    await sleep(2500);
+
+    return await this.page.evaluate(() => {
+      const text = document.body?.innerText || "";
+      const lower = text.replace(/\s+/g, " ").toLowerCase();
+      if (!lower.includes("flipkart") || (!lower.includes("verification") && !lower.includes("otp"))) {
+        return null;
+      }
+      const m = text.match(/\b(\d{6})\b/);
+      return m ? m[1] : null;
+    }).catch(() => null);
   }
 }
