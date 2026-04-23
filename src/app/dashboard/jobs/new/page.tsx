@@ -9,6 +9,7 @@ interface Profile {
   _id: string;
   name: string;
   platform: string;
+  gmailAddress: string | null;
 }
 
 interface ProductEntry {
@@ -390,9 +391,29 @@ export default function NewJobPage() {
             {profiles.map((p) => (
               <option key={p._id} value={p._id}>
                 {p.name} ({p.platform})
+                {p.gmailAddress ? ` — ${p.gmailAddress}` : ""}
               </option>
             ))}
           </select>
+          {(() => {
+            const sel = profiles.find((p) => p._id === chromeProfileId);
+            if (!sel) return null;
+            if (sel.gmailAddress) {
+              return (
+                <p className="text-xs text-emerald-400 mt-1">
+                  ✉ OTPs will be fetched from <span className="font-mono">{sel.gmailAddress}</span>
+                </p>
+              );
+            }
+            if (useInstaDdr) {
+              return (
+                <p className="text-xs text-yellow-400 mt-1">
+                  ⚠ This profile has no Gmail connected — OTP auto-fetch will fail. Link a Gmail on the Profiles page first.
+                </p>
+              );
+            }
+            return <p className="text-xs text-gray-500 mt-1">No Gmail linked — OTP would be manual.</p>;
+          })()}
         </div>
 
         {/* Products */}
@@ -584,13 +605,13 @@ export default function NewJobPage() {
               )}
             </div>
 
-            {/* InstaDDR OTP Automation */}
+            {/* Gmail Auto-OTP (InstaDDR emails are forwarded to the profile's linked Gmail) */}
             <div className="p-5 bg-gray-900 rounded-xl border border-gray-800">
               <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="text-sm font-semibold text-gray-200">InstaDDR Auto-OTP</h3>
+                  <h3 className="text-sm font-semibold text-gray-200">Gmail Auto-OTP</h3>
                   <p className="text-xs text-gray-500 mt-0.5">
-                    Auto-fetch OTP from InstaDDR instead of entering manually
+                    Picks InstaDDR emails as login identities, fetches OTP from the Chrome profile&apos;s linked Gmail
                   </p>
                 </div>
                 <label className="relative inline-flex items-center cursor-pointer">

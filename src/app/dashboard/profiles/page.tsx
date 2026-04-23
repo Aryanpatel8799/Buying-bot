@@ -11,6 +11,8 @@ interface Profile {
   isLoggedIn: boolean;
   lastUsedAt: string | null;
   createdAt: string;
+  gmailAddress: string | null;
+  gmailConnectedAt: string | null;
 }
 
 export default function ProfilesPage() {
@@ -23,6 +25,9 @@ export default function ProfilesPage() {
   const [newPlatform, setNewPlatform] = useState("both");
   const [creating, setCreating] = useState(false);
   const [setupLoading, setSetupLoading] = useState<string | null>(null);
+  const [gmailLoading, setGmailLoading] = useState<string | null>(null);
+  const [gmailModalFor, setGmailModalFor] = useState<string | null>(null);
+  const [gmailInput, setGmailInput] = useState("");
 
   useEffect(() => {
     if (status === "unauthenticated") router.push("/login");
@@ -68,6 +73,49 @@ export default function ProfilesPage() {
       alert(data.error || "Failed to launch Chrome");
     }
     setSetupLoading(null);
+  }
+
+  function openGmailModal(profileId: string, current: string | null) {
+    setGmailModalFor(profileId);
+    setGmailInput(current ?? "");
+  }
+
+  async function handleConnectGmail(e: React.FormEvent) {
+    e.preventDefault();
+    if (!gmailModalFor) return;
+    const address = gmailInput.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address)) {
+      alert("Enter a valid Gmail address");
+      return;
+    }
+    setGmailLoading(gmailModalFor);
+    const res = await fetch(`/api/profiles/${gmailModalFor}/gmail`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gmailAddress: address }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      alert("Gmail address saved. Chrome is open — log in, then close the browser.");
+    } else {
+      alert(data.error || "Failed to connect Gmail");
+    }
+    setGmailModalFor(null);
+    setGmailInput("");
+    setGmailLoading(null);
+    fetchProfiles();
+  }
+
+  async function handleDisconnectGmail(profileId: string) {
+    if (!confirm("Unlink the Gmail address from this profile?")) return;
+    setGmailLoading(profileId);
+    const res = await fetch(`/api/profiles/${profileId}/gmail`, { method: "DELETE" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || "Failed to disconnect Gmail");
+    }
+    setGmailLoading(null);
+    fetchProfiles();
   }
 
   if (loading) {
@@ -151,48 +199,126 @@ export default function ProfilesPage() {
           {profiles.map((profile) => (
             <div
               key={profile._id}
-              className="p-4 bg-gray-900 rounded-xl border border-gray-800 hover:border-gray-700 transition-colors flex items-center justify-between"
+              className="p-4 bg-gray-900 rounded-xl border border-gray-800 hover:border-gray-700 transition-colors"
             >
-              <div>
-                <h3 className="font-medium text-white">{profile.name}</h3>
-                <div className="flex gap-4 mt-1.5 text-xs text-gray-500">
-                  <span className="capitalize">
-                    Platform: <span className="text-gray-400">{profile.platform}</span>
-                  </span>
-                  <span>
-                    Status:{" "}
-                    <span
-                      className={
-                        profile.isLoggedIn ? "text-emerald-400" : "text-yellow-400"
-                      }
-                    >
-                      {profile.isLoggedIn ? "Logged In" : "Not Set Up"}
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <h3 className="font-medium text-white">{profile.name}</h3>
+                  <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5 text-xs text-gray-500">
+                    <span className="capitalize">
+                      Platform: <span className="text-gray-400">{profile.platform}</span>
                     </span>
-                  </span>
-                  {profile.lastUsedAt && (
                     <span>
-                      Last used: <span className="text-gray-400">{new Date(profile.lastUsedAt).toLocaleDateString()}</span>
+                      Status:{" "}
+                      <span
+                        className={
+                          profile.isLoggedIn ? "text-emerald-400" : "text-yellow-400"
+                        }
+                      >
+                        {profile.isLoggedIn ? "Logged In" : "Not Set Up"}
+                      </span>
                     </span>
-                  )}
+                    {profile.lastUsedAt && (
+                      <span>
+                        Last used: <span className="text-gray-400">{new Date(profile.lastUsedAt).toLocaleDateString()}</span>
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-2 text-xs">
+                    {profile.gmailAddress ? (
+                      <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-300">
+                        <span>&#x2709;</span>
+                        Gmail connected: <span className="font-mono">{profile.gmailAddress}</span>
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg bg-gray-800 border border-gray-700 text-gray-400">
+                        No Gmail linked
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex flex-col gap-2 shrink-0">
+                  <button
+                    onClick={() => handleSetup(profile._id)}
+                    disabled={setupLoading === profile._id}
+                    className={`px-4 py-2 rounded-xl text-sm font-medium transition-all disabled:opacity-50 ${
+                      profile.isLoggedIn
+                        ? "bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700"
+                        : "bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-600/10"
+                    }`}
+                  >
+                    {setupLoading === profile._id
+                      ? "Launching..."
+                      : profile.isLoggedIn
+                      ? "Re-login"
+                      : "Setup Login"}
+                  </button>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => openGmailModal(profile._id, profile.gmailAddress)}
+                      disabled={gmailLoading === profile._id}
+                      className="flex-1 px-4 py-2 rounded-xl text-sm font-medium transition-all disabled:opacity-50 bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/10"
+                    >
+                      {profile.gmailAddress ? "Reconnect Gmail" : "Connect Gmail"}
+                    </button>
+                    {profile.gmailAddress && (
+                      <button
+                        onClick={() => handleDisconnectGmail(profile._id)}
+                        disabled={gmailLoading === profile._id}
+                        className="px-3 py-2 rounded-xl text-sm font-medium transition-all disabled:opacity-50 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700"
+                        title="Unlink Gmail"
+                      >
+                        &#x2715;
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
-              <button
-                onClick={() => handleSetup(profile._id)}
-                disabled={setupLoading === profile._id}
-                className={`px-4 py-2 rounded-xl text-sm font-medium transition-all disabled:opacity-50 ${
-                  profile.isLoggedIn
-                    ? "bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700"
-                    : "bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-600/10"
-                }`}
-              >
-                {setupLoading === profile._id
-                  ? "Launching..."
-                  : profile.isLoggedIn
-                  ? "Re-login"
-                  : "Setup Login"}
-              </button>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Gmail connect modal */}
+      {gmailModalFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <form
+            onSubmit={handleConnectGmail}
+            className="w-full max-w-md bg-gray-900 border border-gray-800 rounded-2xl p-6 space-y-4"
+          >
+            <div>
+              <h2 className="text-lg font-semibold text-white">Connect Gmail</h2>
+              <p className="text-xs text-gray-500 mt-1">
+                Enter the Gmail address that receives InstaDDR forwards. Chrome
+                will open for you to log into Gmail in this profile.
+              </p>
+            </div>
+            <input
+              type="email"
+              value={gmailInput}
+              onChange={(e) => setGmailInput(e.target.value)}
+              placeholder="you@gmail.com"
+              autoFocus
+              required
+              className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-xl text-white font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500/40"
+            />
+            <div className="flex gap-2 justify-end">
+              <button
+                type="button"
+                onClick={() => { setGmailModalFor(null); setGmailInput(""); }}
+                className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-xl text-sm font-medium border border-gray-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={gmailLoading === gmailModalFor}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-medium disabled:opacity-50"
+              >
+                {gmailLoading === gmailModalFor ? "Opening…" : "Save & Open Gmail"}
+              </button>
+            </div>
+          </form>
         </div>
       )}
     </div>
