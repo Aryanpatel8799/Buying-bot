@@ -84,7 +84,10 @@ export async function POST(
       defaultViewport: null,
     });
     const page = await browser.newPage();
-    await page.goto("https://mail.google.com", { waitUntil: "networkidle2" }).catch(() => { /* ignore */ });
+    // Land directly on the inbox URL so users see Gmail (not the marketing page),
+    // and so the search input loads up-front. If they're not signed in yet,
+    // Google will redirect them to the sign-in page from here.
+    await page.goto("https://mail.google.com/mail/u/0/?tab=rm&ogbl#inbox", { waitUntil: "networkidle2" }).catch(() => { /* ignore */ });
 
     return NextResponse.json({
       message: "Gmail address saved. Chrome is open — log in manually, then close the browser.",
