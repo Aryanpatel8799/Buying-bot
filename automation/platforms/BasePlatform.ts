@@ -7,13 +7,15 @@ export interface InstaDdrAccount {
   email: string;
 }
 
-/** Minimal interface for InstaDdrService */
+/** Minimal interface for an OTP provider (InstaDdrService, GmailOtpService, …) */
 export interface InstaDdrServiceLike {
   login(id: string, password: string): Promise<void>;
   logout(): Promise<void>;
   fetchOtp(credentials: { instaDdrId: string; instaDdrPassword: string; email: string }): Promise<string>;
-  /** Navigate to InstaDDR login page and wait for user to log in manually. */
+  /** Navigate to the OTP provider and wait for the user to log in manually. */
   waitForManualLogin(id: string, password: string): Promise<void>;
+  /** Release any resources held by the service (page, isolated context, etc.). */
+  close(): Promise<void>;
 }
 
 /** Options passed to loginWithEmail for InstaDDR OTP automation */

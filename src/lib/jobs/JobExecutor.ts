@@ -41,7 +41,10 @@ export class JobExecutor extends EventEmitter {
     const typedPaymentDetails = paymentDetails as unknown as import("@/types").PaymentDetails;
 
     // Build config for the runner
-    const chromeProfile = job.chromeProfileId as unknown as { directoryName: string };
+    const chromeProfile = job.chromeProfileId as unknown as {
+      directoryName: string;
+      gmailAddress?: string | null;
+    };
     // Build products array: use job.products if available, else fall back to single productUrl
     const products =
       job.products && job.products.length > 0
@@ -177,6 +180,13 @@ export class JobExecutor extends EventEmitter {
       console.log(`[Job ${this.jobId}] GST address verification will be skipped (no address available)`);
     }
 
+    if (instaDdrAccounts && instaDdrAccounts.length > 0 && !chromeProfile.gmailAddress) {
+      console.warn(
+        `[Job ${this.jobId}] InstaDDR accounts selected but the Chrome profile has no linked Gmail — ` +
+        `OTP fetching will fall back to the legacy InstaDDR scraper (likely to fail if InstaDDR was disabled).`
+      );
+    }
+
     const config: JobConfig = {
       jobId: this.jobId,
       platform: job.platform,
@@ -193,6 +203,7 @@ export class JobExecutor extends EventEmitter {
       ...(address ? { address } : {}),
       ...(job.maxConcurrentTabs > 1 ? { maxConcurrentTabs: job.maxConcurrentTabs } : {}),
       ...(instaDdrAccounts && instaDdrAccounts.length > 0 ? { instaDdrAccounts } : {}),
+      ...(chromeProfile.gmailAddress ? { gmailAddress: chromeProfile.gmailAddress } : {}),
     };
 
     const configB64 = Buffer.from(JSON.stringify(config)).toString("base64");

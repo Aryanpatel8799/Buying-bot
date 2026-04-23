@@ -8,6 +8,7 @@ interface Profile {
   _id: string;
   name: string;
   platform: string;
+  gmailAddress: string | null;
 }
 
 interface GiftCardEntry {
@@ -553,6 +554,7 @@ export default function GiftCardsPage() {
               {profiles.map((p) => (
                 <option key={p._id} value={p._id}>
                   {p.name} ({p.platform})
+                  {p.gmailAddress ? ` — ${p.gmailAddress}` : ""}
                 </option>
               ))}
             </select>
@@ -563,6 +565,25 @@ export default function GiftCardsPage() {
                   : "Must already be logged into Flipkart, or enable account login below"
                 : "Must be logged into Amazon"}
             </p>
+            {(() => {
+              const sel = profiles.find((p) => p._id === chromeProfileId);
+              if (!sel) return null;
+              if (sel.gmailAddress) {
+                return (
+                  <p className="text-xs text-emerald-400 mt-1">
+                    ✉ OTPs will be fetched from <span className="font-mono">{sel.gmailAddress}</span>
+                  </p>
+                );
+              }
+              if (platform === "flipkart" && useAccountLogin && useInstaDdr) {
+                return (
+                  <p className="text-xs text-yellow-400 mt-1">
+                    ⚠ This profile has no Gmail connected — OTP auto-fetch will fail. Link a Gmail on the Profiles page first.
+                  </p>
+                );
+              }
+              return null;
+            })()}
           </div>
 
           {/* Flipkart account login (single-select) */}
@@ -627,9 +648,9 @@ export default function GiftCardsPage() {
                   <div className="mt-4 pt-4 border-t border-gray-800">
                     <div className="flex items-center justify-between mb-3">
                       <div>
-                        <h4 className="text-sm font-semibold text-gray-200">InstaDDR Auto-OTP</h4>
+                        <h4 className="text-sm font-semibold text-gray-200">Gmail Auto-OTP</h4>
                         <p className="text-xs text-gray-500 mt-0.5">
-                          Automatically fetch the Flipkart OTP from InstaDDR
+                          Picks InstaDDR emails as login identities; OTPs are fetched from the profile&apos;s linked Gmail
                         </p>
                       </div>
                       <button

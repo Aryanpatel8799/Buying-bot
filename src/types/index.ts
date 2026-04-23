@@ -69,8 +69,9 @@ export interface JobConfig {
   address?: AddressDetails; // delivery address with GST for checkout verification
   maxConcurrentTabs?: number; // max simultaneous browser tabs for RTGS multi-tab mode (default: 1)
   giftCardInventoryId?: string; // gift card inventory for code rotation
-  instaDdrAccounts?: InstaDdrAccount[]; // InstaDDR accounts for OTP automation
-  instaDdrUrl?: string; // InstaDDR portal URL (defaults to https://m.kuku.lu)
+  instaDdrAccounts?: InstaDdrAccount[]; // InstaDDR email identities for Flipkart login
+  instaDdrUrl?: string; // (legacy) InstaDDR portal URL — only used when gmailAddress is absent
+  gmailAddress?: string; // Gmail linked to the Chrome profile; when set, OTPs are fetched from Gmail instead of InstaDDR
 }
 
 export interface InstaDdrAccount {

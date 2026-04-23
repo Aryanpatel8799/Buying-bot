@@ -7,6 +7,8 @@ import { CardPayment } from "../payments/CardPayment";
 import { GiftCardPayment } from "../payments/GiftCardPayment";
 import { RTGSPayment } from "../payments/RTGSPayment";
 import { InstaDdrService } from "../services/InstaDdrService";
+import { GmailOtpService } from "../services/GmailOtpService";
+import type { InstaDdrServiceLike } from "../platforms/BasePlatform";
 import { sleep, sendMessage } from "./helpers";
 import type { JobConfig, ProductItem, CardDetails } from "../../src/types";
 import type { OrderDetails } from "../platforms/BasePlatform";
@@ -29,7 +31,8 @@ export class BatchOrchestrator {
   private inventoryCodes: InventoryCode[] = [];
   private inventoryIndex = 0;
   private inventoryBaseUrl: string;
-  private instaDdrService: InstaDdrService | null = null;
+  private otpService: InstaDdrServiceLike | null = null;
+  private otpServiceCleanup: (() => Promise<void>) | null = null;
   private instaDdrAccounts: Array<{ instaDdrId: string; instaDdrPassword: string; email: string }> | null = null;
 
   constructor(
@@ -113,6 +116,35 @@ export class BatchOrchestrator {
     process.once("SIGINT", () => {
       this.shouldStopFlag = true;
     });
+  }
+
+  /**
+   * Lazily build the OTP service used during Flipkart login.
+   *
+   * - If the Chrome profile has a linked Gmail (config.gmailAddress), open a
+   *   new page in the MAIN browser context (cookies carry over, so Gmail is
+   *   already signed in) and use GmailOtpService.
+   * - Otherwise fall back to InstaDdrService inside an isolated context,
+   *   which logs into m.kuku.lu and scrapes the inbox there.
+   */
+  private async ensureOtpService(): Promise<void> {
+    if (this.otpService) return;
+    const browser = this.page.browser() as Browser;
+
+    if (this.config.gmailAddress) {
+      sendMessage({ type: "log", level: "info", message: `Opening Gmail tab for OTP (${this.config.gmailAddress})` });
+      const gmailPage = await browser.newPage();
+      this.otpService = new GmailOtpService(gmailPage);
+      this.otpServiceCleanup = async () => { /* page is closed by GmailOtpService.close() */ };
+      return;
+    }
+
+    sendMessage({ type: "log", level: "info", message: "Creating isolated InstaDDR browser context..." });
+    const instaDdrContext = await browser.createBrowserContext();
+    const instaDdrPage = await instaDdrContext.newPage();
+    this.otpService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
+    // InstaDdrService.close() also closes the context, so no extra cleanup needed.
+    this.otpServiceCleanup = null;
   }
 
   async run(): Promise<void> {
@@ -199,26 +231,26 @@ export class BatchOrchestrator {
             });
           }
 
-          // Lazily create InstaDDR service with isolated browser context
-          if (instaDdrAccount && !this.instaDdrService) {
-            sendMessage({ type: "log", level: "info", message: "Creating isolated InstaDDR browser context..." });
-            const browser = this.page.browser() as Browser;
-            const instaDdrContext = await browser.createBrowserContext();
-            const instaDdrPage = await instaDdrContext.newPage();
-            this.instaDdrService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
+          // Lazily create the OTP service (Gmail if the profile has one linked,
+          // otherwise fall back to the InstaDDR isolated-context scraper).
+          if (instaDdrAccount && !this.otpService) {
+            await this.ensureOtpService();
           }
 
-          // Build InstaDDR options
+          // Build OTP options (interface shape is unchanged; service can be
+          // either GmailOtpService or InstaDdrService — both implement the same
+          // InstaDdrServiceLike contract).
           const instaOptions: InstaDdrLoginOptions | undefined =
-            this.instaDdrService && instaDdrAccount
-              ? { instaDdrService: this.instaDdrService, instaDdrAccount }
+            this.otpService && instaDdrAccount
+              ? { instaDdrService: this.otpService, instaDdrAccount }
               : undefined;
 
+          const otpSource = this.config.gmailAddress ? "Gmail" : "InstaDDR";
           sendMessage({
             type: "log",
             level: "info",
             message: `Logging in to Flipkart with email: ${loginEmail.substring(0, 3)}***` +
-              (instaOptions ? ` (InstaDDR will auto-fetch OTP)` : ` (manual OTP)`),
+              (instaOptions ? ` (${otpSource} will auto-fetch OTP)` : ` (manual OTP)`),
             iteration: i + 1,
           });
 
@@ -404,9 +436,12 @@ export class BatchOrchestrator {
       }
     }
 
-    // Close the isolated InstaDDR browser context
-    if (this.instaDdrService) {
-      await this.instaDdrService.close();
+    // Close the OTP service (isolated context for InstaDDR, spare tab for Gmail)
+    if (this.otpService) {
+      try { await this.otpService.close(); } catch { /* ignore */ }
+      if (this.otpServiceCleanup) {
+        try { await this.otpServiceCleanup(); } catch { /* ignore */ }
+      }
     }
 
     sendMessage({
@@ -468,23 +503,21 @@ export class BatchOrchestrator {
           loginEmail = instaDdrAccount.email;
         }
 
-        // Lazily create InstaDDR service
-        if (instaDdrAccount && !this.instaDdrService) {
-          const browser = this.page.browser() as Browser;
-          const instaDdrContext = await browser.createBrowserContext();
-          const instaDdrPage = await instaDdrContext.newPage();
-          this.instaDdrService = new InstaDdrService(instaDdrPage, "https://m.kuku.lu", instaDdrContext);
+        // Lazily create OTP service (Gmail or InstaDDR fallback)
+        if (instaDdrAccount && !this.otpService) {
+          await this.ensureOtpService();
         }
 
-        const instaOptions = this.instaDdrService && instaDdrAccount
-          ? { instaDdrService: this.instaDdrService, instaDdrAccount }
+        const instaOptions = this.otpService && instaDdrAccount
+          ? { instaDdrService: this.otpService, instaDdrAccount }
           : undefined;
 
+        const otpSource = this.config.gmailAddress ? "Gmail" : "InstaDDR";
         sendMessage({
           type: "log",
           level: "info",
           message: `RTGS batch login: ${loginEmail.substring(0, 3)}***` +
-            (instaOptions ? ` (InstaDDR auto-OTP)` : ` (manual OTP)`),
+            (instaOptions ? ` (${otpSource} auto-OTP)` : ` (manual OTP)`),
         });
 
         await this.platform.loginWithEmail(loginEmail, instaOptions);
@@ -815,9 +848,12 @@ export class BatchOrchestrator {
       } catch { /* ignore */ }
     }
 
-    // Close the isolated InstaDDR browser context
-    if (this.instaDdrService) {
-      await this.instaDdrService.close();
+    // Close the OTP service (isolated context for InstaDDR, spare tab for Gmail)
+    if (this.otpService) {
+      try { await this.otpService.close(); } catch { /* ignore */ }
+      if (this.otpServiceCleanup) {
+        try { await this.otpServiceCleanup(); } catch { /* ignore */ }
+      }
     }
 
     const completed = tabResults.filter((r) => r === "success").length;

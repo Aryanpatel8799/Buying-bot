@@ -210,6 +210,7 @@ export async function POST(req: NextRequest) {
       cardTimeoutMs: 45000,
       ...(accountEmail ? { account: accountEmail } : {}),
       ...(instaDdrAccounts && instaDdrAccounts.length > 0 ? { instaDdrAccounts } : {}),
+      ...(profile.gmailAddress ? { gmailAddress: profile.gmailAddress } : {}),
     };
 
     const configB64 = Buffer.from(JSON.stringify(config)).toString("base64");
