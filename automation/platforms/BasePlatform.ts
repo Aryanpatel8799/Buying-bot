@@ -16,6 +16,12 @@ export interface InstaDdrServiceLike {
   waitForManualLogin(id: string, password: string): Promise<void>;
   /** Release any resources held by the service (page, isolated context, etc.). */
   close(): Promise<void>;
+  /**
+   * How long to sleep between clicking Flipkart's "Request OTP" button and
+   * the first fetch attempt. InstaDDR needs ~60s (slow polling); Gmail needs
+   * ~10s because mail arrives within seconds.
+   */
+  readonly initialWaitMs?: number;
 }
 
 /** Options passed to loginWithEmail for InstaDDR OTP automation */

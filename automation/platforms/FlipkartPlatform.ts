@@ -1253,13 +1253,16 @@ export class FlipkartPlatform extends BasePlatform {
     if (options?.instaDdrService && options?.instaDdrAccount) {
       const { instaDdrService, instaDdrAccount } = options;
 
-      // 6a: Login to InstaDDR in isolated context
-      console.log("[InstaDDR] Logging into InstaDDR to fetch OTP...");
+      // 6a: Login to InstaDDR in isolated context (no-op for Gmail)
+      console.log("[OTP] Preparing OTP service…");
       await instaDdrService.login(instaDdrAccount.instaDdrId, instaDdrAccount.instaDdrPassword);
 
-      // 6b: Wait for OTP email to arrive (Flipkart takes time to send)
-      console.log("[InstaDDR] Waiting 60s for OTP email to arrive...");
-      await sleep(60000);
+      // 6b: Wait for Flipkart to send the OTP. InstaDDR's legacy polling is
+      // slow so defaults to 60s; Gmail typically receives within seconds and
+      // supplies its own shorter hint (initialWaitMs).
+      const waitMs = instaDdrService.initialWaitMs ?? 60000;
+      console.log(`[OTP] Waiting ${Math.round(waitMs / 1000)}s for the OTP email to arrive...`);
+      await sleep(waitMs);
 
       // 6c: Fetch OTP from InstaDDR inbox with retries — 2 minutes total
       // 24 attempts × 5s between retries = 120s (2 minutes)

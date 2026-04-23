@@ -39,7 +39,9 @@ const SETTLE_AFTER_TYPE_MS = 1800;
 const SETTLE_AFTER_ENTER_MS = 3500;
 
 export class GmailOtpService implements InstaDdrServiceLike {
-  private inboxLoaded = false;
+  /** Shorter initial wait than InstaDDR's 60s — Gmail receives mail much faster. */
+  readonly initialWaitMs = 10000;
+  private inboxReady: Promise<void> | null = null;
 
   constructor(private page: Page) {
     // Hide navigator.webdriver before any navigation so Google Accounts can't
@@ -48,6 +50,37 @@ export class GmailOtpService implements InstaDdrServiceLike {
     this.page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     }).catch(() => { /* ignore */ });
+  }
+
+  /**
+   * Fire-and-forget warm-up: navigate to the Gmail inbox so by the time we
+   * need to fetch the OTP, the UI is already rendered. Call this right after
+   * constructing the service (in parallel with the Flipkart login flow) —
+   * fetchOtp() will await the same promise later so there's no race.
+   */
+  init(): Promise<void> {
+    if (!this.inboxReady) this.inboxReady = this.loadInbox();
+    return this.inboxReady;
+  }
+
+  private async loadInbox(): Promise<void> {
+    const start = Date.now();
+    try {
+      await this.page.goto(INBOX_URL, { waitUntil: "domcontentloaded", timeout: 25000 });
+    } catch (err) {
+      throw new Error(`[Gmail] Couldn't open Gmail inbox: ${(err as Error).message}`);
+    }
+
+    if (this.page.url().includes("accounts.google.com")) {
+      throw new Error("Gmail profile is not signed in — reconnect it from the Profiles page.");
+    }
+
+    try {
+      await this.page.waitForSelector(SEARCH_INPUT_SELECTOR, { timeout: 20000, visible: true });
+    } catch {
+      throw new Error("Gmail loaded but the search input didn't appear (UI may have changed).");
+    }
+    console.log(`[Gmail] inbox ready in ${Date.now() - start}ms`);
   }
 
   // No-ops — login is persisted in the Chrome profile's cookies.
@@ -89,27 +122,10 @@ export class GmailOtpService implements InstaDdrServiceLike {
     throw new Error(`No Flipkart OTP found in Gmail for ${email.substring(0, 4)}***`);
   }
 
-  /** Navigate to the inbox once, wait for the search input to appear. */
+  /** Ensure the inbox has loaded — kicks off init() if no one did. */
   private async ensureInbox(): Promise<void> {
-    if (this.inboxLoaded && this.page.url().startsWith(GMAIL_BASE)) return;
-
-    try {
-      await this.page.goto(INBOX_URL, { waitUntil: "domcontentloaded", timeout: 25000 });
-    } catch (err) {
-      throw new Error(`[Gmail] Couldn't open Gmail inbox: ${(err as Error).message}`);
-    }
-
-    if (this.page.url().includes("accounts.google.com")) {
-      throw new Error("Gmail profile is not signed in — reconnect it from the Profiles page.");
-    }
-
-    // Gmail's search input renders after the chrome of the app loads.
-    try {
-      await this.page.waitForSelector(SEARCH_INPUT_SELECTOR, { timeout: 20000, visible: true });
-    } catch {
-      throw new Error("Gmail loaded but the search input didn't appear (UI may have changed).");
-    }
-    this.inboxLoaded = true;
+    if (!this.inboxReady) this.inboxReady = this.loadInbox();
+    await this.inboxReady;
   }
 
   /**

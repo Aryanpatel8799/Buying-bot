@@ -134,7 +134,13 @@ export class BatchOrchestrator {
     if (this.config.gmailAddress) {
       sendMessage({ type: "log", level: "info", message: `Opening Gmail tab for OTP (${this.config.gmailAddress})` });
       const gmailPage = await browser.newPage();
-      this.otpService = new GmailOtpService(gmailPage);
+      const svc = new GmailOtpService(gmailPage);
+      // Warm up in the background so Gmail is ready by the time Flipkart asks
+      // for the OTP. Errors surface later in fetchOtp.
+      svc.init().catch((err) => {
+        sendMessage({ type: "log", level: "warn", message: `[Gmail] warm-up issue: ${(err as Error).message}` });
+      });
+      this.otpService = svc;
       this.otpServiceCleanup = async () => { /* page is closed by GmailOtpService.close() */ };
       return;
     }
