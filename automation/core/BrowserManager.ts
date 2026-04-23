@@ -59,7 +59,12 @@ export class BrowserManager {
         "--start-maximized",
         "--disable-popup-blocking",
         "--disable-features=ChromeRuntimeRecognizedBlocking",
+        // Hide automation signals so Google Accounts / Gmail / anti-bot DOM
+        // checks don't reject the session when the runner opens a Gmail tab
+        // for OTP fetching. Works in tandem with ignoreDefaultArgs below.
+        "--disable-blink-features=AutomationControlled",
       ],
+      ignoreDefaultArgs: ["--enable-automation"],
       defaultViewport: null,
     });
 
