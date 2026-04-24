@@ -1,6 +1,7 @@
 import puppeteer, { Browser, Page } from "puppeteer-core";
 import fs from "fs";
 import path from "path";
+import { execSync } from "child_process";
 
 function getChromePath(): string {
   // Allow override via env
@@ -49,6 +50,14 @@ export class BrowserManager {
       fs.mkdirSync(profileDir, { recursive: true });
     }
 
+    // Clean up orphan Chrome instances still holding this profile. After a
+    // failed job the runner disconnects (instead of closing) so the user can
+    // inspect; if we don't clear that orphan here, the NEW launch either
+    // attaches to the stale Chrome or starts a degraded sibling process that
+    // manifests as "Execution context was destroyed" errors mid-run.
+    await this.killOrphanChrome(profileDir);
+    this.removeSingletonLocks(profileDir);
+
     this.browser = await puppeteer.launch({
       headless: false,
       executablePath: getChromePath(),
@@ -88,12 +97,56 @@ export class BrowserManager {
   /**
    * Detach the Puppeteer client from Chrome without killing the Chrome
    * process. The user keeps seeing their tabs and can continue manually.
-   * The caller is responsible for closing Chrome themselves when done.
+   * The next call to launch() on this same profile will forcibly kill the
+   * orphaned Chrome so it doesn't interfere.
    */
   async disconnect(): Promise<void> {
     if (this.browser) {
       try { await this.browser.disconnect(); } catch { /* ignore */ }
       this.browser = null;
+    }
+  }
+
+  /**
+   * Kill any running Chrome process whose command-line contains the profile
+   * directory path. Safe to call even if nothing matches.
+   */
+  private async killOrphanChrome(profileDir: string): Promise<void> {
+    const abs = path.resolve(profileDir);
+    try {
+      if (process.platform === "win32") {
+        // Best-effort on Windows. wmic is deprecated but still available; on
+        // newer hosts, the command simply fails silently and we continue.
+        const escaped = abs.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        execSync(
+          `wmic process where "CommandLine like '%%${escaped}%%'" delete`,
+          { stdio: "ignore" }
+        );
+      } else {
+        // pkill exits non-zero when no processes match — swallow.
+        execSync(`pkill -f ${JSON.stringify(abs)}`, { stdio: "ignore" });
+      }
+      // Give Chrome a moment to actually exit before we touch the profile dir.
+      await new Promise((r) => setTimeout(r, 500));
+    } catch {
+      // No orphan process, or the kill command isn't available — either way
+      // we continue; the lock-file cleanup below covers the common case.
+    }
+  }
+
+  /**
+   * Delete Chrome's singleton-instance lock files from the profile dir so a
+   * fresh launch isn't blocked by leftovers from a previous (possibly
+   * crashed) Chrome process.
+   */
+  private removeSingletonLocks(profileDir: string): void {
+    for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+      const p = path.join(profileDir, name);
+      try {
+        // Some of these are symlinks — use lstat/unlink instead of existsSync.
+        fs.lstatSync(p);
+        fs.unlinkSync(p);
+      } catch { /* file missing / not accessible — fine */ }
     }
   }
 }
