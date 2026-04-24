@@ -1569,32 +1569,53 @@ export class FlipkartPlatform extends BasePlatform {
   }
 
   private async clearSessionData(): Promise<void> {
+    // Delete ONLY Flipkart cookies. `Network.clearBrowserCookies` nukes every
+    // cookie in the entire browser profile — that signs out Gmail (and any
+    // other open tab), detaches the Gmail execution context, and breaks OTP
+    // fetching mid-run. We scope the delete to Flipkart hostnames so logout
+    // has no effect on other origins.
     try {
-      const client = await this.page.createCDPSession();
-      await client.send("Network.clearBrowserCookies");
-      await client.detach();
-      console.log("Cleared all cookies via CDP");
+      const flipkartCookies = await this.page.cookies(
+        "https://www.flipkart.com",
+        "https://flipkart.com",
+        "https://m.flipkart.com",
+      );
+      for (const c of flipkartCookies) {
+        await this.page.deleteCookie({
+          name: c.name,
+          domain: c.domain,
+          path: c.path,
+        });
+      }
+      console.log(`Cleared ${flipkartCookies.length} Flipkart cookie(s) — other origins untouched`);
     } catch { /* ignore */ }
     try {
       await this.page.evaluate(() => {
         try { localStorage.clear(); } catch {}
         try { sessionStorage.clear(); } catch {}
       });
-      console.log("Cleared localStorage and sessionStorage");
+      console.log("Cleared Flipkart localStorage/sessionStorage");
     } catch { /* ignore */ }
   }
 
   async resetForNextIteration(): Promise<void> {
     console.log("Resetting browser state for next iteration...");
 
-    // Step 1: Close any extra tabs/pages that may have opened during payment
+    // Step 1: Close ephemeral extra tabs (payment pop-ups, etc.) but keep the
+    // Gmail OTP tab alive — it's reused across iterations, and killing it here
+    // was dropping the Gmail session mid-job.
     try {
       const browser = this.page.browser();
       const pages = await browser.pages();
       for (const p of pages) {
-        if (p !== this.page) {
-          await p.close().catch(() => {});
+        if (p === this.page) continue;
+        let url = "";
+        try { url = p.url(); } catch { /* ignore */ }
+        // Preserve Gmail / Google Accounts tabs.
+        if (/^https?:\/\/[^\/]*(mail\.google\.com|accounts\.google\.com)/i.test(url)) {
+          continue;
         }
+        await p.close().catch(() => {});
       }
     } catch {
       console.log("Tab cleanup skipped");
