@@ -424,30 +424,45 @@ export class BatchOrchestrator {
       }
     }
 
-    // Logout the last account after all iterations
-    if (this.accounts || this.instaDdrAccounts) {
-      try {
-        sendMessage({
-          type: "log",
-          level: "info",
-          message: "Logging out final account...",
-        });
-        await this.platform.logout();
-      } catch (err) {
-        sendMessage({
-          type: "log",
-          level: "warn",
-          message: `Final logout warning: ${err instanceof Error ? err.message : err}`,
-        });
-      }
-    }
+    // Only clean up state if every iteration succeeded. When anything failed
+    // we intentionally leave:
+    //   - the Flipkart tab on the page where it broke (so the user can pick
+    //     up the purchase manually or diagnose what went wrong),
+    //   - the Gmail tab open (so subsequent debugging can see the OTP mail),
+    //   - no final logout (so cookies/cart/checkout state are preserved).
+    const cleanRun = failed === 0;
 
-    // Close the OTP service (isolated context for InstaDDR, spare tab for Gmail)
-    if (this.otpService) {
-      try { await this.otpService.close(); } catch { /* ignore */ }
-      if (this.otpServiceCleanup) {
-        try { await this.otpServiceCleanup(); } catch { /* ignore */ }
+    if (cleanRun) {
+      if (this.accounts || this.instaDdrAccounts) {
+        try {
+          sendMessage({
+            type: "log",
+            level: "info",
+            message: "Logging out final account...",
+          });
+          await this.platform.logout();
+        } catch (err) {
+          sendMessage({
+            type: "log",
+            level: "warn",
+            message: `Final logout warning: ${err instanceof Error ? err.message : err}`,
+          });
+        }
       }
+
+      // Close the OTP service (isolated context for InstaDDR, Gmail tab for Gmail)
+      if (this.otpService) {
+        try { await this.otpService.close(); } catch { /* ignore */ }
+        if (this.otpServiceCleanup) {
+          try { await this.otpServiceCleanup(); } catch { /* ignore */ }
+        }
+      }
+    } else {
+      sendMessage({
+        type: "log",
+        level: "info",
+        message: "Leaving Flipkart + Gmail tabs open (run had failures) — close the Chrome window manually when done.",
+      });
     }
 
     sendMessage({
