@@ -78,6 +78,7 @@ async function main() {
   }
 
   const browserManager = new BrowserManager();
+  let runnerErrored = false;
 
   try {
     // Launch browser with profile
@@ -113,20 +114,44 @@ async function main() {
 
     // Run batch orchestrator
     const orchestrator = new BatchOrchestrator(page, platform, payment, config);
-    await orchestrator.run();
+    const { completed, failed } = await orchestrator.run();
 
-    sendMessage({ type: "log", level: "info", message: "Runner completed" });
-    process.exit(0);
+    // Iterations can fail without throwing (e.g. "Buy Now button not found"
+    // is caught per-iteration). Treat any failed iteration the same as an
+    // error for the purposes of keeping Chrome open for inspection.
+    if (failed > 0) {
+      runnerErrored = true;
+      sendMessage({
+        type: "log",
+        level: "warn",
+        message: `Runner finished with ${failed} failed iteration(s) and ${completed} successful — keeping Chrome open.`,
+      });
+    } else {
+      sendMessage({ type: "log", level: "info", message: "Runner completed" });
+    }
   } catch (err) {
+    runnerErrored = true;
     const errorMsg = err instanceof Error ? err.message : String(err);
     sendMessage({
       type: "log",
       level: "error",
       message: `Runner fatal error: ${errorMsg}`,
     });
-    process.exit(1);
   } finally {
-    await browserManager.close();
+    if (runnerErrored) {
+      // Leave Chrome open so the user can inspect what happened or pick up
+      // the purchase manually. Disconnect just detaches Puppeteer; the
+      // process stays running until the user closes the window themselves.
+      sendMessage({
+        type: "log",
+        level: "info",
+        message: "Chrome left open for manual inspection. Close the window when done.",
+      });
+      await browserManager.disconnect();
+    } else {
+      await browserManager.close();
+    }
+    process.exit(runnerErrored ? 1 : 0);
   }
 }
 

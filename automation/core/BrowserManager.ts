@@ -66,6 +66,12 @@ export class BrowserManager {
       ],
       ignoreDefaultArgs: ["--enable-automation"],
       defaultViewport: null,
+      // Don't let Puppeteer tear Chrome down when the Node runner receives
+      // a signal or exits — we manage the browser lifecycle ourselves so we
+      // can leave Chrome open on errors for the user to inspect.
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
     });
 
     const page = await this.browser.newPage();
@@ -75,6 +81,18 @@ export class BrowserManager {
   async close(): Promise<void> {
     if (this.browser) {
       await this.browser.close();
+      this.browser = null;
+    }
+  }
+
+  /**
+   * Detach the Puppeteer client from Chrome without killing the Chrome
+   * process. The user keeps seeing their tabs and can continue manually.
+   * The caller is responsible for closing Chrome themselves when done.
+   */
+  async disconnect(): Promise<void> {
+    if (this.browser) {
+      try { await this.browser.disconnect(); } catch { /* ignore */ }
       this.browser = null;
     }
   }
