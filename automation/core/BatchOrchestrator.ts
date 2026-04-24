@@ -153,7 +153,7 @@ export class BatchOrchestrator {
     this.otpServiceCleanup = null;
   }
 
-  async run(): Promise<void> {
+  async run(): Promise<{ completed: number; failed: number }> {
     let totalIterations = Math.ceil(
       this.config.totalQuantity / this.config.perOrderQuantity
     );
@@ -455,6 +455,8 @@ export class BatchOrchestrator {
       completed,
       failed,
     });
+
+    return { completed, failed };
   }
 
   // ─── RTGS Multi-Tab Batched Flow ────────────────────────────────────────────
