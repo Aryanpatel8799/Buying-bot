@@ -1601,25 +1601,9 @@ export class FlipkartPlatform extends BasePlatform {
   async resetForNextIteration(): Promise<void> {
     console.log("Resetting browser state for next iteration...");
 
-    // Step 1: Close ephemeral extra tabs (payment pop-ups, etc.) but keep the
-    // Gmail OTP tab alive — it's reused across iterations, and killing it here
-    // was dropping the Gmail session mid-job.
-    try {
-      const browser = this.page.browser();
-      const pages = await browser.pages();
-      for (const p of pages) {
-        if (p === this.page) continue;
-        let url = "";
-        try { url = p.url(); } catch { /* ignore */ }
-        // Preserve Gmail / Google Accounts tabs.
-        if (/^https?:\/\/[^\/]*(mail\.google\.com|accounts\.google\.com)/i.test(url)) {
-          continue;
-        }
-        await p.close().catch(() => {});
-      }
-    } catch {
-      console.log("Tab cleanup skipped");
-    }
+    // Step 1: (intentionally no tab closing) — every tab stays open across
+    // iterations so the user can watch Gmail, payment popups, etc. Orphans
+    // from previous jobs are already killed by BrowserManager.launch().
 
     // Step 2: Dismiss any popups on current page (don't navigate yet — save time)
     await this.page.evaluate(() => {

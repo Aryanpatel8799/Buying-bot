@@ -424,31 +424,17 @@ export class BatchOrchestrator {
       }
     }
 
-    // Logout the last account after all iterations
-    if (this.accounts || this.instaDdrAccounts) {
-      try {
-        sendMessage({
-          type: "log",
-          level: "info",
-          message: "Logging out final account...",
-        });
-        await this.platform.logout();
-      } catch (err) {
-        sendMessage({
-          type: "log",
-          level: "warn",
-          message: `Final logout warning: ${err instanceof Error ? err.message : err}`,
-        });
-      }
-    }
-
-    // Close the OTP service (isolated context for InstaDDR, spare tab for Gmail)
-    if (this.otpService) {
-      try { await this.otpService.close(); } catch { /* ignore */ }
-      if (this.otpServiceCleanup) {
-        try { await this.otpServiceCleanup(); } catch { /* ignore */ }
-      }
-    }
+    // Intentionally NO tab cleanup: the user wants every tab (Flipkart,
+    // Gmail, any payment popup) to stay open throughout the whole process,
+    // so they can watch the OTP arrive, inspect failures, or continue
+    // manually. We also skip the post-run logout — it navigates the Flipkart
+    // tab away from the result page. Orphan Chrome instances are reclaimed
+    // by BrowserManager.launch() at the start of the next job.
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: "Leaving all tabs open (Flipkart + Gmail + any popups). Close the Chrome window when you're done.",
+    });
 
     sendMessage({
       type: "done",
@@ -856,13 +842,7 @@ export class BatchOrchestrator {
       } catch { /* ignore */ }
     }
 
-    // Close the OTP service (isolated context for InstaDDR, spare tab for Gmail)
-    if (this.otpService) {
-      try { await this.otpService.close(); } catch { /* ignore */ }
-      if (this.otpServiceCleanup) {
-        try { await this.otpServiceCleanup(); } catch { /* ignore */ }
-      }
-    }
+    // Intentionally no OTP-service close — Gmail tab stays open across runs.
 
     const completed = tabResults.filter((r) => r === "success").length;
     const failed = tabResults.filter((r) => r === "failed").length;
