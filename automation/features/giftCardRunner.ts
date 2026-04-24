@@ -752,14 +752,10 @@ async function main() {
     runnerErrored = errMsg;
     sendMessage({ type: "log", level: "error", message: `Gift Card Runner fatal error: ${errMsg}` });
   } finally {
-    if (otpService) {
-      try {
-        await otpService.close();
-      } catch {
-        /* ignore */
-      }
-    }
-    await browserManager.close();
+    // Never close tabs or the browser — the user wants to keep everything
+    // visible throughout. Detach Puppeteer only. Next run's BrowserManager
+    // kills any orphan Chrome before launching.
+    await browserManager.disconnect();
 
     // Finalize DB record (if we have a reporter) — even if the runner errored
     if (reporter) {

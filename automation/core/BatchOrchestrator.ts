@@ -424,46 +424,17 @@ export class BatchOrchestrator {
       }
     }
 
-    // Only clean up state if every iteration succeeded. When anything failed
-    // we intentionally leave:
-    //   - the Flipkart tab on the page where it broke (so the user can pick
-    //     up the purchase manually or diagnose what went wrong),
-    //   - the Gmail tab open (so subsequent debugging can see the OTP mail),
-    //   - no final logout (so cookies/cart/checkout state are preserved).
-    const cleanRun = failed === 0;
-
-    if (cleanRun) {
-      if (this.accounts || this.instaDdrAccounts) {
-        try {
-          sendMessage({
-            type: "log",
-            level: "info",
-            message: "Logging out final account...",
-          });
-          await this.platform.logout();
-        } catch (err) {
-          sendMessage({
-            type: "log",
-            level: "warn",
-            message: `Final logout warning: ${err instanceof Error ? err.message : err}`,
-          });
-        }
-      }
-
-      // Close the OTP service (isolated context for InstaDDR, Gmail tab for Gmail)
-      if (this.otpService) {
-        try { await this.otpService.close(); } catch { /* ignore */ }
-        if (this.otpServiceCleanup) {
-          try { await this.otpServiceCleanup(); } catch { /* ignore */ }
-        }
-      }
-    } else {
-      sendMessage({
-        type: "log",
-        level: "info",
-        message: "Leaving Flipkart + Gmail tabs open (run had failures) — close the Chrome window manually when done.",
-      });
-    }
+    // Intentionally NO tab cleanup: the user wants every tab (Flipkart,
+    // Gmail, any payment popup) to stay open throughout the whole process,
+    // so they can watch the OTP arrive, inspect failures, or continue
+    // manually. We also skip the post-run logout — it navigates the Flipkart
+    // tab away from the result page. Orphan Chrome instances are reclaimed
+    // by BrowserManager.launch() at the start of the next job.
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: "Leaving all tabs open (Flipkart + Gmail + any popups). Close the Chrome window when you're done.",
+    });
 
     sendMessage({
       type: "done",
@@ -871,13 +842,7 @@ export class BatchOrchestrator {
       } catch { /* ignore */ }
     }
 
-    // Close the OTP service (isolated context for InstaDDR, spare tab for Gmail)
-    if (this.otpService) {
-      try { await this.otpService.close(); } catch { /* ignore */ }
-      if (this.otpServiceCleanup) {
-        try { await this.otpServiceCleanup(); } catch { /* ignore */ }
-      }
-    }
+    // Intentionally no OTP-service close — Gmail tab stays open across runs.
 
     const completed = tabResults.filter((r) => r === "success").length;
     const failed = tabResults.filter((r) => r === "failed").length;

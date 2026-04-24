@@ -138,19 +138,18 @@ async function main() {
       message: `Runner fatal error: ${errorMsg}`,
     });
   } finally {
-    if (runnerErrored) {
-      // Leave Chrome open so the user can inspect what happened or pick up
-      // the purchase manually. Disconnect just detaches Puppeteer; the
-      // process stays running until the user closes the window themselves.
-      sendMessage({
-        type: "log",
-        level: "info",
-        message: "Chrome left open for manual inspection. Close the window when done.",
-      });
-      await browserManager.disconnect();
-    } else {
-      await browserManager.close();
-    }
+    // Never close Chrome from the runner — detach only. The user wants every
+    // tab (Flipkart, Gmail, any payment popup) to stay exactly where it is,
+    // on success AND on failure. Orphan Chromes from previous runs are
+    // cleaned up by BrowserManager.launch() at the start of the next job.
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: runnerErrored
+        ? "Run finished with errors — Chrome left open for inspection."
+        : "Run complete — Chrome left open. Close the window when you're done.",
+    });
+    await browserManager.disconnect();
     process.exit(runnerErrored ? 1 : 0);
   }
 }
