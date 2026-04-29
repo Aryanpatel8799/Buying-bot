@@ -109,28 +109,63 @@ export class BrowserManager {
 
   /**
    * Kill any running Chrome process whose command-line contains the profile
-   * directory path. Safe to call even if nothing matches.
+   * directory path — but ONLY if the profile isn't currently held by a live
+   * Chrome. We detect "live" via Chrome's own SingletonLock symlink (target
+   * format: `<hostname>-<pid>`); if that PID is alive, refuse the launch so
+   * we don't kill another concurrent job that's legitimately using the
+   * profile.
    */
   private async killOrphanChrome(profileDir: string): Promise<void> {
     const abs = path.resolve(profileDir);
+
+    // 1. Check the SingletonLock for a live owner.
+    const lockPath = path.join(abs, "SingletonLock");
+    try {
+      const target = fs.readlinkSync(lockPath);
+      const m = target.match(/-(\d+)$/);
+      if (m) {
+        const pid = parseInt(m[1], 10);
+        if (Number.isFinite(pid) && this.isPidAlive(pid)) {
+          throw new Error(
+            `Chrome profile "${path.basename(abs)}" is already in use by another running job (PID ${pid}). ` +
+            `Pick a different Chrome profile for this job, or wait for the running one to finish.`
+          );
+        }
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "EINVAL") {
+        // No lock or not a symlink — no live owner, safe to continue.
+      } else if (err instanceof Error && err.message.includes("already in use")) {
+        throw err; // bubble our user-facing message
+      }
+      // Other read errors (EACCES etc.) — fall through and try to clean up.
+    }
+
+    // 2. No live owner. Reap any orphan Chrome processes.
     try {
       if (process.platform === "win32") {
-        // Best-effort on Windows. wmic is deprecated but still available; on
-        // newer hosts, the command simply fails silently and we continue.
         const escaped = abs.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
         execSync(
           `wmic process where "CommandLine like '%%${escaped}%%'" delete`,
           { stdio: "ignore" }
         );
       } else {
-        // pkill exits non-zero when no processes match — swallow.
         execSync(`pkill -f ${JSON.stringify(abs)}`, { stdio: "ignore" });
       }
-      // Give Chrome a moment to actually exit before we touch the profile dir.
       await new Promise((r) => setTimeout(r, 500));
     } catch {
-      // No orphan process, or the kill command isn't available — either way
-      // we continue; the lock-file cleanup below covers the common case.
+      // No orphan process matched — that's fine.
+    }
+  }
+
+  /** Check if a PID is reachable. Treats EPERM as "alive but not ours". */
+  private isPidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "EPERM";
     }
   }
 
