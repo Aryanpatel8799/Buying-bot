@@ -59,7 +59,13 @@ export async function POST(
 
   try {
     await enqueueJob(jobId);
-    return NextResponse.json({ message: "Job started" });
+    // Re-read the job to surface the freshly-allocated noVncUrl (set by
+    // JobExecutor.start()) so the client can pop the live viewer.
+    const startedJob = await Job.findById(jobId).select("noVncUrl").lean();
+    return NextResponse.json({
+      message: "Job started",
+      noVncUrl: (startedJob as { noVncUrl?: string | null } | null)?.noVncUrl ?? null,
+    });
   } catch (error) {
     // Revert status on failure
     await Job.updateOne({ _id: jobId }, { status: "failed" });

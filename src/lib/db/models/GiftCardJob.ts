@@ -23,6 +23,8 @@ export interface IGiftCardJob extends Document {
   platform: "flipkart" | "amazon";
   status: GiftCardJobStatus;
   pid?: number | null;
+  vncDisplay?: number | null;
+  noVncUrl?: string | null;
   total: number;
   completed: number;
   failed: number;
@@ -73,6 +75,8 @@ const GiftCardJobSchema = new Schema<IGiftCardJob>(
       index: true,
     },
     pid: { type: Number, default: null },
+    vncDisplay: { type: Number, default: null },
+    noVncUrl: { type: String, default: null },
     total: { type: Number, default: 0 },
     completed: { type: Number, default: 0 },
     failed: { type: Number, default: 0 },

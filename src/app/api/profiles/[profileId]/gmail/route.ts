@@ -3,6 +3,7 @@ import { getAuthSession } from "@/lib/auth/getSession";
 import dbConnect from "@/lib/db/connect";
 import ChromeProfile from "@/lib/db/models/ChromeProfile";
 import { getProfileDir, getChromePath } from "@/lib/platform/chromePaths";
+import { displayManager } from "@/lib/display/displayManager";
 import puppeteer from "puppeteer-core";
 import { z } from "zod";
 
@@ -65,8 +66,10 @@ export async function POST(
 
     const profileDir = getProfileDir(profile.directoryName);
 
-    // Launch Chrome on the Gmail sign-in page so the user can log in.
-    // Mirrors the setup route. Browser stays open for the user to close.
+    // Allocate a per-call display so simultaneous Gmail-connects across
+    // users don't collide with running jobs or each other.
+    const slot = await displayManager.allocate();
+
     const browser = await puppeteer.launch({
       headless: false,
       executablePath: getChromePath(),
@@ -75,23 +78,25 @@ export async function POST(
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--start-maximized",
-        // Google Accounts rejects Chrome if it detects automation flags.
-        // Suppress the two telltales: the default "--enable-automation" (stripped
-        // via ignoreDefaultArgs below) and the navigator.webdriver property.
         "--disable-blink-features=AutomationControlled",
       ],
       ignoreDefaultArgs: ["--enable-automation"],
       defaultViewport: null,
+      ...(slot ? { env: { ...process.env, DISPLAY: slot.displayString } } : {}),
     });
+    if (slot) {
+      browser.on("disconnected", () => {
+        displayManager.release(slot.display).catch(() => { /* ignore */ });
+      });
+    }
+
     const page = await browser.newPage();
-    // Land directly on the inbox URL so users see Gmail (not the marketing page),
-    // and so the search input loads up-front. If they're not signed in yet,
-    // Google will redirect them to the sign-in page from here.
     await page.goto("https://mail.google.com/mail/u/0/?tab=rm&ogbl#inbox", { waitUntil: "networkidle2" }).catch(() => { /* ignore */ });
 
     return NextResponse.json({
       message: "Gmail address saved. Chrome is open — log in manually, then close the browser.",
       gmailAddress: data.gmailAddress,
+      noVncUrl: slot?.noVncUrl ?? null,
     });
   } catch (err) {
     console.error("Gmail connect error:", err);

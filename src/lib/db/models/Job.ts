@@ -32,6 +32,8 @@ export interface IJob extends Document {
     currentIteration: number;
   };
   pid: number | null;
+  vncDisplay: number | null;   // allocated Xvfb display number (e.g. 105)
+  noVncUrl: string | null;     // public noVNC URL for this job
   startedAt: Date | null;
   completedAt: Date | null;
   createdAt: Date;
@@ -141,6 +143,14 @@ const JobSchema = new Schema<IJob>(
     },
     pid: {
       type: Number,
+      default: null,
+    },
+    vncDisplay: {
+      type: Number,
+      default: null,
+    },
+    noVncUrl: {
+      type: String,
       default: null,
     },
     startedAt: {

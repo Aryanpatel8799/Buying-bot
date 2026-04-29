@@ -24,7 +24,7 @@ export async function GET(req: NextRequest) {
   if (kind === "verify" || kind === "add") filter.kind = kind;
 
   const jobs = await GiftCardJob.find(filter)
-    .select("_id kind platform status total completed failed skipped startedAt completedAt createdAt errorMessage")
+    .select("_id kind platform status total completed failed skipped startedAt completedAt createdAt errorMessage noVncUrl")
     .sort({ createdAt: -1 })
     .limit(limit)
     .lean();
@@ -43,6 +43,7 @@ export async function GET(req: NextRequest) {
       startedAt: j.startedAt,
       completedAt: j.completedAt,
       createdAt: j.createdAt,
+      noVncUrl: (j as { noVncUrl?: string | null }).noVncUrl ?? null,
     }))
   );
 }

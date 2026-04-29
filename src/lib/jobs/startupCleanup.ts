@@ -1,6 +1,7 @@
 import dbConnect from "@/lib/db/connect";
 import Job from "@/lib/db/models/Job";
 import GiftCardJob from "@/lib/db/models/GiftCardJob";
+import { displayManager } from "@/lib/display/displayManager";
 
 let cleaned = false;
 
@@ -27,7 +28,7 @@ export async function cleanupStaleJobs(): Promise<void> {
     await dbConnect();
 
     // ── Buying Jobs ──────────────────────────────────────────────────────
-    const staleJobs = await Job.find({ status: "running" }).select("pid");
+    const staleJobs = await Job.find({ status: "running" }).select("pid vncDisplay");
     for (const job of staleJobs) {
       if (job.pid) {
         try {
@@ -37,6 +38,11 @@ export async function cleanupStaleJobs(): Promise<void> {
           // Process already dead — that's fine
         }
       }
+      // Free the per-job display slot so a new job can claim it.
+      if (job.vncDisplay != null) {
+        displayManager.markInUse(job.vncDisplay);
+        await displayManager.release(job.vncDisplay);
+      }
     }
 
     const result = await Job.updateMany(
@@ -45,6 +51,8 @@ export async function cleanupStaleJobs(): Promise<void> {
         $set: {
           status: "failed",
           pid: null,
+          vncDisplay: null,
+          noVncUrl: null,
           completedAt: new Date(),
         },
       }
@@ -62,20 +70,30 @@ export async function cleanupStaleJobs(): Promise<void> {
     // it on its own schedule.
     const staleGiftCardJobs = await GiftCardJob.find({
       status: { $in: ["pending", "running"] },
-    }).select("pid _id");
+    }).select("pid vncDisplay _id");
 
     let gcReset = 0;
     for (const gcJob of staleGiftCardJobs) {
       // No PID recorded = never started correctly, safe to fail
       // PID recorded but not alive = orphaned, safe to fail
       // PID recorded and alive = runner is still going, don't touch
-      if (!gcJob.pid || !isProcessAlive(gcJob.pid)) {
+      const alive = gcJob.pid && isProcessAlive(gcJob.pid);
+      if (alive && gcJob.vncDisplay != null) {
+        // Job is genuinely still running — keep its display reservation.
+        displayManager.markInUse(gcJob.vncDisplay);
+      } else if (!alive) {
+        if (gcJob.vncDisplay != null) {
+          displayManager.markInUse(gcJob.vncDisplay);
+          await displayManager.release(gcJob.vncDisplay);
+        }
         await GiftCardJob.updateOne(
           { _id: gcJob._id },
           {
             $set: {
               status: "failed",
               pid: null,
+              vncDisplay: null,
+              noVncUrl: null,
               completedAt: new Date(),
               errorMessage: "Runner process was terminated before job completed",
             },

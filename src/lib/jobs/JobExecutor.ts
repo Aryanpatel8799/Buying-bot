@@ -12,6 +12,7 @@ import { decrypt } from "@/lib/encryption";
 import { getProfileDir } from "@/lib/platform/chromePaths";
 import { removeExecutor } from "./jobRegistry";
 import { spawnTsx } from "./spawnTsx";
+import { displayManager, type DisplaySlot } from "@/lib/display/displayManager";
 import type { RunnerMessage, JobConfig } from "@/types";
 
 export class JobExecutor extends EventEmitter {
@@ -231,8 +232,18 @@ export class JobExecutor extends EventEmitter {
 
     const configB64 = Buffer.from(JSON.stringify(config)).toString("base64");
 
+    // Allocate a per-job Xvfb / x11vnc / noVNC slot (when the pool is
+    // configured). Each user can therefore watch this job in isolation
+    // without fighting other jobs over a shared display. If the pool is
+    // disabled or exhausted, fall back to the inherited DISPLAY env.
+    const slot: DisplaySlot | null = await displayManager.allocate();
+    const spawnEnv = slot
+      ? { ...process.env, DISPLAY: slot.displayString }
+      : undefined;
+
     this.process = spawnTsx("automation/runner.ts", [configB64], {
       stdio: ["pipe", "pipe", "pipe"],
+      ...(spawnEnv ? { env: spawnEnv } : {}),
     });
 
     // Update job status
@@ -243,9 +254,20 @@ export class JobExecutor extends EventEmitter {
         status: "running",
         pid: this.process.pid,
         startedAt: new Date(),
+        vncDisplay: slot?.display ?? null,
+        noVncUrl: slot?.noVncUrl ?? null,
         "progress.totalIterations": totalIterations,
       }
     );
+
+    // Release the display when the runner exits (success OR failure).
+    if (slot) {
+      const releaseOnce = async () => {
+        await displayManager.release(slot.display);
+      };
+      this.process.once("exit", releaseOnce);
+      this.process.once("error", releaseOnce);
+    }
 
     // Parse stdout for JSON messages
     let buffer = "";

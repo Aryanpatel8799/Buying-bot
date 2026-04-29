@@ -66,7 +66,14 @@ export default function ProfilesPage() {
       method: "POST",
     });
     if (res.ok) {
-      alert("Chrome launched! Log in manually, then close the browser.");
+      const data = await res.json().catch(() => ({}));
+      if (data.noVncUrl) {
+        // Open the live view in a new tab so the user can watch + interact.
+        window.open(data.noVncUrl, "_blank", "noopener,noreferrer");
+        alert(`Chrome launched. A new tab should have opened at:\n${data.noVncUrl}\n\nLog in manually, then close the Chrome window.`);
+      } else {
+        alert("Chrome launched! Log in manually, then close the browser.");
+      }
       fetchProfiles();
     } else {
       const data = await res.json();
@@ -96,7 +103,12 @@ export default function ProfilesPage() {
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
-      alert("Gmail address saved. Chrome is open — log in, then close the browser.");
+      if (data.noVncUrl) {
+        window.open(data.noVncUrl, "_blank", "noopener,noreferrer");
+        alert(`Gmail address saved.\nLive view: ${data.noVncUrl}\nLog in to Gmail in the new tab, then close that Chrome window.`);
+      } else {
+        alert("Gmail address saved. Chrome is open — log in, then close the browser.");
+      }
     } else {
       alert(data.error || "Failed to connect Gmail");
     }

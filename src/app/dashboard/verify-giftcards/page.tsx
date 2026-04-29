@@ -333,6 +333,10 @@ export default function VerifyGiftCardsPage() {
 
       setActiveJobId(data.jobId);
       setResumedNotice(null);
+      if (data.noVncUrl) {
+        setSuccess(`Job started — watch live: ${data.noVncUrl}`);
+        window.open(data.noVncUrl, "_blank", "noopener,noreferrer");
+      }
       subscribeToJob(data.jobId);
       refreshHistory();
     } catch {

@@ -4,6 +4,7 @@ import dbConnect from "@/lib/db/connect";
 import ChromeProfile from "@/lib/db/models/ChromeProfile";
 import { getProfileDir } from "@/lib/platform/chromePaths";
 import { getChromePath } from "@/lib/platform/chromePaths";
+import { displayManager } from "@/lib/display/displayManager";
 import puppeteer from "puppeteer-core";
 
 // POST /api/profiles/[profileId]/setup — launch Chrome for manual login
@@ -25,10 +26,13 @@ export async function POST(
     return NextResponse.json({ error: "Profile not found" }, { status: 404 });
   }
 
+  // Allocate a per-session display so multiple users can run profile-setup
+  // (and watch via noVNC) without colliding.
+  const slot = await displayManager.allocate();
+
   try {
     const profileDir = getProfileDir(profile.directoryName);
 
-    // Launch Chrome with the profile for manual login
     const browser = await puppeteer.launch({
       headless: false,
       executablePath: getChromePath(),
@@ -37,37 +41,39 @@ export async function POST(
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--start-maximized",
-        // Hide automation signals so Google / Amazon / Flipkart don't block
-        // the "Sign in with Google" flow on this profile.
         "--disable-blink-features=AutomationControlled",
       ],
       ignoreDefaultArgs: ["--enable-automation"],
       defaultViewport: null,
+      ...(slot ? { env: { ...process.env, DISPLAY: slot.displayString } } : {}),
     });
+
+    // Release the display the moment the user closes the Chrome window.
+    if (slot) {
+      browser.on("disconnected", () => {
+        displayManager.release(slot.display).catch(() => { /* ignore */ });
+      });
+    }
 
     const page = await browser.newPage();
 
-    // Navigate to the platform's login page
     const loginUrl =
       profile.platform === "amazon" || profile.platform === "both"
         ? "https://www.amazon.in"
         : "https://www.flipkart.com";
+    await page.goto(loginUrl, { waitUntil: "networkidle2" }).catch(() => { /* ignore */ });
 
-    await page.goto(loginUrl, { waitUntil: "networkidle2" });
-
-    // Update profile status
     await ChromeProfile.updateOne(
       { _id: profileId },
       { isLoggedIn: true, lastUsedAt: new Date() }
     );
 
-    // NOTE: Browser stays open for user to login manually.
-    // They close it when done. The session persists in the profile directory.
-
     return NextResponse.json({
       message: "Chrome launched. Please log in manually and close the browser when done.",
+      noVncUrl: slot?.noVncUrl ?? null,
     });
   } catch (error) {
+    if (slot) await displayManager.release(slot.display);
     console.error("Profile setup error:", error);
     return NextResponse.json(
       { error: "Failed to launch Chrome. Make sure Chrome is installed." },

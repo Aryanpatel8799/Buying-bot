@@ -36,5 +36,6 @@ export async function GET(
     errorMessage: job.errorMessage,
     startedAt: job.startedAt,
     completedAt: job.completedAt,
+    noVncUrl: job.noVncUrl ?? null,
   });
 }

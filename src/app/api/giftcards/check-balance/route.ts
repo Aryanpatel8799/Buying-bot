@@ -7,6 +7,7 @@ import { getProfileDir } from "@/lib/platform/chromePaths";
 import { checkRateLimit, rateLimitResponse } from "@/lib/rateLimit";
 import { spawnTsx } from "@/lib/jobs/spawnTsx";
 import { cleanupStaleJobs } from "@/lib/jobs/startupCleanup";
+import { displayManager } from "@/lib/display/displayManager";
 import { z } from "zod";
 
 const checkBalanceSchema = z.object({
@@ -83,9 +84,14 @@ export async function POST(req: NextRequest) {
 
     const configB64 = Buffer.from(JSON.stringify(config)).toString("base64");
 
+    // Allocate a per-job display so each verify run is independently watchable.
+    const slot = await displayManager.allocate();
+    const spawnEnv = slot ? { ...process.env, DISPLAY: slot.displayString } : undefined;
+
     const child = spawnTsx("automation/features/giftCardBalanceChecker.ts", [configB64], {
       stdio: "ignore",
       detached: true,
+      ...(spawnEnv ? { env: spawnEnv } : {}),
     });
     child.on("error", async (err) => {
       console.error(`[GiftCardJob ${job._id}] failed to spawn balance checker:`, err);
@@ -99,17 +105,27 @@ export async function POST(req: NextRequest) {
           }
         );
       } catch { /* ignore */ }
+      if (slot) await displayManager.release(slot.display);
     });
+    if (slot) {
+      child.once("exit", () => { displayManager.release(slot.display); });
+    }
     child.unref();
 
     await GiftCardJob.updateOne(
       { _id: job._id },
-      { pid: child.pid ?? null, startedAt: new Date() }
+      {
+        pid: child.pid ?? null,
+        startedAt: new Date(),
+        vncDisplay: slot?.display ?? null,
+        noVncUrl: slot?.noVncUrl ?? null,
+      }
     );
 
     return NextResponse.json({
       success: true,
       jobId: String(job._id),
+      noVncUrl: slot?.noVncUrl ?? null,
     });
   } catch (error) {
     if (error instanceof z.ZodError) {

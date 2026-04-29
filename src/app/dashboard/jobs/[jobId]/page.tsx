@@ -14,6 +14,7 @@ interface Job {
   perOrderQuantity: number;
   intervalSeconds: number;
   status: string;
+  noVncUrl?: string | null;
   progress: {
     totalIterations: number;
     completedIterations: number;
@@ -177,7 +178,13 @@ export default function JobDetailPage({
   }
 
   async function handleStart() {
-    await fetch(`/api/jobs/${jobId}/start`, { method: "POST" });
+    const res = await fetch(`/api/jobs/${jobId}/start`, { method: "POST" });
+    if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      if (data.noVncUrl) {
+        window.open(data.noVncUrl, "_blank", "noopener,noreferrer");
+      }
+    }
     fetchJob();
   }
 
@@ -302,6 +309,16 @@ export default function JobDetailPage({
             {job.progress.failedIterations} failed
           </span>
           <span>Status: {job.status}</span>
+          {job.noVncUrl && (job.status === "running" || job.status === "pending") && (
+            <a
+              href={job.noVncUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="ml-auto px-3 py-1 rounded-lg bg-indigo-600/20 border border-indigo-500/40 text-indigo-300 text-xs font-medium hover:bg-indigo-600/30"
+            >
+              ▶ Watch live
+            </a>
+          )}
         </div>
       </div>
 

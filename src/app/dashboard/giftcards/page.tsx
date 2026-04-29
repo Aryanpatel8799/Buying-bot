@@ -330,6 +330,11 @@ export default function GiftCardsPage() {
         return;
       }
 
+      if (data.noVncUrl) {
+        setSuccess(`Job started — watch live: ${data.noVncUrl}`);
+        // Pop the live viewer so the user doesn't have to copy the URL.
+        window.open(data.noVncUrl, "_blank", "noopener,noreferrer");
+      }
       subscribeToJob(data.jobId);
     } catch {
       setError("Something went wrong");
