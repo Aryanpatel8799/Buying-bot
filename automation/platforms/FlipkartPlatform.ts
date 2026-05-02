@@ -1375,22 +1375,43 @@ export class FlipkartPlatform extends BasePlatform {
       timeoutMs: 15000,
       maxRetries: 2,
     });
-    await sleep(DELAYS.medium);
+    // Wait for "Manage Addresses" header so we know the React app has hydrated
+    // (otherwise the saved-address cards won't be in the DOM yet).
+    try {
+      await this.page.waitForFunction(
+        () => {
+          const t = document.body?.innerText || "";
+          return /Manage Addresses/i.test(t) || /ADD A NEW ADDRESS/i.test(t);
+        },
+        { timeout: 15000 }
+      );
+    } catch {
+      console.log("[AddressPreflight] Manage Addresses header didn't render within 15s — continuing anyway");
+    }
+    await sleep(800);
 
     const targetName = (address.companyName || address.name || "").trim();
+    // Iterate each saved-address card (`div.CHc0Fj`) and check ALL four
+    // signals on the SAME card: name, city, pincode, mobile. This avoids
+    // the false-positive of the previous body-text scan.
     const matchExists = await this.page.evaluate(
-      (expected) => {
-        // Each saved address renders as a card containing name, mobile, and
-        // address text. Classes are dynamic — scan body text for a contiguous
-        // window that has all four signals.
-        const text = (document.body?.innerText || "").replace(/\s+/g, " ");
-        const lower = text.toLowerCase();
-        return (
-          lower.includes(expected.name.toLowerCase()) &&
-          lower.includes(expected.city.toLowerCase()) &&
-          text.includes(expected.pincode) &&
-          text.includes(expected.mobile)
-        );
+      (expected: { name: string; city: string; pincode: string; mobile: string }) => {
+        const cards = Array.from(document.querySelectorAll(".CHc0Fj")) as HTMLElement[];
+        const lowerName = expected.name.toLowerCase();
+        const lowerCity = expected.city.toLowerCase();
+        for (const card of cards) {
+          const text = (card.innerText || "").replace(/\s+/g, " ");
+          const lower = text.toLowerCase();
+          if (
+            lower.includes(lowerName) &&
+            lower.includes(lowerCity) &&
+            text.includes(expected.pincode) &&
+            text.includes(expected.mobile)
+          ) {
+            return true;
+          }
+        }
+        return false;
       },
       {
         name: targetName,
@@ -1418,31 +1439,64 @@ export class FlipkartPlatform extends BasePlatform {
     address: AddressDetails,
     mobile10: string
   ): Promise<void> {
-    // Click ADD A NEW ADDRESS
+    // Click ADD A NEW ADDRESS — Flipkart marks the actual button as
+    // `div.cv8zZS` whose direct text is "ADD A NEW ADDRESS". Earlier we were
+    // matching ANY div whose innerText contained the phrase, which picks up
+    // outer container divs (the whole "Manage Addresses" wrapper) and a
+    // click on those did nothing — the form never opened.
     await waitWithRetry(
       this.page,
       async () => {
         await this.page.waitForFunction(
           () => {
-            const divs = Array.from(document.querySelectorAll("div"));
-            return divs.some((d) => (d.innerText || "").trim().includes("ADD A NEW ADDRESS"));
+            const cv8 = Array.from(document.querySelectorAll<HTMLElement>("div.cv8zZS"));
+            if (cv8.some((el) => /ADD A NEW ADDRESS/i.test(el.innerText || ""))) return true;
+            // Fallback selector if Flipkart rotates the class hash.
+            const candidates = Array.from(document.querySelectorAll<HTMLElement>("div"));
+            return candidates.some(
+              (d) => /^ADD A NEW ADDRESS$/i.test((d.innerText || "").trim())
+            );
           },
-          { timeout: 10000 }
+          { timeout: 15000 }
         );
       },
-      { label: "ADD A NEW ADDRESS button", timeoutMs: 10000, maxRetries: 3 }
+      { label: "ADD A NEW ADDRESS button", timeoutMs: 15000, maxRetries: 3 }
     );
-    await this.page.evaluate(() => {
-      const divs = Array.from(document.querySelectorAll("div"));
-      for (const d of divs) {
-        const txt = (d.innerText || "").trim();
-        if (txt.includes("ADD A NEW ADDRESS")) {
-          (d as HTMLElement).click();
-          return;
+    const clicked = await this.page.evaluate(() => {
+      // Strategy 1: the Flipkart-specific class
+      const cv8 = Array.from(document.querySelectorAll<HTMLElement>("div.cv8zZS"));
+      for (const el of cv8) {
+        if (/ADD A NEW ADDRESS/i.test(el.innerText || "")) {
+          el.scrollIntoView({ block: "center" });
+          el.click();
+          return "cv8zZS";
         }
       }
+      // Strategy 2: any div whose direct trimmed text equals the label
+      const all = Array.from(document.querySelectorAll<HTMLElement>("div"));
+      for (const d of all) {
+        const txt = (d.innerText || "").trim();
+        if (/^ADD A NEW ADDRESS$/i.test(txt)) {
+          d.scrollIntoView({ block: "center" });
+          d.click();
+          return "exact-text";
+        }
+      }
+      return null;
     });
-    await sleep(500);
+    if (!clicked) {
+      throw new Error("Could not find ADD A NEW ADDRESS button on /account/addresses");
+    }
+    console.log(`[AddressPreflight] clicked ADD A NEW ADDRESS via ${clicked} strategy`);
+    await sleep(800);
+
+    // Wait for the actual form to render before clearAndType — clicking
+    // the button opens an overlay with the input fields.
+    try {
+      await this.page.waitForSelector('input[name="name"]', { visible: true, timeout: 15000 });
+    } catch {
+      throw new Error('Add-address form did not appear (input[name="name"] not visible) — selector may have changed');
+    }
 
     // Fill the form (selectors mirror addressRunner.ts)
     await clearAndType(this.page, 'input[name="name"]', address.name, "Name");
