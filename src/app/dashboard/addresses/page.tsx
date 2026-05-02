@@ -7,7 +7,7 @@ import { useRouter } from "next/navigation";
 interface SavedAddressEntry {
   _id: string;
   name: string;
-  maskedMobile: string;
+  maskedMobile?: string;
   pincode: string;
   locality: string;
   addressLine1: string;
@@ -73,7 +73,6 @@ export default function AddressesPage() {
 
   // Form fields
   const [name, setName] = useState("");
-  const [mobile, setMobile] = useState("");
   const [pincode, setPincode] = useState("");
   const [locality, setLocality] = useState("");
   const [addressLine1, setAddressLine1] = useState("");
@@ -101,8 +100,6 @@ export default function AddressesPage() {
   function validateForm(): Record<string, string> {
     const errors: Record<string, string> = {};
     if (!name.trim()) errors.name = "Name is required";
-    if (!mobile.trim()) errors.mobile = "Mobile number is required";
-    else if (!/^\d{10}$/.test(mobile)) errors.mobile = "Must be exactly 10 digits";
     if (!pincode.trim()) errors.pincode = "Pincode is required";
     else if (!/^\d{6}$/.test(pincode)) errors.pincode = "Must be exactly 6 digits";
     if (!locality.trim()) errors.locality = "Locality is required";
@@ -130,7 +127,6 @@ export default function AddressesPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: name.trim(),
-          mobile,
           pincode,
           locality: locality.trim(),
           addressLine1: addressLine1.trim(),
@@ -145,7 +141,6 @@ export default function AddressesPage() {
       if (res.ok) {
         setSuccessMsg("Address saved successfully!");
         setName("");
-        setMobile("");
         setPincode("");
         setLocality("");
         setAddressLine1("");
@@ -301,25 +296,6 @@ export default function AddressesPage() {
                 />
                 {formError.name && (
                   <p className="text-xs text-red-400 mt-1">{formError.name}</p>
-                )}
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1.5 uppercase tracking-wider">
-                  10-digit Mobile Number
-                </label>
-                <input
-                  type="text"
-                  value={mobile}
-                  onChange={(e) => {
-                    setMobile(e.target.value.replace(/\D/g, "").slice(0, 10));
-                    setFormError((p) => ({ ...p, mobile: undefined }));
-                  }}
-                  placeholder="9876543210"
-                  maxLength={10}
-                  className={fieldClass("mobile")}
-                />
-                {formError.mobile && (
-                  <p className="text-xs text-red-400 mt-1">{formError.mobile}</p>
                 )}
               </div>
               <div>
@@ -511,7 +487,9 @@ export default function AddressesPage() {
                     <p>
                       {addr.city} — {addr.pincode}, {addr.state}
                     </p>
-                    <p className="text-gray-500">{addr.maskedMobile}</p>
+                    {addr.maskedMobile && (
+                      <p className="text-gray-500">{addr.maskedMobile}</p>
+                    )}
                   </div>
                 </div>
 

@@ -3,6 +3,11 @@ import mongoose, { Schema, Document, Model } from "mongoose";
 export interface ISavedAddress extends Document {
   userId: mongoose.Types.ObjectId;
   name: string;
+  /**
+   * Mobile is no longer entered on the dashboard — the bot pulls the
+   * per-account number from Flipkart's `/account` page at run time. Old
+   * records still carry the value; new ones default to "".
+   */
   mobile: string;
   pincode: string;
   locality: string;
@@ -32,10 +37,10 @@ const SavedAddressSchema = new Schema<ISavedAddress>(
     },
     mobile: {
       type: String,
-      required: true,
+      required: false,
+      default: "",
       trim: true,
-      maxlength: 10,
-      minlength: 10,
+      maxlength: 15,
     },
     pincode: {
       type: String,

@@ -69,6 +69,50 @@ async function main() {
     const { browser, page } = await browserManager.launch(config.chromeProfileDir);
 
     // =========================================================
+    // STEP 0: If no mobile was provided in the saved address (the
+    // dashboard form no longer captures it), scrape the account's
+    // registered mobile from /account first. This way every saved
+    // address gets the per-account number, matching the per-job
+    // pre-flight behaviour.
+    // =========================================================
+    if (!config.address.mobile || !config.address.mobile.trim()) {
+      try {
+        await navigateWithRetry(page, "https://www.flipkart.com/account", {
+          timeoutMs: 15000,
+          maxRetries: 2,
+        });
+        await sleep(1000);
+        const fetched = await page.evaluate(() => {
+          const inp = document.querySelector(
+            'input[name="mobileNumber"]'
+          ) as HTMLInputElement | null;
+          return inp ? (inp.value || "").trim() : "";
+        });
+        const digits = fetched.replace(/\D/g, "").slice(-10);
+        if (digits.length === 10) {
+          config.address.mobile = digits;
+          sendMessage({
+            type: "log",
+            level: "info",
+            message: `Scraped account mobile from /account: ***${digits.slice(-4)}`,
+          });
+        } else {
+          sendMessage({
+            type: "log",
+            level: "warn",
+            message: `Could not read mobile from /account (got "${fetched}") — Flipkart may reject the form`,
+          });
+        }
+      } catch (err) {
+        sendMessage({
+          type: "log",
+          level: "warn",
+          message: `Failed to fetch account mobile: ${err instanceof Error ? err.message : err}`,
+        });
+      }
+    }
+
+    // =========================================================
     // STEP 1: Navigate to Flipkart account addresses page
     // =========================================================
     await navigateWithRetry(page, "https://www.flipkart.com/account/addresses", {

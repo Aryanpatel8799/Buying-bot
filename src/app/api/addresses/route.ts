@@ -7,11 +7,11 @@ import { z } from "zod";
 
 const addAddressSchema = z.object({
   name: z.string().min(1, "Name is required").max(100),
-  mobile: z
-    .string()
-    .min(1, "Mobile number is required")
-    .max(10, "Mobile number must be exactly 10 digits")
-    .regex(/^\d{10}$/, "Mobile number must be exactly 10 digits"),
+  // Mobile is no longer captured by the dashboard form — the bot pulls
+  // the per-account mobile from Flipkart's /account page at run time.
+  // Kept as an optional string so older clients still work and CSV imports
+  // can carry a value if they want to.
+  mobile: z.string().max(15).optional().default(""),
   pincode: z
     .string()
     .min(1, "Pincode is required")
@@ -45,7 +45,9 @@ export async function GET() {
   const masked = addresses.map((addr) => ({
     _id: addr._id,
     name: addr.name,
-    maskedMobile: addr.mobile.slice(0, 3) + "*****" + addr.mobile.slice(-2),
+    maskedMobile: addr.mobile && addr.mobile.length >= 5
+      ? addr.mobile.slice(0, 3) + "*****" + addr.mobile.slice(-2)
+      : "",
     pincode: addr.pincode,
     locality: addr.locality,
     addressLine1: addr.addressLine1,
@@ -90,7 +92,9 @@ export async function POST(req: NextRequest) {
         name: address.name,
         maskedGstNumber:
           address.gstNumber.slice(0, 2) + "*".repeat(11) + address.gstNumber.slice(-2),
-        maskedMobile: address.mobile.slice(0, 3) + "*****" + address.mobile.slice(-2),
+        maskedMobile: address.mobile && address.mobile.length >= 5
+          ? address.mobile.slice(0, 3) + "*****" + address.mobile.slice(-2)
+          : "",
         companyName: address.companyName,
         addressType: address.addressType,
         createdAt: address.createdAt,
