@@ -108,50 +108,58 @@ export async function clearAndType(
     { label: label || selector, timeoutMs: 10000, maxRetries: 5, isPaymentPage }
   );
 
-  await page.evaluate((sel: string) => {
-    const el = document.querySelector(sel) as HTMLElement | null;
-    if (el) {
-      el.scrollIntoView({ block: "center" });
-      el.click();
-    }
-  }, selector);
-  await sleep(100);
+  // Helper: write `val` directly to the field via the right prototype's
+  // native value setter. Critical for two reasons:
+  //   - Textareas don't accept HTMLInputElement.prototype.value setter, so
+  //     we branch on element type.
+  //   - We deliberately do NOT dispatch a "blur" event. Flipkart's input
+  //     handler trims/normalises on blur and was eating our last character.
+  //     Just `input` (which React listens to via its synthetic event
+  //     system) is enough.
+  const jsSet = async (val: string) => {
+    await page.evaluate(
+      (sel: string, v: string) => {
+        const el = document.querySelector(sel) as HTMLInputElement | HTMLTextAreaElement | null;
+        if (!el) return;
+        const proto =
+          el instanceof HTMLTextAreaElement
+            ? window.HTMLTextAreaElement.prototype
+            : window.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+        if (setter) setter.call(el, v);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      },
+      selector,
+      val
+    );
+  };
 
-  // Select all existing text and delete it
-  const isMac = process.platform === "darwin";
-  if (isMac) {
-    await page.keyboard.down("Meta");
-    await page.keyboard.press("a");
-    await page.keyboard.up("Meta");
-  } else {
-    await page.keyboard.down("Control");
-    await page.keyboard.press("a");
-    await page.keyboard.up("Control");
-  }
-  await page.keyboard.press("Backspace");
-  await sleep(100);
+  // Focus + clear via the native setter (no Ctrl+A / Backspace race).
+  await page.focus(selector).catch(async () => {
+    // Some inputs need a click to gain focus (overlays, custom widgets).
+    await page.evaluate((sel: string) => {
+      (document.querySelector(sel) as HTMLElement | null)?.click();
+    }, selector);
+  });
+  await sleep(80);
+  await jsSet("");
+  await sleep(80);
 
-  // Also clear via JS to be safe
-  await page.evaluate((sel: string) => {
-    const el = document.querySelector(sel) as HTMLInputElement;
-    if (el) {
-      el.value = "";
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-    }
-  }, selector);
-  await sleep(50);
-
-  // Type the value character by character. delay:50 is the sweet spot for
-  // Flipkart's React-controlled inputs — anything faster (we used to be at
-  // 20) and React drops the trailing keypresses, leaving the field with a
-  // truncated value.
-  await page.type(selector, value, { delay: 50 });
+  // Type the value character by character. delay:80 gives React's reducer
+  // time to process each keypress without dropping the trailing character.
+  await page.type(selector, value, { delay: 80 });
   // Wait long enough for React's onChange to flush before we verify.
-  await sleep(300);
+  await sleep(400);
 
-  // Verify the value was entered correctly. Loop up to 3 times so we recover
-  // from React's "value reverted" race (it sometimes overwrites our chars
-  // with its previous controlled-state value mid-typing).
+  // ALWAYS reapply via the native setter. This ensures the DOM value is
+  // exactly `value` even if Puppeteer's keystrokes triggered an autocomplete
+  // selection, an onBlur trim, or a controlled-state revert. Idempotent —
+  // when the typed value already matches, this just re-fires the input event.
+  await jsSet(value);
+  await sleep(150);
+
+  // Verify; retry the JS set up to 2 more times if React still hasn't
+  // accepted (e.g. onChange handler aggressively normalises).
   for (let attempt = 1; attempt <= 3; attempt++) {
     const actualValue = await page.evaluate((sel: string) => {
       const el = document.querySelector(sel) as HTMLInputElement | HTMLTextAreaElement | null;
@@ -163,31 +171,9 @@ export async function clearAndType(
     const displayVal = sensitive ? "***" : value;
     const displayActual = sensitive ? "***" : actualValue;
     console.log(
-      `Value mismatch on ${label || selector} (attempt ${attempt}/3): expected "${displayVal}" (${value.length} chars), got "${displayActual}" (${actualValue.length} chars). Re-applying via native setter...`
+      `Value mismatch on ${label || selector} (attempt ${attempt}/3): expected "${displayVal}" (${value.length} chars), got "${displayActual}" (${actualValue.length} chars). Reapplying via native setter...`
     );
-
-    // Use the RIGHT prototype's value setter — `HTMLInputElement` doesn't
-    // work for textareas, which is why the previous fallback silently
-    // no-op'd on the address-line field. Pick the prototype matching the
-    // element so React picks up the change properly via its synthetic
-    // event system.
-    await page.evaluate(
-      (sel: string, val: string) => {
-        const el = document.querySelector(sel) as HTMLInputElement | HTMLTextAreaElement | null;
-        if (!el) return;
-        const proto =
-          el instanceof HTMLTextAreaElement
-            ? window.HTMLTextAreaElement.prototype
-            : window.HTMLInputElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-        if (setter) setter.call(el, val);
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        el.dispatchEvent(new Event("change", { bubbles: true }));
-        el.dispatchEvent(new Event("blur", { bubbles: true }));
-      },
-      selector,
-      value
-    );
+    await jsSet(value);
     await sleep(300);
   }
 
