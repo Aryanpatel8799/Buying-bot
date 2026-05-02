@@ -141,32 +141,68 @@ export async function clearAndType(
   }, selector);
   await sleep(50);
 
-  // Type the value character by character
-  await page.type(selector, value, { delay: 20 });
-  await sleep(100);
+  // Type the value character by character. delay:50 is the sweet spot for
+  // Flipkart's React-controlled inputs — anything faster (we used to be at
+  // 20) and React drops the trailing keypresses, leaving the field with a
+  // truncated value.
+  await page.type(selector, value, { delay: 50 });
+  // Wait long enough for React's onChange to flush before we verify.
+  await sleep(300);
 
-  // Verify the value was entered correctly
-  const actualValue = await page.evaluate((sel: string) => {
-    const el = document.querySelector(sel) as HTMLInputElement;
-    return el?.value || "";
-  }, selector);
+  // Verify the value was entered correctly. Loop up to 3 times so we recover
+  // from React's "value reverted" race (it sometimes overwrites our chars
+  // with its previous controlled-state value mid-typing).
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const actualValue = await page.evaluate((sel: string) => {
+      const el = document.querySelector(sel) as HTMLInputElement | HTMLTextAreaElement | null;
+      return el?.value || "";
+    }, selector);
 
-  if (actualValue !== value) {
+    if (actualValue === value) break;
+
     const displayVal = sensitive ? "***" : value;
     const displayActual = sensitive ? "***" : actualValue;
-    console.log(`Value mismatch: expected "${displayVal}", got "${displayActual}". Retrying with JS set...`);
-    await page.evaluate((sel: string, val: string) => {
-      const el = document.querySelector(sel) as HTMLInputElement;
-      if (el) {
-        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype, "value"
-        )?.set;
-        nativeInputValueSetter?.call(el, val);
+    console.log(
+      `Value mismatch on ${label || selector} (attempt ${attempt}/3): expected "${displayVal}" (${value.length} chars), got "${displayActual}" (${actualValue.length} chars). Re-applying via native setter...`
+    );
+
+    // Use the RIGHT prototype's value setter — `HTMLInputElement` doesn't
+    // work for textareas, which is why the previous fallback silently
+    // no-op'd on the address-line field. Pick the prototype matching the
+    // element so React picks up the change properly via its synthetic
+    // event system.
+    await page.evaluate(
+      (sel: string, val: string) => {
+        const el = document.querySelector(sel) as HTMLInputElement | HTMLTextAreaElement | null;
+        if (!el) return;
+        const proto =
+          el instanceof HTMLTextAreaElement
+            ? window.HTMLTextAreaElement.prototype
+            : window.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+        if (setter) setter.call(el, val);
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-    }, selector, value);
-    await sleep(100);
+        el.dispatchEvent(new Event("blur", { bubbles: true }));
+      },
+      selector,
+      value
+    );
+    await sleep(300);
+  }
+
+  // Final sanity check — log if we still couldn't get the right value so
+  // the runner's screenshots have a clear trail.
+  const finalValue = await page.evaluate((sel: string) => {
+    const el = document.querySelector(sel) as HTMLInputElement | HTMLTextAreaElement | null;
+    return el?.value || "";
+  }, selector);
+  if (finalValue !== value) {
+    const displayVal = sensitive ? "***" : value;
+    const displayActual = sensitive ? "***" : finalValue;
+    console.log(
+      `WARNING: ${label || selector} ended with truncated/changed value: expected "${displayVal}" got "${displayActual}"`
+    );
   }
 
   const displayValue = sensitive ? "***" : value;
