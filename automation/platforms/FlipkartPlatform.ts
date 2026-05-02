@@ -1307,6 +1307,217 @@ export class FlipkartPlatform extends BasePlatform {
     }
   }
 
+  // ================================================================
+  // ACCOUNT MOBILE + ADDRESS PRE-FLIGHT
+  // Runs after login, before the purchase flow. Ensures the saved
+  // address Flipkart will eventually deliver to has the CORRECT
+  // mobile number for THIS account (not the static one from job
+  // config), so each account's orders ship with their own number.
+  // ================================================================
+
+  /**
+   * Navigate to /account and scrape the registered mobile number from
+   * `input[name="mobileNumber"]`. Returns the value as it appears (e.g.
+   * "+919898537706") or null if not found.
+   */
+  async fetchAccountMobile(): Promise<string | null> {
+    console.log("[Mobile] Fetching account mobile from /account ...");
+    try {
+      await navigateWithRetry(this.page, "https://www.flipkart.com/account", {
+        timeoutMs: 15000,
+        maxRetries: 2,
+      });
+      await sleep(DELAYS.medium);
+
+      const value = await this.page.evaluate(() => {
+        const el = document.querySelector(
+          'input[name="mobileNumber"]'
+        ) as HTMLInputElement | null;
+        return el?.value || null;
+      });
+
+      if (!value) {
+        console.log("[Mobile] mobileNumber input not found on /account");
+        return null;
+      }
+      const trimmed = value.trim();
+      console.log(`[Mobile] Account mobile read: ${trimmed.slice(0, 4)}***${trimmed.slice(-3)}`);
+      return trimmed;
+    } catch (err) {
+      console.log(`[Mobile] Failed to fetch account mobile: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  /** Strip non-digits and return the last 10 digits (Indian mobile). */
+  private normalizeMobile(input: string): string {
+    return input.replace(/\D/g, "").slice(-10);
+  }
+
+  /**
+   * Ensure /account/addresses contains an address that matches `address`
+   * AND has the given `accountMobile`. If a matching saved address exists
+   * (same name/company + city + pincode + mobile), no-op. Otherwise add a
+   * fresh one using the same form-fill logic as addressRunner.ts but with
+   * the per-account mobile.
+   */
+  async ensureAddressForAccount(
+    address: AddressDetails,
+    accountMobile: string
+  ): Promise<void> {
+    const tail4 = this.normalizeMobile(accountMobile).slice(-4);
+    console.log(
+      `[AddressPreflight] ensuring address (${address.companyName || address.name}, ` +
+      `${address.city}, ${address.pincode}) has mobile ending ${tail4}`
+    );
+
+    await navigateWithRetry(this.page, "https://www.flipkart.com/account/addresses", {
+      timeoutMs: 15000,
+      maxRetries: 2,
+    });
+    await sleep(DELAYS.medium);
+
+    const targetName = (address.companyName || address.name || "").trim();
+    const matchExists = await this.page.evaluate(
+      (expected) => {
+        // Each saved address renders as a card containing name, mobile, and
+        // address text. Classes are dynamic — scan body text for a contiguous
+        // window that has all four signals.
+        const text = (document.body?.innerText || "").replace(/\s+/g, " ");
+        const lower = text.toLowerCase();
+        return (
+          lower.includes(expected.name.toLowerCase()) &&
+          lower.includes(expected.city.toLowerCase()) &&
+          text.includes(expected.pincode) &&
+          text.includes(expected.mobile)
+        );
+      },
+      {
+        name: targetName,
+        city: address.city,
+        pincode: address.pincode,
+        mobile: this.normalizeMobile(accountMobile),
+      }
+    );
+
+    if (matchExists) {
+      console.log("[AddressPreflight] matching saved address with correct mobile already present");
+      return;
+    }
+
+    console.log("[AddressPreflight] no matching saved address — adding a new one with the account mobile");
+    await this.addNewAddressWithMobile(address, this.normalizeMobile(accountMobile));
+  }
+
+  /**
+   * Click "ADD A NEW ADDRESS" on /account/addresses and fill the form using
+   * the supplied mobile. Same selectors used by addressRunner.ts so the
+   * behaviour stays consistent across entry points.
+   */
+  private async addNewAddressWithMobile(
+    address: AddressDetails,
+    mobile10: string
+  ): Promise<void> {
+    // Click ADD A NEW ADDRESS
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForFunction(
+          () => {
+            const divs = Array.from(document.querySelectorAll("div"));
+            return divs.some((d) => (d.innerText || "").trim().includes("ADD A NEW ADDRESS"));
+          },
+          { timeout: 10000 }
+        );
+      },
+      { label: "ADD A NEW ADDRESS button", timeoutMs: 10000, maxRetries: 3 }
+    );
+    await this.page.evaluate(() => {
+      const divs = Array.from(document.querySelectorAll("div"));
+      for (const d of divs) {
+        const txt = (d.innerText || "").trim();
+        if (txt.includes("ADD A NEW ADDRESS")) {
+          (d as HTMLElement).click();
+          return;
+        }
+      }
+    });
+    await sleep(500);
+
+    // Fill the form (selectors mirror addressRunner.ts)
+    await clearAndType(this.page, 'input[name="name"]', address.name, "Name");
+    await sleep(200);
+    await clearAndType(this.page, 'input[name="phone"]', mobile10, "Mobile");
+    await sleep(200);
+    await clearAndType(this.page, 'input[name="pincode"]', address.pincode, "Pincode");
+    await sleep(200);
+    await clearAndType(this.page, 'input[name="addressLine2"]', address.locality, "Locality");
+    await sleep(200);
+    await clearAndType(
+      this.page,
+      'textarea[name="addressLine1"]',
+      address.addressLine1,
+      "Address line 1"
+    );
+    await sleep(200);
+    await clearAndType(this.page, 'input[name="city"]', address.city, "City");
+    await sleep(200);
+
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForSelector('select[name="state"]', { visible: true, timeout: 5000 });
+      },
+      { label: "State dropdown", timeoutMs: 5000, maxRetries: 3 }
+    );
+    await this.page.select('select[name="state"]', address.state);
+    await sleep(200);
+
+    const radioValue = address.addressType === "Home" ? "HOME" : "WORK";
+    await this.page.evaluate((val) => {
+      const r = document.querySelector(
+        `input[name="locationTypeTag"][id="${val}"]`
+      ) as HTMLInputElement | null;
+      r?.click();
+    }, radioValue);
+    await sleep(200);
+
+    // Save
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.page.waitForFunction(
+          () => Array.from(document.querySelectorAll("button")).some(
+            (b) => b.textContent?.trim().toLowerCase() === "save"
+          ),
+          { timeout: 5000 }
+        );
+      },
+      { label: "Save button", timeoutMs: 5000, maxRetries: 3 }
+    );
+    await this.page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll("button"));
+      for (const b of btns) {
+        if (b.textContent?.trim().toLowerCase() === "save") {
+          b.scrollIntoView({ block: "center" });
+          (b as HTMLElement).click();
+          return;
+        }
+      }
+    });
+    await sleep(1500);
+
+    const ok = await this.page.evaluate(() => {
+      const t = document.body?.innerText || "";
+      return /address saved|saved successfully|added successfully/i.test(t);
+    });
+    if (ok) {
+      console.log("[AddressPreflight] new address saved");
+    } else {
+      console.log("[AddressPreflight] could not confirm save — continuing anyway");
+    }
+  }
+
   /**
    * Enter a 6-digit OTP into Flipkart's OTP input field after requesting OTP.
    */

@@ -354,6 +354,51 @@ export class BatchOrchestrator {
           });
         }
 
+        // ── Pre-flight: per-account mobile + saved-address verification ──
+        // After login, scrape THIS account's registered mobile from
+        // /account and ensure /account/addresses contains the job's
+        // selected address with that exact number. This guarantees each
+        // account ships with its own mobile rather than the static one
+        // baked into job config.
+        if (
+          this.platform instanceof FlipkartPlatform &&
+          this.config.address &&
+          needsLogin
+        ) {
+          try {
+            const mobile = await this.platform.fetchAccountMobile();
+            if (mobile) {
+              // Override the mobile we'll feed into downstream verification
+              // so the checkout-page address match keys on the right number.
+              const normalised = mobile.replace(/\D/g, "").slice(-10);
+              if (normalised) {
+                this.config.address.mobile = normalised;
+              }
+              await this.platform.ensureAddressForAccount(this.config.address, mobile);
+              sendMessage({
+                type: "log",
+                level: "info",
+                message: `Pre-flight done: account mobile ending ${normalised.slice(-4)} ensured on saved address`,
+                iteration: i + 1,
+              });
+            } else {
+              sendMessage({
+                type: "log",
+                level: "warn",
+                message: "Pre-flight: could not read mobile from /account — falling back to job config mobile",
+                iteration: i + 1,
+              });
+            }
+          } catch (err) {
+            sendMessage({
+              type: "log",
+              level: "warn",
+              message: `Pre-flight skipped: ${err instanceof Error ? err.message : err}`,
+              iteration: i + 1,
+            });
+          }
+        }
+
         if (this.isMultiUrl) {
           await this.runMultiUrlIteration(i + 1);
         } else {
