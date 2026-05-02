@@ -2328,6 +2328,12 @@ export class FlipkartPlatform extends BasePlatform {
         }
       }
     }
+
+    // Final mobile-aware verification — if two saved addresses share city +
+    // pincode but differ in mobile, the city-only matcher above can pick the
+    // wrong one. This loop opens the picker and tries the next candidate
+    // until the displayed mobile matches the per-account number.
+    await this.ensureMobileMatchesOnCheckout(address);
   }
 
   private async verifyGstCheckboxOnSummary(address: AddressDetails): Promise<void> {
@@ -2891,7 +2897,12 @@ export class FlipkartPlatform extends BasePlatform {
     console.log(`Pincode match: ${hasPincode}, City match: ${hasCity}, Score: ${matchScore}/6`);
 
     if (hasPincode && hasCity) {
-      console.log("Delivery address matches — no change needed");
+      console.log("Delivery address city+pincode match — verifying mobile next");
+      // Even if city+pincode match, two saved addresses can share them with
+      // DIFFERENT mobiles (the per-account-mobile case). Let the mobile loop
+      // confirm the right one is showing; it's a no-op when the mobile
+      // already matches.
+      await this.ensureMobileMatchesOnCheckout(address);
       return;
     }
 
@@ -2980,6 +2991,7 @@ export class FlipkartPlatform extends BasePlatform {
       if (modalClosed) {
         console.log("Address selected successfully — proceeding with checkout");
         await sleep(300);
+        await this.ensureMobileMatchesOnCheckout(address);
         return;
       }
 
@@ -3002,6 +3014,10 @@ export class FlipkartPlatform extends BasePlatform {
       } else {
         console.log("Address appears correct after refresh — proceeding");
       }
+
+      // Even on the recovery path, verify mobile to catch the duplicate-
+      // address case before we hit Place Order.
+      await this.ensureMobileMatchesOnCheckout(address);
     }
   }
 
@@ -3853,11 +3869,14 @@ export class FlipkartPlatform extends BasePlatform {
    * by company name + city + locality. Falls back to false if no match found.
    * Saved address cards show: company name (bold) + "locality, city" text.
    */
-  private async selectAddressFromList(address: AddressDetails): Promise<boolean> {
+  private async selectAddressFromList(
+    address: AddressDetails,
+    excludeTexts: string[] = []
+  ): Promise<boolean> {
     const targetName = (address.companyName || address.name || "").trim().toLowerCase();
     const targetCity = address.city.trim().toLowerCase();
     const targetLocality = (address.locality || "").trim().toLowerCase();
-    console.log(`[SelectAddress] Looking for saved address: name="${targetName}", city="${targetCity}", locality="${targetLocality}"`);
+    console.log(`[SelectAddress] Looking for saved address: name="${targetName}", city="${targetCity}", locality="${targetLocality}", excluding=${excludeTexts.length} prior candidate(s)`);
 
     // Wait for the address modal to appear
     let modalFound = false;
@@ -3904,10 +3923,13 @@ export class FlipkartPlatform extends BasePlatform {
     for (let attempt = 0; attempt < 3 && !result; attempt++) {
       try {
         result = await this.page.evaluate(
-          (addr: AddressDetails) => {
+          (addr: AddressDetails, exclude: string[]) => {
             const targetName = (addr.companyName || addr.name || "").trim().toLowerCase();
             const targetCity = addr.city.trim().toLowerCase();
             const targetLocality = (addr.locality || "").trim().toLowerCase();
+            const excluded = new Set(
+              exclude.map((s) => s.replace(/\s+/g, " ").trim().toLowerCase())
+            );
 
             const cards: {
               el: HTMLElement;
@@ -4000,6 +4022,13 @@ export class FlipkartPlatform extends BasePlatform {
             for (const card of cards) {
               const cardText = card.text.toLowerCase();
               const cardName = card.name.toLowerCase();
+              const normalised = card.text.replace(/\s+/g, " ").trim().toLowerCase();
+              // Skip candidates the caller has already tried (and rejected
+              // because their mobile didn't match).
+              if (excluded.has(normalised)) {
+                console.log(`[SelectAddress] Skipping excluded card: "${card.text.replace(/\s+/g, " ").trim().slice(0, 80)}"`);
+                continue;
+              }
               let score = 0;
 
               // Name match (highest weight — company names are unique per address)
@@ -4068,7 +4097,8 @@ export class FlipkartPlatform extends BasePlatform {
               score: bestScore,
             };
           },
-          address
+          address,
+          excludeTexts
         );
       } catch (err) {
         const msg = (err as Error).message;
@@ -4111,6 +4141,161 @@ export class FlipkartPlatform extends BasePlatform {
       } catch (e) {
         console.log(`[SelectAddress] All click methods failed: ${(e as Error).message}`);
         return false;
+      }
+    }
+  }
+
+  /**
+   * Reads the currently-displayed "Deliver to: …" delivery card on the
+   * checkout / order-summary page. Returns null if the card isn't present
+   * yet (e.g. modal still up, page mid-render).
+   */
+  private async readDeliveryCard(): Promise<{ fullText: string; mobile: string | null } | null> {
+    try {
+      return await this.page.evaluate(() => {
+        const divs = Array.from(document.querySelectorAll("div"));
+        let bestText = "";
+        for (const d of divs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (txt.startsWith("Deliver to:")) {
+            // Pick the SHORTEST "Deliver to:" container — the outermost
+            // contains the whole page; we want the inner card.
+            if (!bestText || txt.length < bestText.length) {
+              bestText = txt;
+            }
+          }
+        }
+        if (!bestText) return null;
+        // Mobile: a 10-digit number after a non-digit boundary (so we don't
+        // pick up "388421" from a 6-digit pincode). Look for 10-digit
+        // sequences and take the LAST one — Flipkart usually shows the
+        // mobile after the address.
+        const matches = bestText.match(/(?:^|\D)(\d{10})(?!\d)/g) || [];
+        let mobile: string | null = null;
+        if (matches.length > 0) {
+          const last = matches[matches.length - 1];
+          const m = last.match(/(\d{10})/);
+          mobile = m ? m[1] : null;
+        }
+        return { fullText: bestText, mobile };
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /** Strip non-digits and keep the last 10. Empty string if input is falsy. */
+  private normaliseMobile(raw: string | undefined | null): string {
+    if (!raw) return "";
+    const digits = String(raw).replace(/\D/g, "");
+    return digits.slice(-10);
+  }
+
+  /**
+   * Ensures the displayed delivery card on the checkout page (or order
+   * summary) shows BOTH the right pincode + city AND the right mobile
+   * number. If two saved addresses share city + pincode but differ in
+   * mobile (the documented duplicate-address case for accounts with
+   * a per-account number), this loop opens the saved-address picker,
+   * skips the previously-tried card, and selects the next candidate.
+   *
+   * Returns silently on success. Throws with a clear message after
+   * `maxAttempts` failed attempts so the iteration fails fast instead
+   * of placing the order with the wrong number.
+   */
+  private async ensureMobileMatchesOnCheckout(
+    address: AddressDetails,
+    maxAttempts = 4
+  ): Promise<void> {
+    const targetMobile = this.normaliseMobile(address.mobile);
+    if (!targetMobile) {
+      // No mobile to verify — pre-flight didn't run, so leave the existing
+      // city/pincode result alone.
+      return;
+    }
+
+    const tried: string[] = [];
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // Give the card a moment to render after any prior selection.
+      await sleep(800);
+      const card = await this.readDeliveryCard();
+      if (!card) {
+        console.log(`[ensureMobileMatch] Could not read displayed delivery card on attempt ${attempt} — skipping further verification`);
+        return;
+      }
+
+      const displayedMobile = this.normaliseMobile(card.mobile);
+      const cardSnippet = card.fullText.slice(0, 120);
+      console.log(
+        `[ensureMobileMatch] attempt ${attempt}/${maxAttempts}: target=${targetMobile} displayed=${displayedMobile || "<none>"} card="${cardSnippet}"`
+      );
+
+      if (displayedMobile === targetMobile) {
+        console.log(`[ensureMobileMatch] Mobile matches — delivery address verified`);
+        return;
+      }
+
+      // Mark this card as already-tried so the picker won't return it again.
+      tried.push(card.fullText);
+
+      if (attempt === maxAttempts) {
+        throw new Error(
+          `Could not find a saved address with the expected mobile number (${targetMobile}) ` +
+          `on the checkout page after ${maxAttempts} attempts. ` +
+          `The Flipkart account may have multiple saved addresses sharing city + pincode but with ` +
+          `different mobiles, or the right one wasn't created during pre-flight.`
+        );
+      }
+
+      // Open the picker and pick the next candidate that hasn't been tried.
+      console.log(`[ensureMobileMatch] mismatch — clicking Change to try next candidate (excluding ${tried.length} already-tried)`);
+      await this.clickAddressChangeButton();
+
+      // Wait for the saved-address modal to render.
+      let modalLoaded = false;
+      for (let i = 0; i < 8 && !modalLoaded; i++) {
+        await sleep(300);
+        try {
+          modalLoaded = await this.page.evaluate(() => {
+            const body = document.body?.innerText || "";
+            return (
+              body.includes("Select Delivery") ||
+              body.includes("Saved Address") ||
+              body.includes("Delivery Address") ||
+              body.includes("ADD A NEW ADDRESS")
+            );
+          });
+        } catch { /* frame detach — keep waiting */ }
+      }
+      if (!modalLoaded) {
+        console.log(`[ensureMobileMatch] address modal didn't open on attempt ${attempt} — aborting loop`);
+        return;
+      }
+
+      const picked = await this.selectAddressFromList(address, tried);
+      if (!picked) {
+        throw new Error(
+          `No remaining saved-address candidates to try with the expected mobile (${targetMobile}). ` +
+          `Tried ${tried.length} candidate(s) on the checkout picker.`
+        );
+      }
+
+      // Wait for the modal to close so the next attempt's readDeliveryCard
+      // sees the new card, not the picker overlay.
+      let modalClosed = false;
+      for (let i = 0; i < 10 && !modalClosed; i++) {
+        await sleep(400);
+        try {
+          modalClosed = await this.page.evaluate(() => {
+            const body = document.body?.innerText || "";
+            return !(
+              body.includes("Select Delivery Address") ||
+              body.includes("Edit Address") ||
+              body.includes("ADD A NEW ADDRESS")
+            );
+          });
+        } catch { modalClosed = true; }
       }
     }
   }
