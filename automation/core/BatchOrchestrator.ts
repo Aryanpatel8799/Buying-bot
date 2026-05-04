@@ -42,6 +42,10 @@ export class BatchOrchestrator {
   private otpService: InstaDdrServiceLike | null = null;
   private otpServiceCleanup: (() => Promise<void>) | null = null;
   private instaDdrAccounts: Array<{ instaDdrId: string; instaDdrPassword: string; email: string }> | null = null;
+  // Last visible "Total" / "Amount Paid" we've seen on a Flipkart page during
+  // the current iteration. Used as the fallback amount when an iteration is
+  // declined/failed and we never reach the order-confirmation page.
+  private lastSeenAmount = "";
 
   constructor(
     private page: Page,
@@ -221,6 +225,10 @@ export class BatchOrchestrator {
         });
         break;
       }
+
+      // Reset per-iteration captured state (price seen on cart/checkout) so
+      // a successful Iter N's price doesn't leak into Iter N+1's failed row.
+      this.lastSeenAmount = "";
 
       sendMessage({
         type: "log",
@@ -433,17 +441,19 @@ export class BatchOrchestrator {
 
         if (paymentResult.ok) {
           completed++;
-          let orderDetails: OrderDetails | undefined;
+          let extracted: OrderDetails | undefined;
           try {
-            orderDetails = await this.platform.extractOrderDetails();
-            orderDetails.quantity = totalQty;
-            orderDetails.pinCode = pinCode;
-            if (orderDetails.amount && totalQty > 0) {
-              orderDetails.perPc = String(Math.round(Number(orderDetails.amount) / totalQty));
-            }
+            extracted = await this.platform.extractOrderDetails();
           } catch (csvErr) {
             console.log(`extractOrderDetails warning: ${csvErr instanceof Error ? csvErr.message : csvErr}`);
           }
+          // Always synthesize so URL fallbacks fill any blanks left by the
+          // confirmation-page extractor.
+          const order = this.synthesizeOrderDetails({
+            qty: totalQty,
+            pinCode,
+            extracted,
+          });
 
           try {
             this.appendOrderRow({
@@ -453,7 +463,7 @@ export class BatchOrchestrator {
               gstName,
               pinCode,
               qty: totalQty,
-              order: orderDetails,
+              order,
             });
           } catch (csvErr) {
             console.log(`CSV export warning: ${csvErr instanceof Error ? csvErr.message : csvErr}`);
@@ -469,6 +479,12 @@ export class BatchOrchestrator {
           failed++;
           // Generic timeout (no specific decline phrase). Log a row with
           // status=failed so the per-job CSV still has a complete record.
+          // Synthesize from URL + lastSeenAmount so model/colour/amount/per-pc
+          // are populated even though we never reached the confirmation page.
+          const order = this.synthesizeOrderDetails({
+            qty: totalQty,
+            pinCode,
+          });
           try {
             this.appendOrderRow({
               iteration: i + 1,
@@ -478,6 +494,7 @@ export class BatchOrchestrator {
               pinCode,
               qty: totalQty,
               note: "payment verification timed out",
+              order,
             });
           } catch (csvErr) {
             console.log(`CSV export warning: ${csvErr instanceof Error ? csvErr.message : csvErr}`);
@@ -496,6 +513,13 @@ export class BatchOrchestrator {
         const totalQtyForRow = this.config.products?.reduce((sum, p) => sum + p.quantity, 0) ?? this.config.perOrderQuantity;
         const pinCodeForRow = this.config.address?.checkoutPincode || this.config.address?.pincode || "";
         const gstNameForRow = this.config.address?.companyName || "";
+        // Synthesize model/colour/amount from URL + lastSeenAmount so the row
+        // is fully populated even on declined/failed iterations that never
+        // reached the order-confirmation page.
+        const orderForRow = this.synthesizeOrderDetails({
+          qty: totalQtyForRow,
+          pinCode: pinCodeForRow,
+        });
         try {
           this.appendOrderRow({
             iteration: i + 1,
@@ -507,6 +531,7 @@ export class BatchOrchestrator {
             note: err instanceof CardDeclinedError
               ? `card ending ${err.cardLast4}: ${err.reason}`
               : (err instanceof Error ? err.message : String(err)).slice(0, 300),
+            order: orderForRow,
           });
         } catch (csvErr) {
           console.log(`CSV export warning: ${csvErr instanceof Error ? csvErr.message : csvErr}`);
@@ -1162,6 +1187,10 @@ export class BatchOrchestrator {
       try {
         const totalQty = this.config.products?.reduce((sum, p) => sum + p.quantity, 0) ?? this.config.perOrderQuantity;
         await platform.verifyAddressOnOrderSummary(this.config.address, totalQty);
+        // Capture the visible total so failed/declined rows still get an
+        // amount in the CSV. Best effort — don't fail the iteration.
+        const seen = await platform.captureCheckoutTotal();
+        if (seen) this.lastSeenAmount = seen;
       } catch (err) {
         const warnMsg = err instanceof Error ? err.message : String(err);
         sendMessage({
@@ -1293,6 +1322,10 @@ export class BatchOrchestrator {
       // verifyAddressOnOrderSummary() handles address + GST + clicks Continue → navigates to payment page
       try {
         await this.platform.verifyAddressOnOrderSummary(this.config.address, qty);
+        // Capture the visible total so failed/declined rows still get an
+        // amount in the CSV.
+        const seen = await this.platform.captureCheckoutTotal();
+        if (seen) this.lastSeenAmount = seen;
       } catch (err) {
         const warnMsg = err instanceof Error ? err.message : String(err);
         sendMessage({
@@ -1845,5 +1878,46 @@ export class BatchOrchestrator {
       return this.instaDdrAccounts[i % this.instaDdrAccounts.length]?.email || "";
     }
     return "";
+  }
+
+  // Build an OrderDetails object for the CURRENT iteration's row. Falls back
+  // to URL-derived model + colour and the last visible checkout total when
+  // the iteration didn't reach an order-confirmation page (declined/failed).
+  // `extracted` is the (possibly empty) result of extractOrderDetails — its
+  // non-empty fields always win.
+  private synthesizeOrderDetails(args: {
+    qty: number;
+    pinCode: string;
+    extracted?: OrderDetails;
+  }): OrderDetails {
+    const productUrl =
+      this.config.products?.[0]?.url || this.config.productUrl || "";
+    const fallback =
+      productUrl && this.platform instanceof FlipkartPlatform
+        ? FlipkartPlatform.parseProductFromUrl(productUrl)
+        : { model: "", colour: "" };
+
+    const ex = args.extracted;
+    const model = (ex?.model || "").trim() || fallback.model;
+    const colour = (ex?.colour || "").trim() || fallback.colour;
+    const amount = (ex?.amount || "").trim() || this.lastSeenAmount || "";
+    const orderId = (ex?.orderId || "").trim();
+    const perPc =
+      amount && args.qty > 0
+        ? String(Math.round(Number(amount) / args.qty))
+        : "";
+
+    return {
+      orderId,
+      model,
+      colour,
+      quantity: args.qty,
+      pinCode: args.pinCode,
+      amount,
+      perPc,
+      orderDate:
+        ex?.orderDate ||
+        new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short" }),
+    };
   }
 }

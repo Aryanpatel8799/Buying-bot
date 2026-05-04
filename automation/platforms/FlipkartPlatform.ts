@@ -19,6 +19,76 @@ export class FlipkartPlatform extends BasePlatform {
   }
 
   /**
+   * Parse a Flipkart product URL into a readable model + (optional) colour
+   * derived from the slug. Used as a fallback so the per-job CSV still has
+   * a model/colour value even on iterations that never reach the order
+   * confirmation page (declined / failed).
+   *
+   * Example:
+   *   https://www.flipkart.com/oneplus-12r-cool-blue-256-gb/p/itm123?pid=...
+   *   → { model: "Oneplus 12R Cool Blue 256 Gb", colour: "blue" }
+   */
+  static parseProductFromUrl(url: string): { model: string; colour: string } {
+    try {
+      const u = new URL(url);
+      // Slug is the first path segment for Flipkart product URLs.
+      const seg = u.pathname.split("/").filter(Boolean)[0] || "";
+      // Strip "/p/itm..." if it leaked into the segment somehow.
+      const slug = seg.replace(/-+/g, " ").trim();
+      const model = slug
+        .split(" ")
+        .filter(Boolean)
+        .map((w) => (w.length > 1 ? w[0].toUpperCase() + w.slice(1) : w.toUpperCase()))
+        .join(" ");
+      const COLOURS = [
+        "black", "white", "blue", "red", "green", "yellow", "pink",
+        "purple", "grey", "gray", "silver", "gold", "rose", "graphite",
+        "midnight", "starlight", "titanium", "navy", "beige", "bronze",
+        "phantom", "lavender", "mint", "cream", "ivory",
+      ];
+      const lower = slug.toLowerCase();
+      const colour = COLOURS.find((c) => new RegExp(`\\b${c}\\b`).test(lower)) || "";
+      return { model, colour };
+    } catch {
+      return { model: "", colour: "" };
+    }
+  }
+
+  /**
+   * Read the order total from whatever Flipkart page we're currently on
+   * (product / cart / order-summary / checkout / confirmation). Returns
+   * the largest-meaningful ₹ value found near a "total"-style label, or
+   * the largest ₹ on the page if no labelled total is visible. Returns
+   * "" on any failure — never throws.
+   */
+  async captureCheckoutTotal(): Promise<string> {
+    try {
+      return await this.page.evaluate(() => {
+        const body = (document.body?.innerText || "").replace(/\s+/g, " ");
+        const labels = [
+          "amount paid", "total amount", "order total", "grand total",
+          "total payable", "payable amount", "you pay",
+        ];
+        const lower = body.toLowerCase();
+        for (const label of labels) {
+          const idx = lower.indexOf(label);
+          if (idx >= 0) {
+            const slice = body.slice(idx, idx + 200);
+            const m = slice.match(/(?:₹|Rs\.?)\s*([\d,]+(?:\.\d{1,2})?)/);
+            if (m) return m[1].replace(/,/g, "");
+          }
+        }
+        const all = Array.from(body.matchAll(/(?:₹|Rs\.?)\s*([\d,]+(?:\.\d{1,2})?)/g))
+          .map((m) => Number(m[1].replace(/,/g, "")))
+          .filter((n) => Number.isFinite(n) && n > 0);
+        return all.length > 0 ? String(Math.max(...all)) : "";
+      });
+    } catch {
+      return "";
+    }
+  }
+
+  /**
    * Detect if the current page context is stale (destroyed by SPA navigation)
    * and re-navigate to restore it. Call this after any action that might
    * trigger a Flipkart SPA navigation (address Change, address selection, etc.).
