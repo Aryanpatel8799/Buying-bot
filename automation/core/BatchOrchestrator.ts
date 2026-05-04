@@ -46,6 +46,15 @@ export class BatchOrchestrator {
   // the current iteration. Used as the fallback amount when an iteration is
   // declined/failed and we never reach the order-confirmation page.
   private lastSeenAmount = "";
+  // Product details captured on the product page itself (model + colour +
+  // unit price), via FlipkartPlatform.captureProductDetails(). Reset every
+  // iteration. Used as a fallback in synthesizeOrderDetails so failed/declined
+  // rows still have model/colour/amount populated.
+  private lastSeenProduct: { model: string; colour: string; amount: string } = {
+    model: "",
+    colour: "",
+    amount: "",
+  };
 
   constructor(
     private page: Page,
@@ -226,9 +235,11 @@ export class BatchOrchestrator {
         break;
       }
 
-      // Reset per-iteration captured state (price seen on cart/checkout) so
-      // a successful Iter N's price doesn't leak into Iter N+1's failed row.
+      // Reset per-iteration captured state (product details + price seen on
+      // cart/checkout) so a successful Iter N's data doesn't leak into Iter
+      // N+1's failed row.
       this.lastSeenAmount = "";
+      this.lastSeenProduct = { model: "", colour: "", amount: "" };
 
       sendMessage({
         type: "log",
@@ -1120,6 +1131,33 @@ export class BatchOrchestrator {
       // Navigate to this product
       await platform.navigateToProduct();
 
+      // Capture model/colour/price from the product page itself — these
+      // selectors (font="default-fk-font-l|m") are the most reliable source
+      // because we're guaranteed to land on this page, unlike the order
+      // confirmation page which a declined iteration never reaches.
+      if (platform instanceof FlipkartPlatform) {
+        try {
+          const details = await platform.captureProductDetails();
+          // Last product wins for multi-URL — preferences the most recently
+          // viewed item, and for single-URL multi-product carts the last
+          // product is usually the highest-value one.
+          if (details.model) this.lastSeenProduct.model = details.model;
+          if (details.colour) this.lastSeenProduct.colour = details.colour;
+          if (details.amount) this.lastSeenProduct.amount = details.amount;
+          if (details.amount && !this.lastSeenAmount) {
+            this.lastSeenAmount = details.amount;
+          }
+          sendMessage({
+            type: "log",
+            level: "info",
+            message: `Product details captured: ${details.model || "(no model)"} | ${details.colour || "(no colour)"} | ${details.amount ? "₹" + details.amount : "(no price)"}`,
+            iteration: iterationNum,
+          });
+        } catch (err) {
+          console.log(`captureProductDetails warning: ${(err as Error).message}`);
+        }
+      }
+
       // Add to cart (quantity will be set on the cart page for all platforms)
       await platform.addToCart();
 
@@ -1303,6 +1341,30 @@ export class BatchOrchestrator {
 
     // Step 1: Navigate to product
     await this.platform.navigateToProduct();
+
+    // Capture model/colour/price from the product page using the stable
+    // font="default-fk-font-l|m" selectors. This is the most reliable source
+    // since we're guaranteed to land here, unlike the order-confirmation
+    // page that a declined iteration never reaches.
+    if (this.platform instanceof FlipkartPlatform) {
+      try {
+        const details = await this.platform.captureProductDetails();
+        if (details.model) this.lastSeenProduct.model = details.model;
+        if (details.colour) this.lastSeenProduct.colour = details.colour;
+        if (details.amount) this.lastSeenProduct.amount = details.amount;
+        if (details.amount && !this.lastSeenAmount) {
+          this.lastSeenAmount = details.amount;
+        }
+        sendMessage({
+          type: "log",
+          level: "info",
+          message: `Product details captured: ${details.model || "(no model)"} | ${details.colour || "(no colour)"} | ${details.amount ? "₹" + details.amount : "(no price)"}`,
+          iteration: iterationNum,
+        });
+      } catch (err) {
+        console.log(`captureProductDetails warning: ${(err as Error).message}`);
+      }
+    }
 
     // Step 2 & 3: Quantity before or after Buy Now depends on platform
     const qty = this.config.products?.length === 1
@@ -1892,15 +1954,27 @@ export class BatchOrchestrator {
   }): OrderDetails {
     const productUrl =
       this.config.products?.[0]?.url || this.config.productUrl || "";
-    const fallback =
+    const urlFallback =
       productUrl && this.platform instanceof FlipkartPlatform
         ? FlipkartPlatform.parseProductFromUrl(productUrl)
         : { model: "", colour: "" };
 
+    // Priority: confirmation-page extraction → product-page capture →
+    // URL-derived fallback → last-seen-amount on cart/checkout.
     const ex = args.extracted;
-    const model = (ex?.model || "").trim() || fallback.model;
-    const colour = (ex?.colour || "").trim() || fallback.colour;
-    const amount = (ex?.amount || "").trim() || this.lastSeenAmount || "";
+    const model =
+      (ex?.model || "").trim() ||
+      this.lastSeenProduct.model ||
+      urlFallback.model;
+    const colour =
+      (ex?.colour || "").trim() ||
+      this.lastSeenProduct.colour ||
+      urlFallback.colour;
+    const amount =
+      (ex?.amount || "").trim() ||
+      this.lastSeenProduct.amount ||
+      this.lastSeenAmount ||
+      "";
     const orderId = (ex?.orderId || "").trim();
     const perPc =
       amount && args.qty > 0
