@@ -30,7 +30,7 @@ export default function HomePage() {
           AutoBuy Platform
         </h1>
         <p className="text-lg text-gray-400 mb-8">
-          Automate bulk product purchasing on Amazon and Flipkart. Configure
+          Automate bulkyst product purchasing on Amazon and Flipkart. Configure
           payment methods, set quantities, and let the bot handle the rest.
         </p>
 
