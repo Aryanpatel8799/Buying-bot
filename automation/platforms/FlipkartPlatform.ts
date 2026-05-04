@@ -5,6 +5,8 @@ import {
   clearAndType,
   navigateWithRetry,
   waitWithRetry,
+  sendMessage,
+  safeEvaluate,
 } from "../core/helpers";
 
 const DELAYS = {
@@ -1340,22 +1342,57 @@ export class FlipkartPlatform extends BasePlatform {
   }
 
   async loginWithEmail(email: string, options?: InstaDdrLoginOptions): Promise<void> {
-    console.log(`Logging in with email: ${email.substring(0, 3)}***`);
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: `[login] Step 1/6: checking session for ${email.substring(0, 3)}***`,
+    });
 
-    // Step 1: Check if already logged in — if so, log out first
-    if (await this.isLoggedIn()) {
-      console.log("Already logged in. Logging out first...");
-      await this.logout();
+    // Step 1: Check if already logged in — if so, log out first.
+    // isLoggedIn() catches errors internally and returns false on context loss,
+    // so this never throws.
+    let alreadyLoggedIn = false;
+    try {
+      alreadyLoggedIn = await this.isLoggedIn();
+    } catch {
+      alreadyLoggedIn = false;
+    }
+    if (alreadyLoggedIn) {
+      sendMessage({
+        type: "log",
+        level: "info",
+        message: "[login] previous session detected — logging out first",
+      });
+      try {
+        await this.logout();
+      } catch (err) {
+        sendMessage({
+          type: "log",
+          level: "warn",
+          message: `[login] logout failed (continuing): ${(err as Error).message}`,
+        });
+      }
     }
 
-    // Step 2: Navigate to Flipkart login page
+    // Step 2: Navigate to Flipkart login page. Extra settle so the SPA's
+    // post-load redirects don't race with the next page.evaluate.
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: "[login] Step 2/6: navigating to /account/login",
+    });
     await navigateWithRetry(this.page, "https://www.flipkart.com/account/login?ret=/", {
       timeoutMs: 15000,
       maxRetries: 3,
     });
-    await sleep(DELAYS.long);
+    await sleep(1500); // longer settle: defends against Flipkart's post-DCL redirects
 
     // Step 3: Wait for email input field
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: "[login] Step 3/6: waiting for email/mobile input",
+    });
     await waitWithRetry(
       this.page,
       async () => {
@@ -1370,10 +1407,16 @@ export class FlipkartPlatform extends BasePlatform {
       { label: "Login email input", timeoutMs: 10000, maxRetries: 5 }
     );
 
-    // Step 4: Enter email into login form
-    console.log("Typing into login email input ...");
+    // Step 4: Enter email into login form. Wrapped in safeEvaluate so a
+    // mid-flight Flipkart redirect doesn't kill the iteration.
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: "[login] Step 4/6: typing email into login form",
+    });
 
-    const typed = await this.page.evaluate((emailToType: string) => {
+    const typed = await safeEvaluate(this.page, () =>
+      this.page.evaluate((emailToType: string) => {
       if (typeof (globalThis as any).__name === "undefined") (globalThis as any).__name = (fn: any) => fn;
       // Helper: type value into input using React-compatible keyboard events
       function typeIntoInput(input: HTMLInputElement, value: string): void {
@@ -1437,17 +1480,28 @@ export class FlipkartPlatform extends BasePlatform {
       }
 
       return null;
-    }, email);
+    }, email), "loginWithEmail.typeEmail");
 
     if (!typed) {
       throw new Error("Could not find email input on login page");
     }
-    console.log(`Email entered via ${typed} strategy`);
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: `[login] email entered (${typed} strategy)`,
+    });
     await sleep(DELAYS.medium);
 
-    // Step 5: Click "Request OTP" button
-    console.log("Clicking Request OTP...");
-    const otpRequested = await this.page.evaluate(() => {
+    // Step 5: Click "Request OTP" button. Wrapped in safeEvaluate — clicking
+    // this button kicks off Flipkart's OTP-request, which sometimes triggers
+    // a same-page state change that races with our next call.
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: "[login] Step 5/6: clicking Request OTP",
+    });
+    const otpRequested = await safeEvaluate(this.page, () =>
+      this.page.evaluate(() => {
       // Strategy 1: Find by exact class names
       const btn1 = document.querySelector('button.dSM5Ub.Kv3ekh.KcXDCU') as HTMLButtonElement | null;
       if (btn1) { btn1.click(); return "class"; }
@@ -1472,17 +1526,24 @@ export class FlipkartPlatform extends BasePlatform {
       }
 
       return null;
-    });
+    }), "loginWithEmail.requestOtp");
 
     if (!otpRequested) {
       throw new Error("Could not find Request OTP button");
     }
-    console.log(`OTP request button clicked via ${otpRequested} strategy`);
-
-    console.log("OTP requested on Flipkart");
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: `[login] Request OTP clicked (${otpRequested} strategy) — OTP should arrive shortly`,
+    });
 
     // Step 6: If InstaDDR is configured, auto-fetch and enter OTP
     if (options?.instaDdrService && options?.instaDdrAccount) {
+      sendMessage({
+        type: "log",
+        level: "info",
+        message: "[login] Step 6/6: fetching OTP via OTP service",
+      });
       const { instaDdrService, instaDdrAccount } = options;
 
       // 6a: Login to InstaDDR in isolated context (no-op for Gmail)

@@ -4,6 +4,44 @@ export const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Wraps a page-mutating callable (page.evaluate, page.click, etc.) so that
+ * if Puppeteer throws "Execution context was destroyed" — because the SPA
+ * navigated mid-call — we wait for the new context to settle and retry once.
+ * Flipkart's login / cart / checkout pages all do client-side redirects that
+ * race with our evaluates; a one-shot retry fixes nearly all of them.
+ */
+export async function safeEvaluate<T>(
+  page: Page,
+  fn: () => Promise<T>,
+  label = "evaluate",
+  settleMs = 800
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      msg.includes("Execution context was destroyed") ||
+      msg.includes("detached Frame") ||
+      msg.includes("Target closed")
+    ) {
+      console.log(
+        `[safeEvaluate] ${label}: context destroyed mid-flight, settling for ${settleMs}ms then retrying once`
+      );
+      await Promise.race([
+        page
+          .waitForNavigation({ waitUntil: "domcontentloaded", timeout: settleMs })
+          .catch(() => {}),
+        sleep(settleMs),
+      ]);
+      await sleep(200);
+      return await fn();
+    }
+    throw err;
+  }
+}
+
+/**
  * Wait for a selector with retry + page refresh logic.
  * Waits `timeoutMs` for the element. If not found, refreshes the page
  * and retries. After `maxRetries` total attempts, throws.
