@@ -17,8 +17,10 @@ export interface IInstaDdrAccount extends Document {
 
 const InstaDdrAccountEntrySchema = new Schema<any>(
   {
-    instaDdrId: { type: String, required: true },
-    instaDdrPassword: { type: String, required: true },
+    // instaDdrId / instaDdrPassword are no longer collected from the UI —
+    // the bot uses Gmail to fetch OTPs. Kept optional for legacy rows.
+    instaDdrId: { type: String, required: false, default: "" },
+    instaDdrPassword: { type: String, required: false, default: "" },
     email: { type: String, required: true },
     createdAt: { type: Date, default: Date.now },
   },

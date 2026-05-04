@@ -30,22 +30,26 @@ export async function GET() {
     .sort({ createdAt: -1 })
     .lean();
 
+  // Return BOTH the full email/phone (for the dashboard) and the masked
+  // version. UI now defaults to showing the full value because the masking
+  // made the list unsearchable / unreadable.
   const masked = accounts.map((acc) => {
+    let email = "";
     let maskedEmail = "***";
     try {
-      const email = decrypt(acc.encryptedEmail);
+      email = decrypt(acc.encryptedEmail);
       if (email.includes("@")) {
         const [user, domain] = email.split("@");
         maskedEmail = `${user[0]}${"*".repeat(Math.max(user.length - 2, 1))}${user.length > 1 ? user[user.length - 1] : ""}@${domain}`;
       } else {
-        // Treat as phone number — keep last 4 digits
         const last4 = email.slice(-4);
         maskedEmail = `${"*".repeat(Math.max(email.length - 4, 1))}${last4}`;
       }
-    } catch { /* keep "***" */ }
+    } catch { /* keep defaults */ }
     return {
       _id: acc._id,
       label: acc.label,
+      email,
       maskedEmail,
       createdAt: acc.createdAt,
     };

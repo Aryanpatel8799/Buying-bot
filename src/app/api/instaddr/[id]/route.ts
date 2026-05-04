@@ -9,16 +9,15 @@ interface RouteParams {
   params: Promise<{ id: string }>;
 }
 
+// instaDdrId / instaDdrPassword are now ignored at the UI layer — emails are
+// the only thing the bot uses (it logs into Gmail via the Chrome profile to
+// fetch OTPs, not into InstaDDR directly). Keep them optional in the schema
+// so old clients still work; default to "".
 const addAccountSchema = z.object({
-  instaDdrId: z.string().min(1),
-  instaDdrPassword: z.string().min(1),
+  instaDdrId: z.string().optional().default(""),
+  instaDdrPassword: z.string().optional().default(""),
   email: z.string().email(),
 });
-
-function mask(str: string, showChars = 2): string {
-  if (str.length <= showChars * 2 + 3) return str[0] + "****" + str.slice(-showChars);
-  return str.slice(0, showChars) + "****" + str.slice(-showChars);
-}
 
 // GET /api/instaddr/[id] — get single group with all accounts (masked)
 export async function GET(req: NextRequest, { params }: RouteParams) {
@@ -37,14 +36,15 @@ export async function GET(req: NextRequest, { params }: RouteParams) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
-  const accounts = group.accounts.map((a: any) => {
+  // Return the FULL email — masking made the dashboard list unreadable.
+  // instaDdrId / instaDdrPassword are still in the schema but no longer
+  // shown in the UI; we omit them from the response to keep payloads small.
+  const accounts = group.accounts.map((a: { _id: { toString: () => string }; email: string; createdAt: Date }) => {
     let email = "";
     try { email = decrypt(a.email); } catch { email = "(decrypt error)"; }
     return {
       _id: a._id.toString(),
-      instaDdrId: mask(a.instaDdrId, 2),
-      instaDdrPassword: "****",
-      email: email ? mask(email, 2) : "****",
+      email,
       createdAt: a.createdAt,
     };
   });
@@ -129,9 +129,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     return NextResponse.json(
       {
         _id: (newAccount._id as any).toString(),
-        instaDdrId: mask(data.instaDdrId, 2),
-        instaDdrPassword: "****",
-        email: mask(data.email, 2),
+        email: data.email,
         createdAt: newAccount.createdAt,
       },
       { status: 201 }

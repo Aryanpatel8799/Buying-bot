@@ -7,6 +7,7 @@ import { useRouter } from "next/navigation";
 interface SavedAccount {
   _id: string;
   label: string;
+  email: string;
   maskedEmail: string;
   createdAt: string;
 }
@@ -16,6 +17,7 @@ export default function AmazonAccountsPage() {
   const router = useRouter();
   const [accounts, setAccounts] = useState<SavedAccount[]>([]);
   const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
 
   // Add account form
   const [showForm, setShowForm] = useState(false);
@@ -270,6 +272,19 @@ export default function AmazonAccountsPage() {
         </div>
       )}
 
+      {/* Search */}
+      {accounts.length > 0 && (
+        <div className="mb-4">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search by label, email, or phone..."
+            className="w-full px-4 py-2.5 bg-gray-900 border border-gray-800 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-orange-500/40 focus:border-orange-500/40 transition-all"
+          />
+        </div>
+      )}
+
       {/* Accounts Table */}
       {accounts.length === 0 ? (
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-12 text-center">
@@ -288,10 +303,20 @@ export default function AmazonAccountsPage() {
               </tr>
             </thead>
             <tbody>
-              {accounts.map((acc) => (
+              {accounts
+                .filter((acc) => {
+                  const q = search.trim().toLowerCase();
+                  if (!q) return true;
+                  return (
+                    acc.label.toLowerCase().includes(q) ||
+                    (acc.email || "").toLowerCase().includes(q) ||
+                    (acc.maskedEmail || "").toLowerCase().includes(q)
+                  );
+                })
+                .map((acc) => (
                 <tr key={acc._id} className="border-b border-gray-800/50 hover:bg-gray-800/30">
                   <td className="px-5 py-3.5 text-sm font-medium">{acc.label}</td>
-                  <td className="px-5 py-3.5 text-sm text-gray-400 font-mono">{acc.maskedEmail}</td>
+                  <td className="px-5 py-3.5 text-sm text-gray-300 font-mono">{acc.email || acc.maskedEmail}</td>
                   <td className="px-5 py-3.5 text-sm text-gray-500">
                     {new Date(acc.createdAt).toLocaleDateString()}
                   </td>

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getAuthSession } from "@/lib/auth/getSession";
 import dbConnect from "@/lib/db/connect";
 import FlipkartAccount from "@/lib/db/models/FlipkartAccount";
-import { encrypt } from "@/lib/encryption";
+import { encrypt, decrypt } from "@/lib/encryption";
 import { checkRateLimit, rateLimitResponse } from "@/lib/rateLimit";
 import { z } from "zod";
 
@@ -26,20 +26,23 @@ export async function GET() {
     .sort({ createdAt: -1 })
     .lean();
 
-  // Mask emails before returning — we need to decrypt to mask
-  const { decrypt } = await import("@/lib/encryption");
+  // Return BOTH the full email (for the dashboard list — masking made the
+  // page hard to use) and the masked version (kept for any callers that
+  // still depend on it).
   const masked = accounts.map((acc) => {
+    let email = "";
     let maskedEmail = "***";
     try {
-      const email = decrypt(acc.encryptedEmail);
+      email = decrypt(acc.encryptedEmail);
       const [user, domain] = email.split("@");
       maskedEmail = `${user[0]}${"*".repeat(Math.max(user.length - 2, 1))}${user.length > 1 ? user[user.length - 1] : ""}@${domain}`;
     } catch {
-      // If decryption fails, just show masked
+      // If decryption fails, leave defaults
     }
     return {
       _id: acc._id,
       label: acc.label,
+      email,
       maskedEmail,
       createdAt: acc.createdAt,
     };

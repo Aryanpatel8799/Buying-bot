@@ -9,7 +9,9 @@ interface RouteParams {
   params: Promise<{ id: string }>;
 }
 
-// POST /api/instaddr/[id]/bulk — CSV upload: instaDdrId,instaDdrPassword,email
+// POST /api/instaddr/[id]/bulk — CSV upload: one email per line (header optional).
+// Old 3-column format (instaDdrId,instaDdrPassword,email) is still accepted for
+// backward compatibility — the first two columns are ignored.
 export async function POST(req: NextRequest, { params }: RouteParams) {
   const session = await getAuthSession();
   if (!session?.user) {
@@ -66,23 +68,21 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
   }
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].toLowerCase();
-    if (line.startsWith("instaddrid") || line.startsWith("id") || line.startsWith("accountid")) {
+    const lower = lines[i].toLowerCase();
+    if (lower.startsWith("instaddrid") || lower.startsWith("id") || lower.startsWith("accountid") || lower === "email") {
       continue; // skip header
     }
 
-    const parts = lines[i].split(",").map((p) => p.trim());
-    if (parts.length < 3) {
-      errors.push(`Row ${i + 1}: Expected 3 fields (instaDdrId,password,email), got ${parts.length}`);
-      continue;
-    }
-
-    const [instaDdrId, instaDdrPassword, email] = parts;
+    // Accept either a single email per line or the legacy 3-column CSV
+    // (instaDdrId,instaDdrPassword,email) — in the latter case the first two
+    // columns are ignored.
+    const parts = lines[i].split(",").map((p) => p.trim()).filter(Boolean);
+    const email = parts.length === 1 ? parts[0] : parts[parts.length - 1];
 
     // Basic email validation
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      errors.push(`Row ${i + 1}: Invalid email "${email}"`);
+    if (!email || !emailRegex.test(email)) {
+      errors.push(`Row ${i + 1}: Invalid email "${email || ""}"`);
       continue;
     }
 
@@ -95,8 +95,8 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     existingEmails.add(email.toLowerCase());
     accountsToAdd.push({
       _id: new mongoose.Types.ObjectId(),
-      instaDdrId,
-      instaDdrPassword: encrypt(instaDdrPassword),
+      instaDdrId: "",
+      instaDdrPassword: encrypt(""),
       email: encrypt(email.toLowerCase()),
       createdAt: new Date(),
     });

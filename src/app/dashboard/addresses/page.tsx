@@ -65,6 +65,7 @@ export default function AddressesPage() {
 
   const [addresses, setAddresses] = useState<SavedAddressEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<Record<string, string | undefined>>({});
@@ -441,6 +442,19 @@ export default function AddressesPage() {
         </div>
       )}
 
+      {/* Search */}
+      {addresses.length > 0 && (
+        <div className="mb-4">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search by name, GST, company, city, pincode..."
+            className="w-full px-4 py-2.5 bg-gray-900 border border-gray-800 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+          />
+        </div>
+      )}
+
       {/* Addresses Table */}
       {addresses.length === 0 ? (
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-12 text-center">
@@ -451,7 +465,21 @@ export default function AddressesPage() {
         </div>
       ) : (
         <div className="space-y-3">
-          {addresses.map((addr) => (
+          {addresses
+            .filter((addr) => {
+              const q = search.trim().toLowerCase();
+              if (!q) return true;
+              return (
+                (addr.name || "").toLowerCase().includes(q) ||
+                (addr.gstNumber || "").toLowerCase().includes(q) ||
+                (addr.companyName || "").toLowerCase().includes(q) ||
+                (addr.city || "").toLowerCase().includes(q) ||
+                (addr.pincode || "").toLowerCase().includes(q) ||
+                (addr.locality || "").toLowerCase().includes(q) ||
+                (addr.state || "").toLowerCase().includes(q)
+              );
+            })
+            .map((addr) => (
             <div
               key={addr._id}
               className="bg-gray-900 border border-gray-800 rounded-xl p-5 hover:border-gray-700 transition-all"
@@ -461,7 +489,7 @@ export default function AddressesPage() {
                   {/* GST Info */}
                   <div className="flex items-center gap-3 mb-3">
                     <span className="font-mono text-sm text-blue-400 bg-blue-500/10 border border-blue-500/20 px-2.5 py-1 rounded-lg">
-                      {addr.maskedGstNumber}
+                      {addr.gstNumber || addr.maskedGstNumber}
                     </span>
                     <span className="text-sm font-medium text-gray-200">
                       {addr.companyName}

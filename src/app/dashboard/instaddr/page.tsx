@@ -6,8 +6,6 @@ import { useRouter } from "next/navigation";
 
 interface InstaDdrAccountItem {
   _id: string;
-  instaDdrId: string;
-  instaDdrPassword: string;
   email: string;
   createdAt: string;
 }
@@ -27,6 +25,8 @@ export default function InstaDdrPage() {
   const router = useRouter();
   const [groups, setGroups] = useState<InstaDdrGroup[]>([]);
   const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [accountSearch, setAccountSearch] = useState("");
 
   // Create group form
   const [showCreateGroup, setShowCreateGroup] = useState(false);
@@ -40,8 +40,6 @@ export default function InstaDdrPage() {
 
   // Add account form
   const [showAddAccount, setShowAddAccount] = useState(false);
-  const [instaDdrId, setInstaDdrId] = useState("");
-  const [instaDdrPassword, setInstaDdrPassword] = useState("");
   const [email, setEmail] = useState("");
   const [addingAccount, setAddingAccount] = useState(false);
   const [accountError, setAccountError] = useState("");
@@ -132,8 +130,8 @@ export default function InstaDdrPage() {
   async function handleAddAccount(e: React.FormEvent) {
     e.preventDefault();
     setAccountError("");
-    if (!instaDdrId.trim() || !instaDdrPassword.trim() || !email.trim()) {
-      setAccountError("All fields are required");
+    if (!email.trim()) {
+      setAccountError("Email is required");
       return;
     }
     setAddingAccount(true);
@@ -142,14 +140,10 @@ export default function InstaDdrPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          instaDdrId: instaDdrId.trim(),
-          instaDdrPassword: instaDdrPassword.trim(),
           email: email.trim(),
         }),
       });
       if (res.ok) {
-        setInstaDdrId("");
-        setInstaDdrPassword("");
         setEmail("");
         setShowAddAccount(false);
         setAccountError("");
@@ -262,6 +256,19 @@ export default function InstaDdrPage() {
         </div>
       )}
 
+      {/* Search */}
+      {groups.length > 0 && (
+        <div className="mb-4">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search groups by label..."
+            className="w-full px-4 py-2.5 bg-gray-900 border border-gray-800 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+          />
+        </div>
+      )}
+
       {/* Groups List */}
       {groups.length === 0 ? (
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-12 text-center">
@@ -270,7 +277,13 @@ export default function InstaDdrPage() {
         </div>
       ) : (
         <div className="space-y-3">
-          {groups.map((group) => (
+          {groups
+            .filter((g) => {
+              const q = search.trim().toLowerCase();
+              if (!q) return true;
+              return g.label.toLowerCase().includes(q) || g.platform.toLowerCase().includes(q);
+            })
+            .map((group) => (
             <div key={group._id} className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
               {/* Group Header */}
               <div
@@ -342,37 +355,19 @@ export default function InstaDdrPage() {
                             </div>
                           )}
                           <form onSubmit={handleAddAccount} className="space-y-3">
-                            <div className="grid grid-cols-3 gap-3">
-                              <div>
-                                <label className="block text-xs font-medium text-gray-400 mb-1">InstaDDR ID</label>
-                                <input
-                                  type="text"
-                                  value={instaDdrId}
-                                  onChange={(e) => setInstaDdrId(e.target.value)}
-                                  placeholder="Account ID"
-                                  className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all"
-                                />
-                              </div>
-                              <div>
-                                <label className="block text-xs font-medium text-gray-400 mb-1">Password</label>
-                                <input
-                                  type="password"
-                                  value={instaDdrPassword}
-                                  onChange={(e) => setInstaDdrPassword(e.target.value)}
-                                  placeholder="Password"
-                                  className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all"
-                                />
-                              </div>
-                              <div>
-                                <label className="block text-xs font-medium text-gray-400 mb-1">Email</label>
-                                <input
-                                  type="email"
-                                  value={email}
-                                  onChange={(e) => setEmail(e.target.value)}
-                                  placeholder="email@example.com"
-                                  className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all"
-                                />
-                              </div>
+                            <div>
+                              <label className="block text-xs font-medium text-gray-400 mb-1">Email</label>
+                              <input
+                                type="email"
+                                value={email}
+                                onChange={(e) => setEmail(e.target.value)}
+                                placeholder="email@example.com"
+                                required
+                                className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all"
+                              />
+                              <p className="text-xs text-gray-500 mt-1">
+                                Only the InstaDDR forwarding email is needed — OTPs are pulled from the linked Gmail.
+                              </p>
                             </div>
                             <button
                               type="submit"
@@ -390,7 +385,7 @@ export default function InstaDdrPage() {
                         <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 mb-4">
                           <h3 className="text-xs font-semibold text-gray-300 mb-1 uppercase tracking-wider">CSV Bulk Upload</h3>
                           <p className="text-xs text-gray-500 mb-3">
-                            Format: <code className="text-gray-400 bg-gray-800 px-1.5 py-0.5 rounded">instaDdrId,instaDdrPassword,email</code> — one per line
+                            Format: <code className="text-gray-400 bg-gray-800 px-1.5 py-0.5 rounded">email</code> — one per line. Header row optional.
                           </p>
                           <div className="mb-2">
                             <label className="cursor-pointer">
@@ -403,7 +398,7 @@ export default function InstaDdrPage() {
                           <textarea
                             value={csvText}
                             onChange={(e) => setCsvText(e.target.value)}
-                            placeholder={`user1,pass1,email1@example.com\nuser2,pass2,email2@example.com`}
+                            placeholder={`email1@example.com\nemail2@example.com\nemail3@example.com`}
                             rows={4}
                             className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white font-mono text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all mb-2"
                           />
@@ -428,35 +423,50 @@ export default function InstaDdrPage() {
 
                       {/* Accounts Table */}
                       {expandedGroup && expandedGroup.accounts && expandedGroup.accounts.length > 0 ? (
-                        <table className="w-full">
-                          <thead>
-                            <tr className="border-b border-gray-800">
-                              <th className="text-left px-3 py-2 text-xs font-medium text-gray-500 uppercase tracking-wider">InstaDDR ID</th>
-                              <th className="text-left px-3 py-2 text-xs font-medium text-gray-500 uppercase tracking-wider">Email</th>
-                              <th className="text-left px-3 py-2 text-xs font-medium text-gray-500 uppercase tracking-wider">Added</th>
-                              <th className="text-right px-3 py-2 text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {expandedGroup.accounts.map((account) => (
-                              <tr key={account._id} className="border-b border-gray-800/50 hover:bg-gray-800/20">
-                                <td className="px-3 py-2.5 text-sm font-mono text-gray-300">{account.instaDdrId}</td>
-                                <td className="px-3 py-2.5 text-sm text-gray-400">{account.email}</td>
-                                <td className="px-3 py-2.5 text-sm text-gray-600">
-                                  {new Date(account.createdAt).toLocaleDateString()}
-                                </td>
-                                <td className="px-3 py-2.5 text-right">
-                                  <button
-                                    onClick={() => handleDeleteAccount(account._id)}
-                                    className="text-xs text-red-400 hover:text-red-300 transition-colors font-medium"
-                                  >
-                                    Delete
-                                  </button>
-                                </td>
+                        <>
+                          <div className="mb-3">
+                            <input
+                              type="text"
+                              value={accountSearch}
+                              onChange={(e) => setAccountSearch(e.target.value)}
+                              placeholder="Search emails in this group..."
+                              className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all"
+                            />
+                          </div>
+                          <table className="w-full">
+                            <thead>
+                              <tr className="border-b border-gray-800">
+                                <th className="text-left px-3 py-2 text-xs font-medium text-gray-500 uppercase tracking-wider">Email</th>
+                                <th className="text-left px-3 py-2 text-xs font-medium text-gray-500 uppercase tracking-wider">Added</th>
+                                <th className="text-right px-3 py-2 text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
                               </tr>
-                            ))}
-                          </tbody>
-                        </table>
+                            </thead>
+                            <tbody>
+                              {expandedGroup.accounts
+                                .filter((acc) => {
+                                  const q = accountSearch.trim().toLowerCase();
+                                  if (!q) return true;
+                                  return (acc.email || "").toLowerCase().includes(q);
+                                })
+                                .map((account) => (
+                                <tr key={account._id} className="border-b border-gray-800/50 hover:bg-gray-800/20">
+                                  <td className="px-3 py-2.5 text-sm text-gray-300 font-mono">{account.email}</td>
+                                  <td className="px-3 py-2.5 text-sm text-gray-600">
+                                    {new Date(account.createdAt).toLocaleDateString()}
+                                  </td>
+                                  <td className="px-3 py-2.5 text-right">
+                                    <button
+                                      onClick={() => handleDeleteAccount(account._id)}
+                                      className="text-xs text-red-400 hover:text-red-300 transition-colors font-medium"
+                                    >
+                                      Delete
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </>
                       ) : (
                         <div className="text-center py-4">
                           <p className="text-gray-600 text-sm">No accounts in this group yet.</p>

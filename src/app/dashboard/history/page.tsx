@@ -33,6 +33,8 @@ export default function HistoryPage() {
   const router = useRouter();
   const [jobs, setJobs] = useState<Job[]>([]);
   const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<string>("all");
 
   useEffect(() => {
     if (status === "unauthenticated") router.push("/login");
@@ -93,6 +95,29 @@ export default function HistoryPage() {
         </div>
       )}
 
+      {/* Filters */}
+      {jobs.length > 0 && (
+        <div className="mb-4 flex flex-wrap gap-2">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search by platform, payment, status..."
+            className="flex-1 min-w-[260px] px-4 py-2.5 bg-gray-900 border border-gray-800 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+          />
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            className="px-4 py-2.5 bg-gray-900 border border-gray-800 rounded-xl text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+          >
+            <option value="all">All statuses</option>
+            <option value="completed">Completed</option>
+            <option value="failed">Failed</option>
+            <option value="cancelled">Cancelled</option>
+          </select>
+        </div>
+      )}
+
       {jobs.length === 0 ? (
         <div className="text-center py-16 bg-gray-900 rounded-xl border border-gray-800">
           <p className="text-gray-500">No completed jobs yet.</p>
@@ -112,7 +137,18 @@ export default function HistoryPage() {
               </tr>
             </thead>
             <tbody>
-              {jobs.map((job) => (
+              {jobs
+                .filter((j) => statusFilter === "all" || j.status === statusFilter)
+                .filter((j) => {
+                  const q = search.trim().toLowerCase();
+                  if (!q) return true;
+                  return (
+                    j.platform.toLowerCase().includes(q) ||
+                    j.paymentMethod.toLowerCase().includes(q) ||
+                    j.status.toLowerCase().includes(q)
+                  );
+                })
+                .map((job) => (
                 <tr key={job._id} className="border-b border-gray-800/50 hover:bg-gray-800/30">
                   <td className="px-4 py-3 text-sm capitalize font-medium">
                     {job.platform}

@@ -20,6 +20,7 @@ export default function ProfilesPage() {
   const router = useRouter();
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const [newName, setNewName] = useState("");
   const [newPlatform, setNewPlatform] = useState("both");
@@ -221,6 +222,19 @@ export default function ProfilesPage() {
         </form>
       )}
 
+      {/* Search */}
+      {profiles.length > 0 && (
+        <div className="mb-4">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search by name, platform, or Gmail..."
+            className="w-full px-4 py-2.5 bg-gray-900 border border-gray-800 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+          />
+        </div>
+      )}
+
       {/* Profiles List */}
       {profiles.length === 0 ? (
         <div className="text-center py-16 bg-gray-900 rounded-xl border border-gray-800">
@@ -231,7 +245,17 @@ export default function ProfilesPage() {
         </div>
       ) : (
         <div className="grid gap-3">
-          {profiles.map((profile) => (
+          {profiles
+            .filter((profile) => {
+              const q = search.trim().toLowerCase();
+              if (!q) return true;
+              return (
+                profile.name.toLowerCase().includes(q) ||
+                profile.platform.toLowerCase().includes(q) ||
+                (profile.gmailAddress || "").toLowerCase().includes(q)
+              );
+            })
+            .map((profile) => (
             <div
               key={profile._id}
               className="p-4 bg-gray-900 rounded-xl border border-gray-800 hover:border-gray-700 transition-colors"
