@@ -44,6 +44,23 @@ export class GmailOtpService implements InstaDdrServiceLike {
   /** Shorter initial wait than InstaDDR's 60s — Gmail receives mail much faster. */
   readonly initialWaitMs = 10000;
   private inboxReady: Promise<void> | null = null;
+  /**
+   * Unix-seconds baseline. When set, `fetchOtp` adds an `after:<seconds>`
+   * term to the Gmail search so any OTP email older than this timestamp is
+   * filtered out by Gmail itself — preventing the runner from typing a
+   * stale OTP from a previous login attempt for the same Flipkart account.
+   */
+  private requestedAtSec: number | null = null;
+
+  /**
+   * Record the moment the runner clicked Flipkart's "Request OTP" button.
+   * Subtracts a 10s grace window to absorb clock skew between the bot host
+   * and Google's mail servers.
+   */
+  markOtpRequestedAt(epochMs: number): void {
+    this.requestedAtSec = Math.floor(epochMs / 1000) - 10;
+    console.log(`[Gmail] OTP freshness baseline set to after:${this.requestedAtSec}`);
+  }
 
   constructor(private page: Page, private sender: GmailOtpSender = "flipkart") {
     // Hide navigator.webdriver before any navigation so Google Accounts can't
@@ -105,16 +122,23 @@ export class GmailOtpService implements InstaDdrServiceLike {
 
     await this.ensureInbox();
 
+    // Freshness term — only honoured when the platform marked the request
+    // time. Gmail's `after:` filter takes unix-seconds and removes anything
+    // older from the result list, so we can't accidentally read an OTP from
+    // a previous login attempt for the same Flipkart email.
+    const freshness = this.requestedAtSec ? ` after:${this.requestedAtSec}` : "";
+
     // Strategy 1: Flipkart sender + the specific InstaDDR address, last 1h.
-    const specificQuery = `from:${this.sender} "${email}" newer_than:1h`;
+    const specificQuery = `from:${this.sender} "${email}" newer_than:1h${freshness}`;
     let otp = await this.searchAndExtract(specificQuery);
     if (otp) {
       console.log(`[Gmail] OTP ${otp} matched via address-specific search`);
       return otp;
     }
 
-    // Strategy 2: newest Flipkart OTP, last 1h.
-    const fallbackQuery = `from:${this.sender} newer_than:1h`;
+    // Strategy 2: newest Flipkart OTP, last 1h. STILL honour the freshness
+    // baseline so we don't fall back to an unrelated stale OTP.
+    const fallbackQuery = `from:${this.sender} newer_than:1h${freshness}`;
     otp = await this.searchAndExtract(fallbackQuery);
     if (otp) {
       console.log(`[Gmail] OTP ${otp} matched via newest-wins fallback`);

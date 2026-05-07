@@ -69,6 +69,15 @@ class DisplayManager {
     return this.enabled;
   }
 
+  /** Snapshot of in-use vs total slots, for log lines / status APIs. */
+  poolStats(): { inUse: number; total: number; enabled: boolean } {
+    return {
+      inUse: this.inUse.size,
+      total: this.pool.length,
+      enabled: this.enabled,
+    };
+  }
+
   /** Pick the first free display, start its systemd services, return slot info. */
   async allocate(): Promise<DisplaySlot | null> {
     if (!this.enabled) return null;

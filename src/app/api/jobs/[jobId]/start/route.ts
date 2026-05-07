@@ -67,12 +67,16 @@ export async function POST(
       noVncUrl: (startedJob as { noVncUrl?: string | null } | null)?.noVncUrl ?? null,
     });
   } catch (error) {
-    // Revert status on failure
-    await Job.updateOne({ _id: jobId }, { status: "failed" });
+    // Revert status on failure so the user can retry / fix the cause.
+    await Job.updateOne({ _id: jobId }, { status: "pending" });
+    const msg = error instanceof Error ? error.message : String(error);
     console.error("Start job error:", error);
-    return NextResponse.json(
-      { error: "Failed to start job" },
-      { status: 500 }
-    );
+
+    // Display-pool exhaustion is a 503 (resource contention) so the
+    // dashboard can show a clearer toast distinct from a generic 500.
+    if (msg.includes("VNC display slots") || msg.includes("VNC_DISPLAY_POOL")) {
+      return NextResponse.json({ error: msg }, { status: 503 });
+    }
+    return NextResponse.json({ error: msg || "Failed to start job" }, { status: 500 });
   }
 }

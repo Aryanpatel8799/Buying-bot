@@ -233,10 +233,25 @@ export class JobExecutor extends EventEmitter {
     const configB64 = Buffer.from(JSON.stringify(config)).toString("base64");
 
     // Allocate a per-job Xvfb / x11vnc / noVNC slot (when the pool is
-    // configured). Each user can therefore watch this job in isolation
-    // without fighting other jobs over a shared display. If the pool is
-    // disabled or exhausted, fall back to the inherited DISPLAY env.
+    // configured). Each user / parallel job gets its own display so they
+    // can't fight each other for window focus or X resources.
+    //
+    // If the pool is configured but full → fail-fast with a clear message
+    // (otherwise multiple jobs would silently share the inherited DISPLAY
+    // and step on each other). If the pool is disabled (env unset), keep
+    // the legacy single-display behaviour for dev environments.
     const slot: DisplaySlot | null = await displayManager.allocate();
+    const stats = displayManager.poolStats();
+    if (stats.enabled && !slot) {
+      throw new Error(
+        `All VNC display slots are in use (${stats.inUse}/${stats.total}). ` +
+        `Stop another running job or increase VNC_DISPLAY_POOL on the server.`
+      );
+    }
+    console.log(
+      `[concurrency] job=${this.jobId} display=${slot?.displayString ?? "inherited"} ` +
+      `pool=${stats.inUse}/${stats.total} enabled=${stats.enabled}`
+    );
     const spawnEnv = slot
       ? { ...process.env, DISPLAY: slot.displayString }
       : undefined;

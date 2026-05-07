@@ -22,6 +22,14 @@ export interface InstaDdrServiceLike {
    * ~10s because mail arrives within seconds.
    */
   readonly initialWaitMs?: number;
+  /**
+   * Optional. Called by the platform IMMEDIATELY before clicking Flipkart's
+   * "Request OTP" button. Implementations should remember this timestamp and
+   * use it as a freshness baseline so a stale OTP from a previous request
+   * for the same email isn't returned by `fetchOtp`. Gmail uses it as an
+   * `after:<unix-seconds>` term in the search query; InstaDDR is a no-op.
+   */
+  markOtpRequestedAt?(epochMs: number): void;
 }
 
 /** Options passed to loginWithEmail for InstaDDR OTP automation */

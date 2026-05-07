@@ -1554,6 +1554,10 @@ export class FlipkartPlatform extends BasePlatform {
       level: "info",
       message: "[login] Step 5/6: clicking Request OTP",
     });
+    // Mark the freshness baseline so the OTP service ignores any older
+    // OTP emails that may still be sitting in the inbox for this address.
+    // No-op for InstaDDR; Gmail uses it as `after:<unix-seconds>`.
+    options?.instaDdrService?.markOtpRequestedAt?.(Date.now());
     const otpRequested = await safeEvaluate(this.page, () =>
       this.page.evaluate(() => {
       // Strategy 1: Find by exact class names
@@ -1642,10 +1646,23 @@ export class FlipkartPlatform extends BasePlatform {
       // 6d: Enter OTP into Flipkart's OTP input field
       await this.enterOtpOnFlipkart(otp);
 
-      // 6e: Wait for login to complete
+      // 6e: Wait for login to complete (URL leaves /account/login AND auth
+      // cookies / DOM markers confirm a real logged-in state — Flipkart
+      // sometimes flashes off the login page then bounces back when the OTP
+      // is stale or the account needs additional verification).
+      sendMessage({
+        type: "log",
+        level: "info",
+        message: "[login] OTP entered — verifying logged-in state",
+      });
       const loginSuccess = await this.waitForLoginCompletion(60000);
       if (!loginSuccess) {
-        throw new Error("Login did not complete after entering OTP");
+        throw new Error(
+          "Login did not complete after entering OTP — page reverted to login form. " +
+          "Likely causes: (a) the OTP was stale or incorrect (Gmail freshness guard now blocks this); " +
+          "(b) this Flipkart account needs manual verification — open Profiles → Setup Login " +
+          "for this profile and log in once by hand."
+        );
       }
 
       console.log("InstaDDR auto-login complete — logged into Flipkart");
@@ -1668,13 +1685,38 @@ export class FlipkartPlatform extends BasePlatform {
    * "+919898537706") or null if not found.
    */
   async fetchAccountMobile(): Promise<string | null> {
-    console.log("[Mobile] Fetching account mobile from /account ...");
+    sendMessage({
+      type: "log",
+      level: "info",
+      message: "[preflight] navigating to /account",
+    });
     try {
       await navigateWithRetry(this.page, "https://www.flipkart.com/account", {
         timeoutMs: 15000,
         maxRetries: 2,
       });
       await sleep(DELAYS.medium);
+
+      // Hard-fail if Flipkart redirected us back to login. This is a much
+      // clearer signal than reading an empty mobileNumber and confusedly
+      // continuing.
+      const url = (this.page.url() || "").toLowerCase();
+      if (url.includes("/account/login")) {
+        sendMessage({
+          type: "log",
+          level: "error",
+          message: `[preflight] /account redirected to ${this.page.url()} — session is not actually logged in`,
+        });
+        throw new Error(
+          "Pre-flight: /account redirected to login page. Flipkart did not honour the OTP — " +
+          "the account may need manual verification (Profiles → Setup Login)."
+        );
+      }
+      sendMessage({
+        type: "log",
+        level: "info",
+        message: `[preflight] /account landed on ${url}`,
+      });
 
       const value = await this.page.evaluate(() => {
         const el = document.querySelector(
@@ -1692,6 +1734,10 @@ export class FlipkartPlatform extends BasePlatform {
       return trimmed;
     } catch (err) {
       console.log(`[Mobile] Failed to fetch account mobile: ${(err as Error).message}`);
+      // Re-throw redirect-to-login so the iteration's catch handles it; swallow
+      // benign read failures (e.g. transient DOM state) and return null so the
+      // pre-flight gracefully degrades.
+      if ((err as Error).message?.includes("Pre-flight:")) throw err;
       return null;
     }
   }
@@ -1722,6 +1768,26 @@ export class FlipkartPlatform extends BasePlatform {
       timeoutMs: 15000,
       maxRetries: 2,
     });
+    // Same login-bounce guard as fetchAccountMobile — if Flipkart redirected
+    // here to /account/login, this iteration is in a half-logged-in state.
+    {
+      const url = (this.page.url() || "").toLowerCase();
+      if (url.includes("/account/login")) {
+        sendMessage({
+          type: "log",
+          level: "error",
+          message: `[preflight] /account/addresses redirected to ${this.page.url()}`,
+        });
+        throw new Error(
+          "Pre-flight: /account/addresses redirected to login page — Flipkart did not honour the OTP."
+        );
+      }
+      sendMessage({
+        type: "log",
+        level: "info",
+        message: `[preflight] /account/addresses landed on ${url}`,
+      });
+    }
     // Wait for "Manage Addresses" header so we know the React app has hydrated
     // (otherwise the saved-address cards won't be in the DOM yet).
     try {
@@ -2046,44 +2112,103 @@ export class FlipkartPlatform extends BasePlatform {
     const deadline = Date.now() + timeoutMs;
     const pollInterval = 2000;
 
+    // Phase 1: wait for the URL to leave /account/login. This is necessary
+    // but NOT sufficient — Flipkart sometimes redirects to /account/login
+    // again moments later if the OTP was wrong / stale, leaving the user
+    // looking briefly logged in then bouncing back to the login form.
+    let urlMoved = false;
     while (Date.now() < deadline) {
       try {
-        const loggedIn = await this.page.evaluate(() => {
-          const url = window.location.href.toLowerCase();
-          // If we're no longer on the login page, login succeeded
-          if (!url.includes("/account/login")) {
-            return true;
-          }
-          // Check for logged-in indicators on the page
-          const text = (document.body?.innerText || "").toLowerCase();
-          if (text.includes("my account") || text.includes("my orders")) {
-            return true;
-          }
-          return false;
-        });
-
-        if (loggedIn) {
-          console.log("Login completed successfully");
-          return true;
+        const url = (this.page.url() || "").toLowerCase();
+        if (!url.includes("/account/login")) {
+          urlMoved = true;
+          break;
         }
-      } catch {
-        // Page might be navigating — that's a good sign
-        await sleep(pollInterval);
-        try {
-          const url = this.page.url();
-          if (!url.includes("/account/login")) {
-            console.log("Login completed (detected via URL change)");
-            return true;
-          }
-        } catch {
-          // Still navigating
-        }
-      }
-
+      } catch { /* page in transition */ }
       await sleep(pollInterval);
     }
 
-    console.log("Login timed out");
+    if (!urlMoved) {
+      sendMessage({
+        type: "log",
+        level: "warn",
+        message: "[login] post-OTP URL never left /account/login — likely wrong/stale OTP",
+      });
+      return false;
+    }
+
+    // Phase 2: settle, then VERIFY the resulting state is genuinely logged in.
+    // Flipkart's authenticated-session cookies are `T` (auth token) and `SN`.
+    // We confirm at least one is set OR the home page shows logged-in chrome.
+    await sleep(1500);
+
+    let confirmed = false;
+    let lastReason = "unknown";
+    try {
+      const cookies = await this.page.cookies(
+        "https://www.flipkart.com",
+        "https://flipkart.com"
+      );
+      const hasAuthCookie = cookies.some((c) => c.name === "T" || c.name === "SN");
+      if (hasAuthCookie) {
+        confirmed = true;
+      } else {
+        lastReason = "no T/SN cookie set after redirect";
+      }
+    } catch (err) {
+      lastReason = `cookie probe failed: ${(err as Error).message}`;
+    }
+
+    if (!confirmed) {
+      // Cookies may not be readable from a non-flipkart URL the SPA landed on
+      // (e.g. mid-navigation). Try the DOM markers as a second source of truth.
+      try {
+        const domMarkers = await this.page.evaluate(() => {
+          const url = window.location.href.toLowerCase();
+          if (url.includes("/account/login")) return false;
+          const text = (document.body?.innerText || "").toLowerCase();
+          // Logged-in indicators that DON'T appear on the public login page.
+          return (
+            text.includes("my orders") ||
+            text.includes("my account") ||
+            text.includes("super coin") ||
+            text.includes("notifications")
+          );
+        });
+        if (domMarkers) confirmed = true;
+        else lastReason = lastReason + "; no logged-in DOM markers either";
+      } catch (err) {
+        lastReason = lastReason + `; DOM probe failed: ${(err as Error).message}`;
+      }
+    }
+
+    // Re-check URL one last time — Flipkart may have bounced us back.
+    try {
+      const finalUrl = (this.page.url() || "").toLowerCase();
+      if (finalUrl.includes("/account/login")) {
+        sendMessage({
+          type: "log",
+          level: "warn",
+          message: `[login] post-OTP page bounced back to /account/login (Flipkart rejected)`,
+        });
+        return false;
+      }
+    } catch { /* tolerate */ }
+
+    if (confirmed) {
+      sendMessage({
+        type: "log",
+        level: "info",
+        message: "[login] post-OTP login VERIFIED (auth cookies + DOM markers OK)",
+      });
+      return true;
+    }
+
+    sendMessage({
+      type: "log",
+      level: "warn",
+      message: `[login] post-OTP login could not be verified: ${lastReason}`,
+    });
     return false;
   }
 
